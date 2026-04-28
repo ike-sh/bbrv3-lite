@@ -1,10 +1,10 @@
-#!/bin/bash
+﻿#!/bin/bash
 #=============================================================================
-# 脚本名称: install-alias.sh
-# 功能描述: 为 BBR v3 / XanMod / TCP 网络调优脚本创建/卸载快捷别名
-# 使用方法: 
-#   安装: bash install-alias.sh [install]
-#   卸载: bash install-alias.sh uninstall
+# 鑴氭湰鍚嶇О: install-alias.sh
+# 鍔熻兘鎻忚堪: 涓?BBR v3 / XanMod / TCP 缃戠粶璋冧紭鑴氭湰鍒涘缓/鍗歌浇蹇嵎鍒悕
+# 浣跨敤鏂规硶: 
+#   瀹夎: bash install-alias.sh [install]
+#   鍗歌浇: bash install-alias.sh uninstall
 #=============================================================================
 
 YELLOW='\033[1;33m'
@@ -13,26 +13,25 @@ CYAN='\033[1;36m'
 RED='\033[1;31m'
 NC='\033[0m' # No Color
 
-# 检测操作模式（安装或卸载）
+# 妫€娴嬫搷浣滄ā寮忥紙瀹夎鎴栧嵏杞斤級
 MODE="${1:-install}"
 if [ "$MODE" != "install" ] && [ "$MODE" != "uninstall" ]; then
-    echo -e "${RED}错误: 未知参数 '$MODE'${NC}"
-    echo "使用方法:"
-    echo "  安装: bash install-alias.sh [install]"
-    echo "  卸载: bash install-alias.sh uninstall"
+    echo -e "${RED}閿欒: 鏈煡鍙傛暟 '$MODE'${NC}"
+    echo "浣跨敤鏂规硶:"
+    echo "  瀹夎: bash install-alias.sh [install]"
+    echo "  鍗歌浇: bash install-alias.sh uninstall"
     exit 1
 fi
 
-# 检测当前使用的 shell
+# 妫€娴嬪綋鍓嶄娇鐢ㄧ殑 shell
 CURRENT_SHELL=$(basename "$SHELL")
 
-# 根据不同的 shell 设置配置文件（检查多个可能的配置文件）
-detect_rc_file() {
+# 鏍规嵁涓嶅悓鐨?shell 璁剧疆閰嶇疆鏂囦欢锛堟鏌ュ涓彲鑳界殑閰嶇疆鏂囦欢锛?detect_rc_file() {
     if [ "$CURRENT_SHELL" = "zsh" ]; then
         RC_FILE="$HOME/.zshrc"
     elif [ "$CURRENT_SHELL" = "bash" ]; then
         RC_FILE="$HOME/.bashrc"
-        # 如果 .bashrc 不存在，使用 .bash_profile
+        # 濡傛灉 .bashrc 涓嶅瓨鍦紝浣跨敤 .bash_profile
         if [ ! -f "$RC_FILE" ]; then
             RC_FILE="$HOME/.bash_profile"
         fi
@@ -40,148 +39,135 @@ detect_rc_file() {
         RC_FILE="$HOME/.bashrc"
     fi
     
-    # 如果文件不存在，创建它
-    if [ ! -f "$RC_FILE" ]; then
+    # 濡傛灉鏂囦欢涓嶅瓨鍦紝鍒涘缓瀹?    if [ ! -f "$RC_FILE" ]; then
         touch "$RC_FILE"
     fi
 }
 
 detect_rc_file
 
-# 卸载功能
+# 鍗歌浇鍔熻兘
 uninstall_alias() {
-    echo -e "${CYAN}=== 卸载 net-tcp-tune 快捷别名 ===${NC}"
+    echo -e "${CYAN}=== 鍗歌浇 net-tcp-tune 蹇嵎鍒悕 ===${NC}"
     echo ""
-    echo -e "检测到 Shell: ${GREEN}${CURRENT_SHELL}${NC}"
-    echo -e "配置文件: ${GREEN}${RC_FILE}${NC}"
+    echo -e "妫€娴嬪埌 Shell: ${GREEN}${CURRENT_SHELL}${NC}"
+    echo -e "閰嶇疆鏂囦欢: ${GREEN}${RC_FILE}${NC}"
     echo ""
     
-    # 检查别名是否已存在
-    if ! grep -q "net-tcp-tune 快捷别名" "$RC_FILE" 2>/dev/null; then
-        echo -e "${YELLOW}未找到已安装的别名，无需卸载${NC}"
+    # 妫€鏌ュ埆鍚嶆槸鍚﹀凡瀛樺湪
+    if ! grep -q "net-tcp-tune 蹇嵎鍒悕" "$RC_FILE" 2>/dev/null; then
+        echo -e "${YELLOW}鏈壘鍒板凡瀹夎鐨勫埆鍚嶏紝鏃犻渶鍗歌浇${NC}"
         echo ""
         return 0
     fi
     
-    # 创建临时文件来存储清理后的内容
-    TEMP_FILE=$(mktemp)
+    # 鍒涘缓涓存椂鏂囦欢鏉ュ瓨鍌ㄦ竻鐞嗗悗鐨勫唴瀹?    TEMP_FILE=$(mktemp)
     
-    # 删除包含 "net-tcp-tune 快捷别名" 的整个块（包括注释和别名）
-    # 先尝试删除从分隔线开始到别名结束的整个块
-    # 如果失败，则只删除别名块本身
+    # 鍒犻櫎鍖呭惈 "net-tcp-tune 蹇嵎鍒悕" 鐨勬暣涓潡锛堝寘鎷敞閲婂拰鍒悕锛?    # 鍏堝皾璇曞垹闄や粠鍒嗛殧绾垮紑濮嬪埌鍒悕缁撴潫鐨勬暣涓潡
+    # 濡傛灉澶辫触锛屽垯鍙垹闄ゅ埆鍚嶅潡鏈韩
     if grep -q "^# ================" "$RC_FILE" 2>/dev/null; then
-        # 尝试删除从分隔线开始到别名结束的整个块
+        # 灏濊瘯鍒犻櫎浠庡垎闅旂嚎寮€濮嬪埌鍒悕缁撴潫鐨勬暣涓潡
         sed '/^# ================/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE" 2>/dev/null
 
-        # 检查是否还有别名残留
-        if grep -q "net-tcp-tune 快捷别名" "$TEMP_FILE" 2>/dev/null; then
-            # 如果还有残留，使用更精确的删除
-            sed '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
+        # 妫€鏌ユ槸鍚﹁繕鏈夊埆鍚嶆畫鐣?        if grep -q "net-tcp-tune 蹇嵎鍒悕" "$TEMP_FILE" 2>/dev/null; then
+            # 濡傛灉杩樻湁娈嬬暀锛屼娇鐢ㄦ洿绮剧‘鐨勫垹闄?            sed '/net-tcp-tune 蹇嵎鍒悕/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
         fi
     else
-        # 直接删除别名块
-        sed '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
+        # 鐩存帴鍒犻櫎鍒悕鍧?        sed '/net-tcp-tune 蹇嵎鍒悕/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
     fi
     
-    # 检查是否有变更
+    # 妫€鏌ユ槸鍚︽湁鍙樻洿
     if ! diff -q "$RC_FILE" "$TEMP_FILE" > /dev/null 2>&1; then
-        # 备份原文件
-        cp "$RC_FILE" "${RC_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+        # 澶囦唤鍘熸枃浠?        cp "$RC_FILE" "${RC_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
         
-        # 替换原文件
-        mv "$TEMP_FILE" "$RC_FILE"
-        echo -e "${GREEN}✅ 别名已从 ${RC_FILE} 中移除${NC}"
+        # 鏇挎崲鍘熸枃浠?        mv "$TEMP_FILE" "$RC_FILE"
+        echo -e "${GREEN}鉁?鍒悕宸蹭粠 ${RC_FILE} 涓Щ闄?{NC}"
         echo ""
-        echo -e "${YELLOW}提示: 原配置文件已备份为 ${RC_FILE}.bak.*${NC}"
+        echo -e "${YELLOW}鎻愮ず: 鍘熼厤缃枃浠跺凡澶囦唤涓?${RC_FILE}.bak.*${NC}"
         echo ""
-        echo -e "${CYAN}=== 现在生效（执行以下命令）===${NC}"
+        echo -e "${CYAN}=== 鐜板湪鐢熸晥锛堟墽琛屼互涓嬪懡浠わ級===${NC}"
         echo ""
         echo -e "${YELLOW}source ${RC_FILE}${NC}"
         echo ""
-        echo "或者关闭终端重新打开，卸载即生效。"
+        echo "鎴栬€呭叧闂粓绔噸鏂版墦寮€锛屽嵏杞藉嵆鐢熸晥銆?
         echo ""
     else
         rm -f "$TEMP_FILE"
-        echo -e "${YELLOW}未找到需要删除的内容${NC}"
+        echo -e "${YELLOW}鏈壘鍒伴渶瑕佸垹闄ょ殑鍐呭${NC}"
         echo ""
     fi
 }
 
-# 安装功能
+# 瀹夎鍔熻兘
 install_alias() {
-    echo -e "${CYAN}=== 安装 net-tcp-tune 快捷别名 ===${NC}"
+    echo -e "${CYAN}=== 瀹夎 net-tcp-tune 蹇嵎鍒悕 ===${NC}"
     echo ""
-    echo -e "检测到 Shell: ${GREEN}${CURRENT_SHELL}${NC}"
+    echo -e "妫€娴嬪埌 Shell: ${GREEN}${CURRENT_SHELL}${NC}"
     echo ""
-    echo -e "配置文件: ${GREEN}${RC_FILE}${NC}"
+    echo -e "閰嶇疆鏂囦欢: ${GREEN}${RC_FILE}${NC}"
     echo ""
     
-    # 定义要添加的别名（带时间戳参数，确保每次获取最新版本）
+    # 瀹氫箟瑕佹坊鍔犵殑鍒悕锛堝甫鏃堕棿鎴冲弬鏁帮紝纭繚姣忔鑾峰彇鏈€鏂扮増鏈級
     ALIAS_CONTENT='
 # ========================================
-# net-tcp-tune 快捷别名 (自动添加)
-# 使用时间戳参数确保每次都获取最新版本，避免缓存
+# net-tcp-tune 蹇嵎鍒悕 (鑷姩娣诲姞)
+# 浣跨敤鏃堕棿鎴冲弬鏁扮‘淇濇瘡娆￠兘鑾峰彇鏈€鏂扮増鏈紝閬垮厤缂撳瓨
 # ========================================
-alias bbr="bash <(curl -fsSL \"https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/net-tcp-tune.sh?\$(date +%s)\")"
+alias bbr="bash <(curl -fsSL \"https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh?\$(date +%s)\")"
 '
     
-    # 检查别名是否已存在
-    if grep -q "net-tcp-tune 快捷别名" "$RC_FILE" 2>/dev/null; then
-        echo -e "${YELLOW}配置已存在，正在更新...${NC}"
+    # 妫€鏌ュ埆鍚嶆槸鍚﹀凡瀛樺湪
+    if grep -q "net-tcp-tune 蹇嵎鍒悕" "$RC_FILE" 2>/dev/null; then
+        echo -e "${YELLOW}閰嶇疆宸插瓨鍦紝姝ｅ湪鏇存柊...${NC}"
         
-        # 备份文件
+        # 澶囦唤鏂囦欢
         cp "$RC_FILE" "${RC_FILE}.bak"
         
-        # 方案：读取文件，过滤掉原来的别名块，然后再追加新的
-        # 1. 如果有旧的块结构，尝试整体替换（兼容旧版）
-        if grep -q "^# ================" "$RC_FILE" 2>/dev/null; then
-             sed -i '/^# ================/,/^alias bbr=/d' "$RC_FILE" 2>/dev/null || sed -i '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE"
+        # 鏂规锛氳鍙栨枃浠讹紝杩囨护鎺夊師鏉ョ殑鍒悕鍧楋紝鐒跺悗鍐嶈拷鍔犳柊鐨?        # 1. 濡傛灉鏈夋棫鐨勫潡缁撴瀯锛屽皾璇曟暣浣撴浛鎹紙鍏煎鏃х増锛?        if grep -q "^# ================" "$RC_FILE" 2>/dev/null; then
+             sed -i '/^# ================/,/^alias bbr=/d' "$RC_FILE" 2>/dev/null || sed -i '/net-tcp-tune 蹇嵎鍒悕/,/^alias bbr=/d' "$RC_FILE"
         else
-             sed -i '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE"
+             sed -i '/net-tcp-tune 蹇嵎鍒悕/,/^alias bbr=/d' "$RC_FILE"
         fi
 
-        # 2. ⚡️暴力清理：确保没有残留的旧版 alias dog= 行
-        if grep -q "alias dog=" "$RC_FILE"; then
+        # 2. 鈿★笍鏆村姏娓呯悊锛氱‘淇濇病鏈夋畫鐣欑殑鏃х増 alias dog= 琛?        if grep -q "alias dog=" "$RC_FILE"; then
             grep -v "alias dog=" "$RC_FILE" > "${RC_FILE}.tmp" && mv "${RC_FILE}.tmp" "$RC_FILE"
         fi
         
-        # 再添加新的
-        echo "$ALIAS_CONTENT" >> "$RC_FILE"
-        echo -e "${GREEN}✅ 别名已更新到 ${RC_FILE}${NC}"
+        # 鍐嶆坊鍔犳柊鐨?        echo "$ALIAS_CONTENT" >> "$RC_FILE"
+        echo -e "${GREEN}鉁?鍒悕宸叉洿鏂板埌 ${RC_FILE}${NC}"
         echo ""
     else
-        # 添加别名到配置文件
-        echo "$ALIAS_CONTENT" >> "$RC_FILE"
-        echo -e "${GREEN}✅ 别名已添加到 ${RC_FILE}${NC}"
+        # 娣诲姞鍒悕鍒伴厤缃枃浠?        echo "$ALIAS_CONTENT" >> "$RC_FILE"
+        echo -e "${GREEN}鉁?鍒悕宸叉坊鍔犲埌 ${RC_FILE}${NC}"
         echo ""
     fi
     
-    echo -e "${CYAN}=== 快捷命令 ===${NC}"
+    echo -e "${CYAN}=== 蹇嵎鍛戒护 ===${NC}"
     echo ""
-    echo -e "  ${GREEN}bbr${NC}   - 一键运行网络调优脚本"
+    echo -e "  ${GREEN}bbr${NC}   - 涓€閿繍琛岀綉缁滆皟浼樿剼鏈?
     echo ""
-    echo -e "${CYAN}=== 使用方法 ===${NC}"
+    echo -e "${CYAN}=== 浣跨敤鏂规硶 ===${NC}"
     echo ""
-    echo "1. 重新加载配置："
+    echo "1. 閲嶆柊鍔犺浇閰嶇疆锛?
     echo -e "   ${YELLOW}source ${RC_FILE}${NC}"
     echo ""
-    echo "2. 或者关闭终端重新打开"
+    echo "2. 鎴栬€呭叧闂粓绔噸鏂版墦寮€"
     echo ""
-    echo "3. 然后直接输入快捷命令："
-    echo -e "   ${GREEN}bbr${NC}  (网络调优)"
+    echo "3. 鐒跺悗鐩存帴杈撳叆蹇嵎鍛戒护锛?
+    echo -e "   ${GREEN}bbr${NC}  (缃戠粶璋冧紭)"
     echo ""
-    echo -e "${CYAN}=== 卸载方法 ===${NC}"
+    echo -e "${CYAN}=== 鍗歌浇鏂规硶 ===${NC}"
     echo ""
-    echo "如需卸载别名，请运行："
+    echo "濡傞渶鍗歌浇鍒悕锛岃杩愯锛?
     echo -e "   ${YELLOW}bash install-alias.sh uninstall${NC}"
     echo ""
-    echo -e "${CYAN}=== 现在就生效（执行以下命令）===${NC}"
+    echo -e "${CYAN}=== 鐜板湪灏辩敓鏁堬紙鎵ц浠ヤ笅鍛戒护锛?==${NC}"
     echo ""
     echo -e "${YELLOW}source ${RC_FILE}${NC}"
     echo ""
 }
 
-# 根据模式执行相应操作
+# 鏍规嵁妯″紡鎵ц鐩稿簲鎿嶄綔
 case "$MODE" in
     install)
         install_alias
@@ -190,3 +176,4 @@ case "$MODE" in
         uninstall_alias
         ;;
 esac
+
