@@ -12,11 +12,21 @@
 apt update -y && apt install curl -y
 ```
 
-安装快捷别名后，可直接输入 `bbr` 运行脚本：
+安装快捷别名：
 
 ```bash
 bash <(curl -fsSL "https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/install-alias.sh?$(date +%s)")
+```
+
+让别名立即生效：
+
+```bash
 source ~/.bashrc
+```
+
+运行脚本：
+
+```bash
 bbr
 ```
 
@@ -28,13 +38,48 @@ bbr
 bash <(curl -fsSL "https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh?$(date +%s)")
 ```
 
-也可以下载到本地后执行：
+## 下载到本地执行
+
+下载脚本：
 
 ```bash
 wget -O net-tcp-tune.sh "https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh?$(date +%s)"
+```
+
+赋予执行权限：
+
+```bash
 chmod +x net-tcp-tune.sh
+```
+
+运行脚本：
+
+```bash
 ./net-tcp-tune.sh
 ```
+
+## 如果 raw.githubusercontent.com 无法解析
+
+如果出现：
+
+```text
+curl: (6) Could not resolve host: raw.githubusercontent.com
+```
+
+说明当前服务器 DNS 解析异常，先临时写入公共 DNS 后再执行安装命令：
+
+```bash
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+```
+
+如果 `/etc/resolv.conf` 被锁定，可以先解除锁定再写入：
+
+```bash
+chattr -i /etc/resolv.conf 2>/dev/null || true
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+```
+
+然后重新执行安装或在线运行命令。
 
 ## 保留功能
 
@@ -54,14 +99,18 @@ chmod +x net-tcp-tune.sh
 
 ## 功能 11：一键全自动优化
 
-一键全自动优化保留原项目自动化逻辑，分两阶段执行：
+一键全自动优化保留原项目自动化逻辑，分两阶段执行。
+
+首次执行：
 
 ```text
-首次执行：
 1. 安装/更新 XanMod 内核 + BBR v3
 2. 提示重启服务器
+```
 
 重启后再次进入脚本选择功能 11：
+
+```text
 3. BBR 直连/落地优化
 4. DNS 净化
 5. Realm 转发 timeout 修复
