@@ -1,6 +1,6 @@
 # BBR v3 / XanMod / TCP 网络调优脚本
 
-当前版本：v5.1.0
+当前版本：v5.1.1
 
 本精简版只保留网络调优相关功能，聚焦 XanMod 内核、BBR v3、TCP 参数调优、DNS 净化、IPv6 管理、Realm 转发 timeout 修复，以及必要的测速、预检和回滚能力。
 
@@ -135,6 +135,8 @@ DNS 净化执行前会备份 `systemd-resolved`、`resolv.conf`、`dnscrypt-prox
 
 v5.1.0 起，一键优化最后会输出结果汇总，标记每一步成功、失败或跳过，并给出 DNS 回滚、IPv6 恢复、XanMod 卸载等提示。DNS、Realm、IPv6 这类辅助步骤失败时不会阻断 BBR/TCP 主流程。
 
+v5.1.1 起，IPv6 汇总状态以真实 sysctl 检测为准：只有 `net.ipv6.conf.all.disable_ipv6`、`net.ipv6.conf.default.disable_ipv6`、`net.ipv6.conf.lo.disable_ipv6` 三项均为 `1` 时，才显示 IPv6 已永久禁用。
+
 ## 回滚 / 卸载
 
 功能 13：回滚 / 卸载管理提供统一入口：
@@ -161,6 +163,11 @@ v5.1.0 起，一键优化最后会输出结果汇总，标记每一步成功、�
 - 换内核前建议先给 VPS 做快照。
 - OpenVZ/LXC 等容器虚拟化环境通常不支持自行更换内核。
 - 生产机请谨慎执行内核安装、DNS 修改、IPv6 禁用等操作，建议确保有控制台或救援模式可用。
+
+## v5.1.1 更新记录
+
+- 修复一键优化中 IPv6 禁用失败但汇总误报成功的问题。
+- 修复确认重启后脚本未立即退出导致菜单短暂重绘的问题。
 
 ## v5.1.0 更新记录
 

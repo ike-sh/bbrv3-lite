@@ -8,10 +8,11 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.1.1: 修复一键优化 IPv6 失败误报成功，并修复确认重启后菜单短暂重绘。
 # v5.1.0: 修复 XanMod 按 CPU level 选包，新增环境预检、一键汇总、DoH 端口避让、快捷命令与回滚入口。
 # v5.0.0 精简版: 仅保留 BBR v3 / XanMod / TCP 网络调优相关功能，删除非调优部署工具入口与实现。
 
-SCRIPT_VERSION="5.1.0"
+SCRIPT_VERSION="5.1.1"
 #=============================================================================
 
 #=============================================================================
@@ -485,6 +486,18 @@ disable_ipv6_temporary() {
     break_end
 }
 
+ipv6_permanent_disabled_state() {
+    local ipv6_all
+    local ipv6_default
+    local ipv6_lo
+
+    ipv6_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "unknown")
+    ipv6_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo "unknown")
+    ipv6_lo=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || echo "unknown")
+
+    [ "$ipv6_all" = "1" ] && [ "$ipv6_default" = "1" ] && [ "$ipv6_lo" = "1" ]
+}
+
 disable_ipv6_permanent() {
     clear
     echo -e "${gl_kjlan}=== 永久禁用IPv6 ===${gl_bai}"
@@ -562,10 +575,15 @@ EOF
             sysctl --system >/dev/null 2>&1
             
             # 验证状态
-            local ipv6_status=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+            local ipv6_all_after
+            local ipv6_default_after
+            local ipv6_lo_after
+            ipv6_all_after=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "unknown")
+            ipv6_default_after=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo "unknown")
+            ipv6_lo_after=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || echo "unknown")
             
             echo ""
-            if [ "$ipv6_status" = "1" ]; then
+            if [ "$ipv6_all_after" = "1" ] && [ "$ipv6_default_after" = "1" ] && [ "$ipv6_lo_after" = "1" ]; then
                 echo -e "${gl_lv}✅ IPv6 已永久禁用${gl_bai}"
                 echo ""
                 echo -e "${gl_zi}说明：${gl_bai}"
@@ -573,20 +591,29 @@ EOF
                 echo "  - 备份文件: /etc/sysctl.d/.ipv6-state-backup.conf"
                 echo "  - 重启后此配置仍然生效"
                 echo "  - 如需恢复，请选择'取消永久禁用'选项"
+                echo ""
+                break_end
+                return 0
             else
                 echo -e "${gl_hong}❌ IPv6 禁用失败${gl_bai}"
+                echo "  all.disable_ipv6=${ipv6_all_after}"
+                echo "  default.disable_ipv6=${ipv6_default_after}"
+                echo "  lo.disable_ipv6=${ipv6_lo_after}"
                 # 如果失败，删除配置文件
                 rm -f /etc/sysctl.d/99-disable-ipv6.conf
                 rm -f /etc/sysctl.d/.ipv6-state-backup.conf
+                echo ""
+                break_end
+                return 1
             fi
             ;;
         *)
             echo "已取消"
+            echo ""
+            break_end
+            return 1
             ;;
     esac
-    
-    echo ""
-    break_end
 }
 
 cancel_ipv6_permanent_disable() {
@@ -811,7 +838,9 @@ server_reboot() {
     case "$rboot" in
         [Yy])
             echo "正在重启..."
-            reboot
+            systemctl reboot 2>/dev/null || reboot
+            sleep 2
+            exit 0
             ;;
         *)
             echo "已取消，请稍后手动执行: reboot"
@@ -5903,10 +5932,11 @@ one_click_optimize() {
         ipv6_choice=${ipv6_choice:-Y}
         if [[ "$ipv6_choice" =~ ^[Yy]$ ]]; then
             AUTO_MODE=1
-            if disable_ipv6_permanent; then
+            disable_ipv6_permanent
+            if ipv6_permanent_disabled_state; then
                 result_ipv6="已永久禁用"
             else
-                result_ipv6="失败"
+                result_ipv6="禁用失败，请检查 /etc/sysctl.d/99-disable-ipv6.conf 或手动执行菜单 6"
             fi
             AUTO_MODE=""
         else
