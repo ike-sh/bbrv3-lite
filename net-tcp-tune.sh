@@ -8,9 +8,10 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.1.0: 修复 XanMod 按 CPU level 选包，新增环境预检、一键汇总、DoH 端口避让、快捷命令与回滚入口。
 # v5.0.0 精简版: 仅保留 BBR v3 / XanMod / TCP 网络调优相关功能，删除非调优部署工具入口与实现。
 
-SCRIPT_VERSION="5.0.0"
+SCRIPT_VERSION="5.1.0"
 #=============================================================================
 
 #=============================================================================
@@ -2192,6 +2193,387 @@ check_bbr_status() {
 # XanMod 内核安装（官方源）
 #=============================================================================
 
+get_xanmod_codename() {
+    local os_id="" version_id="" version_codename=""
+
+    if [ ! -r /etc/os-release ]; then
+        echo -e "${gl_hong}错误: 无法读取 /etc/os-release，无法确定 XanMod APT 源版本${gl_bai}" >&2
+        return 1
+    fi
+
+    . /etc/os-release
+    os_id="${ID:-}"
+    version_id="${VERSION_ID:-}"
+    version_codename="${VERSION_CODENAME:-}"
+
+    case "$os_id" in
+        debian)
+            case "$version_id" in
+                12*) version_codename="bookworm" ;;
+                13*) version_codename="trixie" ;;
+            esac
+            ;;
+        ubuntu)
+            # Ubuntu 使用系统自身 VERSION_CODENAME
+            ;;
+        *)
+            echo -e "${gl_hong}错误: 仅支持 Debian 和 Ubuntu 系统${gl_bai}" >&2
+            return 1
+            ;;
+    esac
+
+    if [ -z "$version_codename" ]; then
+        echo -e "${gl_hong}错误: 未能从 /etc/os-release 读取 VERSION_CODENAME${gl_bai}" >&2
+        echo "请检查当前 Debian/Ubuntu 版本是否受 XanMod APT 源支持" >&2
+        return 1
+    fi
+
+    echo "$version_codename"
+}
+
+write_xanmod_apt_source() {
+    local gpg_key_file="$1"
+    local xanmod_repo_file="$2"
+    local version_codename
+
+    version_codename=$(get_xanmod_codename) || return 1
+    echo "检测到 XanMod APT 源代号: ${version_codename}"
+    echo "deb [signed-by=${gpg_key_file}] http://deb.xanmod.org ${version_codename} main" | \
+        tee "$xanmod_repo_file" > /dev/null
+}
+
+detect_x64_level() {
+    local cpu_arch
+    cpu_arch=$(uname -m)
+
+    if [ "$cpu_arch" != "x86_64" ]; then
+        echo "unknown"
+        return 1
+    fi
+
+    local cpu_flags
+    cpu_flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)
+
+    if [ -z "$cpu_flags" ]; then
+        echo "1"
+        return 0
+    fi
+
+    has_cpu_flags() {
+        local required_flag
+        for required_flag in "$@"; do
+            if ! echo "$cpu_flags" | grep -qw "$required_flag"; then
+                return 1
+            fi
+        done
+        return 0
+    }
+
+    if has_cpu_flags avx512f avx512bw avx512cd avx512dq avx512vl; then
+        echo "4"
+    elif has_cpu_flags avx avx2 bmi1 bmi2 fma movbe xsave; then
+        echo "3"
+    elif has_cpu_flags cx16 lahf_lm popcnt pni sse4_1 sse4_2 ssse3; then
+        echo "2"
+    else
+        echo "1"
+    fi
+
+    unset -f has_cpu_flags >/dev/null 2>&1 || true
+}
+
+xanmod_candidate_list_for_cpu() {
+    local cpu_level="$1"
+
+    case "$cpu_level" in
+        4)
+            printf '%s\n' \
+                linux-xanmod-lts-x64v4 linux-xanmod-x64v4 \
+                linux-xanmod-lts-x64v3 linux-xanmod-x64v3 \
+                linux-xanmod-lts-x64v2 linux-xanmod-x64v2 \
+                linux-xanmod-lts-x64v1 linux-xanmod-x64v1
+            ;;
+        3)
+            printf '%s\n' \
+                linux-xanmod-lts-x64v3 linux-xanmod-x64v3 \
+                linux-xanmod-lts-x64v2 linux-xanmod-x64v2 \
+                linux-xanmod-lts-x64v1 linux-xanmod-x64v1
+            ;;
+        2)
+            printf '%s\n' \
+                linux-xanmod-lts-x64v2 linux-xanmod-x64v2 \
+                linux-xanmod-lts-x64v1 linux-xanmod-x64v1
+            ;;
+        *)
+            printf '%s\n' \
+                linux-xanmod-lts-x64v1 linux-xanmod-x64v1
+            ;;
+    esac
+}
+
+select_xanmod_package() {
+    local cpu_level="$1"
+    local available_packages=""
+    local candidate=""
+    local candidate_packages=""
+
+    if ! [[ "$cpu_level" =~ ^[1-4]$ ]]; then
+        cpu_level="1"
+    fi
+
+    available_packages=$(apt-cache search '^linux-xanmod' 2>/dev/null | awk '{print $1}' | sort -u)
+
+    if [ -z "$available_packages" ]; then
+        echo -e "${gl_hong}错误: 未从 XanMod APT 源找到任何 linux-xanmod 包${gl_bai}" >&2
+        echo "请检查 Debian/Ubuntu 版本、/etc/os-release 中的 VERSION_CODENAME，以及 XanMod APT 源是否可用。" >&2
+        echo "当前 apt-cache search '^linux-xanmod' 无结果。" >&2
+        return 1
+    fi
+
+    candidate_packages=$(xanmod_candidate_list_for_cpu "$cpu_level")
+
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        if echo "$available_packages" | grep -qx "$candidate"; then
+            echo "$candidate"
+            return 0
+        fi
+    done <<< "$candidate_packages"
+
+    echo -e "${gl_hong}错误: 未找到适合当前 CPU 等级 x86-64-v${cpu_level} 的 linux-xanmod 包${gl_bai}" >&2
+    echo "请检查 Debian/Ubuntu 版本、XanMod APT 源，以及仓库中可用的 linux-xanmod 包名。" >&2
+    echo "" >&2
+    echo "按当前 CPU level 允许选择的包:" >&2
+    echo "$candidate_packages" | sed 's/^/  - /' >&2
+    echo "" >&2
+    echo "当前 apt-cache search '^linux-xanmod' 可见包:" >&2
+    echo "$available_packages" | sed 's/^/  - /' >&2
+    return 1
+}
+
+tcp_port_reachable() {
+    local host="$1"
+    local port="$2"
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 4 bash -c ":</dev/tcp/${host}/${port}" >/dev/null 2>&1
+    else
+        bash -c ":</dev/tcp/${host}/${port}" >/dev/null 2>&1
+    fi
+}
+
+detect_virtualization_type() {
+    local virt_type="unknown"
+
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        virt_type=$(systemd-detect-virt 2>/dev/null || echo "none")
+    elif [ -f /proc/user_beancounters ] || [ -d /proc/vz ]; then
+        virt_type="openvz"
+    elif grep -qaE 'docker|kubepods|containerd' /proc/1/cgroup 2>/dev/null; then
+        virt_type="docker"
+    fi
+
+    case "$virt_type" in
+        kvm) echo "KVM" ;;
+        vmware) echo "VMware" ;;
+        microsoft) echo "Hyper-V" ;;
+        lxc) echo "LXC" ;;
+        openvz) echo "OpenVZ" ;;
+        docker|podman|container) echo "Docker" ;;
+        none|"") echo "unknown" ;;
+        *) echo "$virt_type" ;;
+    esac
+}
+
+is_bbr_v3_active() {
+    local current_cc=""
+    local bbr_version=""
+
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    bbr_version=$(modinfo tcp_bbr 2>/dev/null | awk '/^version:/ {print $2}' | head -1)
+
+    [ "$current_cc" = "bbr" ] && [ "$bbr_version" = "3" ]
+}
+
+show_environment_precheck() {
+    clear
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo -e "${gl_kjlan}   环境预检 / 兼容性检查（只读，不修改系统）${gl_bai}"
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo ""
+
+    local os_id="unknown" version_id="unknown" version_codename="unknown" pretty_name="unknown"
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        os_id="${ID:-unknown}"
+        version_id="${VERSION_ID:-unknown}"
+        version_codename="${VERSION_CODENAME:-unknown}"
+        pretty_name="${PRETTY_NAME:-unknown}"
+    fi
+
+    local cpu_arch
+    cpu_arch=$(uname -m)
+    local cpu_level
+    cpu_level=$(detect_x64_level 2>/dev/null || echo "unknown")
+    if [[ "$cpu_level" =~ ^[1-4]$ ]]; then
+        cpu_level="x64v${cpu_level}"
+    else
+        cpu_level="unknown"
+    fi
+
+    local virt_type
+    virt_type=$(detect_virtualization_type)
+    local is_root="否"
+    [ "${EUID:-$(id -u)}" -eq 0 ] && is_root="是"
+    local has_systemd="否"
+    [ -d /run/systemd/system ] && has_systemd="是"
+    local has_systemctl="否"
+    command -v systemctl >/dev/null 2>&1 && has_systemctl="是"
+
+    local kernel_version
+    kernel_version=$(uname -r)
+    local current_cc current_qdisc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+
+    local xanmod_installed="否"
+    if uname -r | grep -qi xanmod || dpkg-query -W -f='${Package}\n' 'linux-*xanmod*' 2>/dev/null | grep -q xanmod; then
+        xanmod_installed="是"
+    fi
+
+    local bbr_v3="否"
+    is_bbr_v3_active && bbr_v3="是"
+
+    local grub_exists="否"
+    if [ -d /boot/grub ] || command -v update-grub >/dev/null 2>&1 || command -v grub-mkconfig >/dev/null 2>&1; then
+        grub_exists="是"
+    fi
+
+    local old_kernel_status="未知"
+    if command -v dpkg-query >/dev/null 2>&1; then
+        local kernel_count
+        kernel_count=$(dpkg-query -W -f='${Package}\n' 'linux-image-*' 2>/dev/null | grep -E '^linux-image-[0-9]|^linux-image-(amd64|cloud-amd64|generic)' | wc -l | tr -d ' ')
+        if [ "${kernel_count:-0}" -gt 1 ]; then
+            old_kernel_status="存在多个内核包（${kernel_count} 个）"
+        elif [ "${kernel_count:-0}" -eq 1 ]; then
+            old_kernel_status="仅检测到 1 个内核包"
+        else
+            old_kernel_status="未检测到 dpkg 内核包"
+        fi
+    fi
+
+    local xanmod_codename="不可用"
+    local xanmod_source_status="未检查"
+    if xanmod_codename=$(get_xanmod_codename 2>/dev/null); then
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fsSL --max-time 6 "http://deb.xanmod.org/dists/${xanmod_codename}/Release" -o /dev/null 2>/dev/null; then
+                xanmod_source_status="可访问"
+            else
+                xanmod_source_status="不可访问或被网络拦截"
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if wget -q --timeout=6 --spider "http://deb.xanmod.org/dists/${xanmod_codename}/Release" 2>/dev/null; then
+                xanmod_source_status="可访问"
+            else
+                xanmod_source_status="不可访问或被网络拦截"
+            fi
+        else
+            xanmod_source_status="未安装 curl/wget，无法检查"
+        fi
+    else
+        xanmod_codename="不可用"
+    fi
+
+    local xanmod_candidates
+    xanmod_candidates=$(apt-cache search '^linux-xanmod' 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
+    [ -z "$xanmod_candidates" ] && xanmod_candidates="当前 apt-cache 无候选（未添加源或未 apt update）"
+
+    local dot_status="不可达"
+    if tcp_port_reachable "1.1.1.1" 853 || tcp_port_reachable "8.8.8.8" 853; then
+        dot_status="可达"
+    fi
+
+    local doh_status="不可达"
+    if tcp_port_reachable "cloudflare-dns.com" 443 || tcp_port_reachable "dns.google" 443; then
+        doh_status="可达"
+    fi
+
+    local resolv_nameservers
+    resolv_nameservers=$(grep -E '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+    [ -z "$resolv_nameservers" ] && resolv_nameservers="未读取到 nameserver"
+
+    local ipv6_state="未知"
+    local ipv6_disabled
+    ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "unknown")
+    case "$ipv6_disabled" in
+        0) ipv6_state="已启用" ;;
+        1) ipv6_state="已禁用" ;;
+        *) ipv6_state="未知" ;;
+    esac
+
+    local swap_state="未启用"
+    if swapon --show 2>/dev/null | awk 'NR>1 {found=1} END {exit !found}'; then
+        swap_state="已启用"
+    fi
+
+    local disk_free
+    disk_free=$(df -h / 2>/dev/null | awk 'NR==2 {print $4 " 可用 / 总计 " $2}' || echo "未知")
+
+    echo -e "${gl_kjlan}[基础环境]${gl_bai}"
+    echo "  发行版: ${pretty_name}"
+    echo "  ID / VERSION_ID / CODENAME: ${os_id} / ${version_id} / ${version_codename}"
+    echo "  CPU 架构: ${cpu_arch}"
+    echo "  CPU level: ${cpu_level}"
+    echo "  虚拟化类型: ${virt_type}"
+    echo "  是否 root: ${is_root}"
+    echo "  systemd: ${has_systemd}"
+    echo "  systemctl: ${has_systemctl}"
+    echo ""
+
+    echo -e "${gl_kjlan}[当前网络内核状态]${gl_bai}"
+    echo "  当前内核: ${kernel_version}"
+    echo "  拥塞控制: ${current_cc}"
+    echo "  队列算法: ${current_qdisc}"
+    echo "  是否已安装/运行 XanMod: ${xanmod_installed}"
+    echo "  是否 BBR v3: ${bbr_v3}"
+    echo "  GRUB: ${grub_exists}"
+    echo "  旧内核包: ${old_kernel_status}"
+    echo ""
+
+    echo -e "${gl_kjlan}[XanMod 源检查]${gl_bai}"
+    echo "  XanMod codename: ${xanmod_codename}"
+    echo "  XanMod APT 源: ${xanmod_source_status}"
+    echo "  可用 linux-xanmod 候选: ${xanmod_candidates}"
+    echo ""
+
+    echo -e "${gl_kjlan}[DNS / IPv6 / 资源]${gl_bai}"
+    echo "  DoT 853 连通性: ${dot_status}"
+    echo "  DoH 443 连通性: ${doh_status}"
+    echo "  resolv.conf nameserver: ${resolv_nameservers}"
+    echo "  IPv6 当前状态: ${ipv6_state}"
+    echo "  SWAP 当前状态: ${swap_state}"
+    echo "  磁盘剩余空间: ${disk_free}"
+    echo ""
+
+    local conclusion="谨慎：只建议 TCP/sysctl 调优，不建议换内核"
+    if echo "$virt_type" | grep -Eq 'LXC|OpenVZ|Docker'; then
+        conclusion="不支持：容器/OpenVZ/LXC 环境通常不能自行更换内核"
+    elif [ "$has_systemd" != "是" ] || [ "$has_systemctl" != "是" ]; then
+        conclusion="谨慎：非完整 systemd 环境，DNS 净化和服务持久化可能不可用"
+    elif [ "$cpu_arch" = "x86_64" ] && [[ "$os_id" =~ ^(debian|ubuntu)$ ]]; then
+        conclusion="推荐：适合完整安装 XanMod + BBR v3，并执行 TCP 调优"
+    elif [ "$cpu_arch" = "aarch64" ] && [[ "$os_id" =~ ^(debian|ubuntu)$ ]]; then
+        conclusion="谨慎：ARM64 仅实验/部分支持，建议先确认内核安装脚本兼容性"
+    fi
+
+    echo -e "${gl_kjlan}[兼容性结论]${gl_bai}"
+    echo -e "  ${gl_huang}${conclusion}${gl_bai}"
+    echo ""
+    echo "提示：此页只读，不会安装软件、写入配置或修改系统。"
+    echo ""
+    break_end
+}
+
 install_xanmod_kernel() {
     clear
     echo -e "${gl_kjlan}=== 安装 XanMod 内核与 BBR v3 ===${gl_bai}"
@@ -2304,17 +2686,9 @@ install_xanmod_kernel() {
     fi
 
     # x86_64 架构安装流程
-    # 检查系统支持
-    if [ -r /etc/os-release ]; then
-        . /etc/os-release
-        if [ "$ID" != "debian" ] && [ "$ID" != "ubuntu" ]; then
-            echo -e "${gl_hong}错误: 仅支持 Debian 和 Ubuntu 系统${gl_bai}"
-            return 1
-        fi
-    else
-        echo -e "${gl_hong}错误: 无法确定操作系统类型${gl_bai}"
-        return 1
-    fi
+    # 检查系统支持并解析 XanMod APT 源代号
+    local xanmod_codename
+    xanmod_codename=$(get_xanmod_codename) || return 1
 
     # 环境准备
     check_disk_space 3 || return 1
@@ -2357,48 +2731,42 @@ install_xanmod_kernel() {
 
     local xanmod_repo_file="/etc/apt/sources.list.d/xanmod-release.list"
 
-    # 添加 XanMod 仓库（使用 HTTPS）
-    echo "deb [signed-by=${gpg_key_file}] https://deb.xanmod.org releases main" | \
-        tee "$xanmod_repo_file" > /dev/null
+    # 添加 XanMod 仓库（按系统 VERSION_CODENAME 动态选择）
+    if ! write_xanmod_apt_source "$gpg_key_file" "$xanmod_repo_file"; then
+        rm -f "$xanmod_repo_file"
+        return 1
+    fi
 
-    # 检测 CPU 架构版本（使用安全临时目录）
+    # 检测 CPU 架构版本
     echo "正在检测 CPU 支持的最优内核版本..."
-    local detect_dir=$(mktemp -d)
-    local detect_script="${detect_dir}/check_x86-64_psabi.sh"
     local version=""
-
-    if wget -qO "$detect_script" "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/check_x86-64_psabi.sh" 2>/dev/null && \
-       [ -s "$detect_script" ]; then
-        chmod +x "$detect_script"
-        version=$("$detect_script" 2>/dev/null | sed -nE 's/.*x86-64-v([1-4]).*/\1/p' | head -1)
-    fi
-    rm -rf "$detect_dir"
-
-    # 在线检测失败时，使用本地 /proc/cpuinfo 检测 CPU 支持的最高等级
+    version=$(detect_x64_level)
     if ! [[ "$version" =~ ^[1-4]$ ]]; then
-        echo -e "${gl_huang}在线检测脚本不可用，使用本地 CPU 特征检测...${gl_bai}"
-        local cpu_flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null)
-        if echo "$cpu_flags" | grep -qw 'avx512f'; then
-            version="4"
-        elif echo "$cpu_flags" | grep -qw 'avx2'; then
-            version="3"
-        elif echo "$cpu_flags" | grep -qw 'sse4_2'; then
-            version="2"
-        else
-            version="1"
-        fi
-        echo -e "${gl_lv}本地检测结果: CPU 支持 x86-64-v${version}${gl_bai}"
+        echo -e "${gl_huang}无法可靠识别 CPU level，按 x86-64-v1 安全处理${gl_bai}"
+        version="1"
     fi
+    echo -e "${gl_lv}检测到 CPU level: x86-64-v${version}${gl_bai}"
 
-    echo -e "${gl_lv}将安装: linux-xanmod-x64v${version}${gl_bai}"
-
-    # 安装 XanMod 内核
     echo "正在更新软件包列表..."
     if ! apt-get update; then
         echo -e "${gl_huang}⚠️  apt-get update 部分失败，尝试继续安装...${gl_bai}"
     fi
 
-    apt-get install -y "linux-xanmod-x64v${version}"
+    local selected_xanmod_pkg
+    if ! selected_xanmod_pkg=$(select_xanmod_package "$version"); then
+        rm -f "$xanmod_repo_file"
+        return 1
+    fi
+
+    echo -e "${gl_kjlan}━━━━━━━━━━ XanMod 安装信息 ━━━━━━━━━━${gl_bai}"
+    echo -e "  当前系统 codename: ${gl_lv}${xanmod_codename}${gl_bai}"
+    echo -e "  检测到 CPU level: ${gl_lv}x86-64-v${version}${gl_bai}"
+    echo -e "  最终选择的 XanMod 包名: ${gl_lv}${selected_xanmod_pkg}${gl_bai}"
+    echo -e "  当前 XanMod APT 源: ${gl_lv}http://deb.xanmod.org ${xanmod_codename} main${gl_bai}"
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+
+    # 安装 XanMod 内核
+    apt-get install -y "$selected_xanmod_pkg"
 
     if [ $? -ne 0 ]; then
         echo -e "${gl_hong}内核安装失败！${gl_bai}"
@@ -2407,7 +2775,7 @@ install_xanmod_kernel() {
     fi
 
     # 验证内核是否真正安装成功
-    if ! dpkg -l 2>/dev/null | grep -qE "^ii\s+linux-xanmod-x64v${version}"; then
+    if ! dpkg-query -W -f='${Status}' "$selected_xanmod_pkg" 2>/dev/null | grep -q "install ok installed"; then
         echo -e "${gl_hong}内核包安装验证失败！${gl_bai}"
         rm -f "$xanmod_repo_file"
         return 1
@@ -2418,7 +2786,8 @@ install_xanmod_kernel() {
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━ CPU 架构信息 ━━━━━━━━━━${gl_bai}"
     echo -e "  CPU 架构等级: ${gl_lv}x86-64-v${version}${gl_bai}"
-    echo -e "  安装内核版本: ${gl_lv}linux-xanmod-x64v${version}${gl_bai}"
+    echo -e "  安装内核包名: ${gl_lv}${selected_xanmod_pkg}${gl_bai}"
+    echo -e "  APT 源代号: ${gl_lv}${xanmod_codename}${gl_bai}"
     echo -e "  ${gl_huang}说明: 本机 CPU 最高支持 v${version}，已安装该等级的最新内核${gl_bai}"
     echo -e "  ${gl_huang}不同等级(v1-v4)的内核更新进度可能不同，以 XanMod 官方仓库为准${gl_bai}"
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
@@ -2769,6 +3138,8 @@ dns_purify_fix_systemd_resolved() {
 # DNS净化 - 主执行函数（SSH安全版）
 dns_purify_and_harden() {
     clear
+    DNS_PURIFY_RESULT="未执行"
+    DNS_PURIFY_ROLLBACK=""
     echo -e "${gl_kjlan}╔════════════════════════════════════════════════════════════╗${gl_bai}"
     echo -e "${gl_kjlan}║    DNS净化与安全加固脚本 - SSH安全增强版 v2.0             ║${gl_bai}"
     echo -e "${gl_kjlan}╚════════════════════════════════════════════════════════════╝${gl_bai}"
@@ -3043,6 +3414,7 @@ dns_purify_and_harden() {
     local BACKUP_DIR="/root/.dns_purify_backup/$(date +%Y%m%d_%H%M%S)"
     local PRE_STATE_DIR="$BACKUP_DIR/pre_state"
     mkdir -p "$BACKUP_DIR" "$PRE_STATE_DIR"
+    DNS_PURIFY_ROLLBACK="$BACKUP_DIR/rollback.sh"
     echo ""
     echo -e "${gl_lv}✅ 创建备份目录：$BACKUP_DIR${gl_bai}"
     echo ""
@@ -3073,7 +3445,12 @@ dns_purify_and_harden() {
     # 解析 DNS 地址中的 SNI 后缀（例如 1.1.1.1#cloudflare-dns.com -> 1.1.1.1）
     plain_dns_ip() {
         local dns_addr="$1"
-        echo "${dns_addr%%#*}"
+        local stripped="${dns_addr%%#*}"
+        if [[ "$stripped" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+            echo "${stripped%:*}"
+        else
+            echo "$stripped"
+        fi
     }
 
     # 预先快照本次功能可能修改的关键文件
@@ -3085,6 +3462,7 @@ dns_purify_and_harden() {
     backup_path_state "/usr/local/bin/dns-purify-apply.sh" "dns-purify-apply.sh"
     backup_path_state "/etc/systemd/system/systemd-resolved.service.d/dbus-fix.conf" "dbus-fix.conf"
     backup_path_state "/etc/NetworkManager/conf.d/99-dns-purify.conf" "nm-99-dns-purify.conf"
+    backup_path_state "/etc/dnscrypt-proxy/dnscrypt-proxy.toml" "dnscrypt-proxy.toml"
 
     # 快照 if-up.d/resolved 执行权限状态
     local ifup_script="/etc/network/if-up.d/resolved"
@@ -3122,6 +3500,23 @@ dns_purify_and_harden() {
         echo "false" > "$PRE_STATE_DIR/resolved.was-active"
     fi
 
+    # 快照 dnscrypt-proxy 状态（DoH fallback 回滚使用）
+    if dpkg -s dnscrypt-proxy >/dev/null 2>&1; then
+        echo "true" > "$PRE_STATE_DIR/had-dnscrypt-proxy.pkg"
+    else
+        echo "false" > "$PRE_STATE_DIR/had-dnscrypt-proxy.pkg"
+    fi
+    if systemctl is-enabled --quiet dnscrypt-proxy 2>/dev/null; then
+        echo "true" > "$PRE_STATE_DIR/dnscrypt-proxy.was-enabled"
+    else
+        echo "false" > "$PRE_STATE_DIR/dnscrypt-proxy.was-enabled"
+    fi
+    if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+        echo "true" > "$PRE_STATE_DIR/dnscrypt-proxy.was-active"
+    else
+        echo "false" > "$PRE_STATE_DIR/dnscrypt-proxy.was-active"
+    fi
+
     # 快照 resolvconf 包状态（用于 Debian 11 回滚）
     if dpkg -s resolvconf >/dev/null 2>&1; then
         echo "true" > "$PRE_STATE_DIR/had-resolvconf.pkg"
@@ -3147,8 +3542,106 @@ dns_purify_and_harden() {
         echo "$existing_dropin|$dropin_key" >> "$PRE_STATE_DIR/networkd-dropins.map"
     done
 
+    # 预生成基础回滚脚本，确保 DoH/降级/跳过分支也有可用回滚入口
+    cat > "$BACKUP_DIR/rollback.sh" << 'ROLLBACK_SCRIPT'
+#!/bin/bash
+# DNS配置基础回滚脚本
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  DNS配置基础回滚脚本"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+BACKUP_DIR="$(dirname "$0")"
+PRE_STATE_DIR="$BACKUP_DIR/pre_state"
+
+restore_path_state() {
+    local dst="$1"
+    local key="$2"
+    rm -f "$dst" 2>/dev/null || true
+    if [[ -e "$PRE_STATE_DIR/$key" || -L "$PRE_STATE_DIR/$key" ]]; then
+        mkdir -p "$(dirname "$dst")"
+        cp -a "$PRE_STATE_DIR/$key" "$dst" 2>/dev/null || true
+    elif [[ -f "$PRE_STATE_DIR/$key.absent" ]]; then
+        rm -f "$dst" 2>/dev/null || true
+    fi
+}
+
+restore_path_state "/etc/systemd/resolved.conf" "resolved.conf"
+restore_path_state "/etc/dnscrypt-proxy/dnscrypt-proxy.toml" "dnscrypt-proxy.toml"
+
+if command -v systemctl >/dev/null 2>&1; then
+    resolved_enable_state="unknown"
+    resolved_was_masked="false"
+    resolved_was_active="false"
+    [[ -f "$PRE_STATE_DIR/resolved.enable-state" ]] && resolved_enable_state=$(cat "$PRE_STATE_DIR/resolved.enable-state" 2>/dev/null || echo "unknown")
+    [[ -f "$PRE_STATE_DIR/resolved.was-masked" ]] && resolved_was_masked=$(cat "$PRE_STATE_DIR/resolved.was-masked" 2>/dev/null || echo "false")
+    [[ -f "$PRE_STATE_DIR/resolved.was-active" ]] && resolved_was_active=$(cat "$PRE_STATE_DIR/resolved.was-active" 2>/dev/null || echo "false")
+
+    if [[ "$resolved_was_masked" == "true" ]]; then
+        systemctl mask systemd-resolved 2>/dev/null || true
+        systemctl stop systemd-resolved 2>/dev/null || true
+    else
+        systemctl unmask systemd-resolved 2>/dev/null || true
+        case "$resolved_enable_state" in
+            enabled|enabled-runtime)
+                systemctl enable systemd-resolved 2>/dev/null || true
+                ;;
+            static|indirect|generated)
+                ;;
+            *)
+                systemctl disable systemd-resolved 2>/dev/null || true
+                ;;
+        esac
+        if [[ "$resolved_was_active" == "true" ]]; then
+            systemctl restart systemd-resolved 2>/dev/null || systemctl start systemd-resolved 2>/dev/null || true
+        else
+            systemctl stop systemd-resolved 2>/dev/null || true
+        fi
+    fi
+
+    had_dnscrypt_proxy_pkg="false"
+    dnscrypt_proxy_was_enabled="false"
+    dnscrypt_proxy_was_active="false"
+    [[ -f "$PRE_STATE_DIR/had-dnscrypt-proxy.pkg" ]] && had_dnscrypt_proxy_pkg=$(cat "$PRE_STATE_DIR/had-dnscrypt-proxy.pkg" 2>/dev/null || echo "false")
+    [[ -f "$PRE_STATE_DIR/dnscrypt-proxy.was-enabled" ]] && dnscrypt_proxy_was_enabled=$(cat "$PRE_STATE_DIR/dnscrypt-proxy.was-enabled" 2>/dev/null || echo "false")
+    [[ -f "$PRE_STATE_DIR/dnscrypt-proxy.was-active" ]] && dnscrypt_proxy_was_active=$(cat "$PRE_STATE_DIR/dnscrypt-proxy.was-active" 2>/dev/null || echo "false")
+    if dpkg -s dnscrypt-proxy >/dev/null 2>&1; then
+        if [[ "$had_dnscrypt_proxy_pkg" == "true" ]]; then
+            if [[ "$dnscrypt_proxy_was_enabled" == "true" ]]; then
+                systemctl enable dnscrypt-proxy 2>/dev/null || true
+            else
+                systemctl disable dnscrypt-proxy 2>/dev/null || true
+            fi
+            if [[ "$dnscrypt_proxy_was_active" == "true" ]]; then
+                systemctl restart dnscrypt-proxy 2>/dev/null || systemctl start dnscrypt-proxy 2>/dev/null || true
+            else
+                systemctl stop dnscrypt-proxy 2>/dev/null || true
+            fi
+        else
+            systemctl disable --now dnscrypt-proxy 2>/dev/null || true
+        fi
+    fi
+fi
+
+if [[ -L "$PRE_STATE_DIR/resolv.conf" ]]; then
+    backup_link_target=$(readlink "$PRE_STATE_DIR/resolv.conf" 2>/dev/null || echo "")
+    if [[ "$backup_link_target" == *"stub-resolv.conf"* ]] && [[ ! -f /run/systemd/resolve/stub-resolv.conf ]]; then
+        rm -f /etc/resolv.conf 2>/dev/null || true
+        echo "nameserver 127.0.0.53" > /etc/resolv.conf 2>/dev/null || true
+    else
+        restore_path_state "/etc/resolv.conf" "resolv.conf"
+    fi
+else
+    restore_path_state "/etc/resolv.conf" "resolv.conf"
+fi
+
+echo "基础回滚完成。"
+ROLLBACK_SCRIPT
+    chmod +x "$BACKUP_DIR/rollback.sh"
+
     # 退出函数时自动清理本函数内动态定义的 helper，避免影响其他功能
-    trap 'unset -f backup_path_state restore_path_state plain_dns_ip auto_rollback_dns_purify dns_runtime_health_check can_connect_tcp >/dev/null 2>&1 || true' RETURN
+    trap 'unset -f backup_path_state restore_path_state plain_dns_ip auto_rollback_dns_purify dns_runtime_health_check can_connect_tcp local_port_busy select_dnscrypt_listen_address configure_dnscrypt_proxy apply_plain_dns_fallback >/dev/null 2>&1 || true' RETURN
 
     # 自动回滚函数（失败即恢复，避免遗留DNS隐患）
     auto_rollback_dns_purify() {
@@ -3161,6 +3654,31 @@ dns_purify_and_harden() {
         restore_path_state "/usr/local/bin/dns-purify-apply.sh" "dns-purify-apply.sh"
         restore_path_state "/etc/systemd/system/systemd-resolved.service.d/dbus-fix.conf" "dbus-fix.conf"
         restore_path_state "/etc/NetworkManager/conf.d/99-dns-purify.conf" "nm-99-dns-purify.conf"
+        restore_path_state "/etc/dnscrypt-proxy/dnscrypt-proxy.toml" "dnscrypt-proxy.toml"
+
+        # 恢复 dnscrypt-proxy 服务状态（DoH fallback）
+        local had_dnscrypt_proxy_pkg="false"
+        local dnscrypt_proxy_was_enabled="false"
+        local dnscrypt_proxy_was_active="false"
+        [[ -f "$PRE_STATE_DIR/had-dnscrypt-proxy.pkg" ]] && had_dnscrypt_proxy_pkg=$(cat "$PRE_STATE_DIR/had-dnscrypt-proxy.pkg" 2>/dev/null || echo "false")
+        [[ -f "$PRE_STATE_DIR/dnscrypt-proxy.was-enabled" ]] && dnscrypt_proxy_was_enabled=$(cat "$PRE_STATE_DIR/dnscrypt-proxy.was-enabled" 2>/dev/null || echo "false")
+        [[ -f "$PRE_STATE_DIR/dnscrypt-proxy.was-active" ]] && dnscrypt_proxy_was_active=$(cat "$PRE_STATE_DIR/dnscrypt-proxy.was-active" 2>/dev/null || echo "false")
+        if dpkg -s dnscrypt-proxy >/dev/null 2>&1; then
+            if [[ "$had_dnscrypt_proxy_pkg" == "true" ]]; then
+                if [[ "$dnscrypt_proxy_was_enabled" == "true" ]]; then
+                    systemctl enable dnscrypt-proxy 2>/dev/null || true
+                else
+                    systemctl disable dnscrypt-proxy 2>/dev/null || true
+                fi
+                if [[ "$dnscrypt_proxy_was_active" == "true" ]]; then
+                    systemctl restart dnscrypt-proxy 2>/dev/null || systemctl start dnscrypt-proxy 2>/dev/null || true
+                else
+                    systemctl stop dnscrypt-proxy 2>/dev/null || true
+                fi
+            else
+                systemctl disable --now dnscrypt-proxy 2>/dev/null || true
+            fi
+        fi
 
         # 恢复 if-up.d/resolved 执行权限
         if [[ -f "$PRE_STATE_DIR/ifup-resolved.exec" ]]; then
@@ -3362,6 +3880,121 @@ dns_purify_and_harden() {
         fi
     }
 
+    local_port_busy() {
+        local port="$1"
+
+        if command -v ss >/dev/null 2>&1; then
+            ss -lntup 2>/dev/null | grep -Eq "(:|\\])${port}([[:space:]]|$)" && return 0
+        fi
+        if command -v lsof >/dev/null 2>&1; then
+            lsof -nP -iTCP:"$port" -iUDP:"$port" 2>/dev/null | awk 'NR>1 {found=1} END {exit !found}' && return 0
+        fi
+        if command -v netstat >/dev/null 2>&1; then
+            netstat -lntup 2>/dev/null | grep -Eq "(:|\\])${port}([[:space:]]|$)" && return 0
+        fi
+
+        return 1
+    }
+
+    select_dnscrypt_listen_address() {
+        DNSCRYPT_LISTEN_ADDR="127.0.0.1:53"
+        DNSCRYPT_RESOLVED_DNS="127.0.0.1"
+
+        if local_port_busy 53; then
+            echo -e "${gl_huang}⚠️  检测到本机 53 端口已被占用，dnscrypt-proxy 将改用 127.0.0.1:5353${gl_bai}"
+            if local_port_busy 5353; then
+                echo -e "${gl_hong}❌ 5353 端口也被占用，无法自动启用 DoH fallback${gl_bai}"
+                return 1
+            fi
+            DNSCRYPT_LISTEN_ADDR="127.0.0.1:5353"
+            DNSCRYPT_RESOLVED_DNS="127.0.0.1:5353"
+        else
+            echo -e "${gl_lv}✅ 本机 53 端口未被占用，dnscrypt-proxy 将监听 127.0.0.1:53${gl_bai}"
+        fi
+
+        echo -e "${gl_kjlan}dnscrypt-proxy 最终监听地址: ${DNSCRYPT_LISTEN_ADDR}${gl_bai}"
+        echo -e "${gl_kjlan}systemd-resolved 将指向: ${DNSCRYPT_RESOLVED_DNS}${gl_bai}"
+        return 0
+    }
+
+    configure_dnscrypt_proxy() {
+        local dnscrypt_conf="/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
+
+        echo -e "${gl_kjlan}正在配置 DoH 443 fallback（dnscrypt-proxy）...${gl_bai}"
+
+        if ! dpkg -s dnscrypt-proxy >/dev/null 2>&1; then
+            echo "  → 正在通过 apt 安装 dnscrypt-proxy..."
+            apt-get update -y >/dev/null 2>&1 || true
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y dnscrypt-proxy >/dev/null 2>&1; then
+                echo -e "${gl_hong}❌ dnscrypt-proxy 无法通过系统源自动安装${gl_bai}"
+                echo -e "${gl_huang}请确认当前系统源是否提供 dnscrypt-proxy；脚本不会强行编译安装。${gl_bai}"
+                return 1
+            fi
+        fi
+
+        if [[ ! -f "$dnscrypt_conf" ]]; then
+            echo -e "${gl_hong}❌ 未找到 dnscrypt-proxy 配置文件: $dnscrypt_conf${gl_bai}"
+            return 1
+        fi
+
+        select_dnscrypt_listen_address || return 1
+
+        set_dnscrypt_toml_key() {
+            local key="$1"
+            local value="$2"
+            if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$dnscrypt_conf"; then
+                sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "$dnscrypt_conf"
+            else
+                printf '\n%s = %s\n' "$key" "$value" >> "$dnscrypt_conf"
+            fi
+        }
+
+        set_dnscrypt_toml_key "server_names" "['cloudflare', 'google']"
+        set_dnscrypt_toml_key "listen_addresses" "['${DNSCRYPT_LISTEN_ADDR}']"
+        set_dnscrypt_toml_key "ipv4_servers" "true"
+        set_dnscrypt_toml_key "ipv6_servers" "false"
+        set_dnscrypt_toml_key "dnscrypt_servers" "false"
+        set_dnscrypt_toml_key "doh_servers" "true"
+        set_dnscrypt_toml_key "require_dnssec" "false"
+        set_dnscrypt_toml_key "require_nolog" "false"
+        set_dnscrypt_toml_key "require_nofilter" "false"
+        unset -f set_dnscrypt_toml_key >/dev/null 2>&1 || true
+
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable dnscrypt-proxy >/dev/null 2>&1 || true
+        if ! systemctl restart dnscrypt-proxy 2>/dev/null; then
+            echo -e "${gl_hong}❌ dnscrypt-proxy 启动失败${gl_bai}"
+            systemctl status dnscrypt-proxy --no-pager 2>/dev/null || true
+            return 1
+        fi
+
+        sleep 2
+        if ! systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+            echo -e "${gl_hong}❌ dnscrypt-proxy 未保持运行${gl_bai}"
+            return 1
+        fi
+
+        if command -v dnscrypt-proxy >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+            if ! timeout 10 dnscrypt-proxy -resolve cloudflare.com -config "$dnscrypt_conf" >/dev/null 2>&1; then
+                echo -e "${gl_huang}⚠️  dnscrypt-proxy DoH 解析自检未通过${gl_bai}"
+                return 1
+            fi
+        fi
+
+        echo -e "${gl_lv}✅ DoH 443 fallback 已启用，dnscrypt-proxy 监听 ${DNSCRYPT_LISTEN_ADDR}${gl_bai}"
+        return 0
+    }
+
+    apply_plain_dns_fallback() {
+        TARGET_DNS="8.8.8.8 1.1.1.1"
+        FALLBACK_DNS=""
+        DNS_OVER_TLS="no"
+        DNSSEC_MODE="no"
+        MODE_NAME="纯国外模式（普通 DNS 53 fallback）"
+        INTERFACE_DNS_PRIMARY="8.8.8.8"
+        INTERFACE_DNS_SECONDARY="1.1.1.1"
+    }
+
     # 目标DNS配置（根据用户选择的模式）
     local TARGET_DNS=""
     local FALLBACK_DNS=""
@@ -3371,6 +4004,8 @@ dns_purify_and_harden() {
     # 网卡级 DNS（用于 resolvectl）
     local INTERFACE_DNS_PRIMARY=""
     local INTERFACE_DNS_SECONDARY=""
+    local DNSCRYPT_LISTEN_ADDR="127.0.0.1:53"
+    local DNSCRYPT_RESOLVED_DNS="127.0.0.1"
     case "$dns_mode_choice" in
         1)
             # 纯国外模式
@@ -3395,17 +4030,64 @@ dns_purify_and_harden() {
             ;;
     esac
 
-    # strict DoT 预检：若目标机房到853不可达，直接中止（不自动降级）
+    # DoT 预检：853 不可达时提供 DoH/普通 DNS 降级，不直接终止
     if [[ "$dns_mode_choice" == "1" ]]; then
         local dot_reachable_count=0
         can_connect_tcp "8.8.8.8" 853 && dot_reachable_count=$((dot_reachable_count + 1))
         can_connect_tcp "1.1.1.1" 853 && dot_reachable_count=$((dot_reachable_count + 1))
 
         if [[ "$dot_reachable_count" -eq 0 ]]; then
-            echo -e "${gl_hong}❌ 预检失败：当前机房无法连通 DoT(853)，已终止执行（未做任何修改）${gl_bai}"
-            echo -e "${gl_huang}建议：改用模式2，或放开到 8.8.8.8/1.1.1.1 的 853 出口后再执行模式1${gl_bai}"
-            break_end
-            return 1
+            echo -e "${gl_huang}⚠️  检测到当前网络无法连接 DoT 853${gl_bai}"
+            echo "可能是 NAT 商家或机房防火墙封锁出站 853。"
+            echo ""
+
+            local doh_choice=""
+            read -e -p "$(echo -e "${gl_huang}是否自动切换到 DoH 443 模式？(Y/n): ${gl_bai}")" doh_choice
+            doh_choice=${doh_choice:-Y}
+
+            if [[ "$doh_choice" =~ ^[Yy]$ ]]; then
+                if configure_dnscrypt_proxy; then
+                    TARGET_DNS="$DNSCRYPT_RESOLVED_DNS"
+                    FALLBACK_DNS=""
+                    DNS_OVER_TLS="no"
+                    DNSSEC_MODE="no"
+                    MODE_NAME="纯国外模式（DoH 443 fallback）"
+                    INTERFACE_DNS_PRIMARY="$DNSCRYPT_RESOLVED_DNS"
+                    INTERFACE_DNS_SECONDARY="$DNSCRYPT_RESOLVED_DNS"
+                    DNS_PURIFY_RESULT="DoH fallback 已启用"
+                    echo -e "${gl_lv}DoH fallback 生效路径: systemd-resolved -> ${DNSCRYPT_RESOLVED_DNS} -> dnscrypt-proxy -> DoH 443${gl_bai}"
+                else
+                    echo -e "${gl_huang}⚠️  DoH 443 模式启用失败${gl_bai}"
+                    local plain_choice=""
+                    read -e -p "$(echo -e "${gl_huang}是否降级为普通 DNS 53？(Y/n): ${gl_bai}")" plain_choice
+                    plain_choice=${plain_choice:-Y}
+                    if [[ "$plain_choice" =~ ^[Yy]$ ]]; then
+                        auto_rollback_dns_purify
+                        apply_plain_dns_fallback
+                        DNS_PURIFY_RESULT="普通 DNS 53 fallback 已启用"
+                    else
+                        auto_rollback_dns_purify
+                        DNS_PURIFY_RESULT="用户跳过"
+                        echo -e "${gl_huang}已跳过 DNS 净化，不影响后续 BBR/TCP 调优流程${gl_bai}"
+                        return 0
+                    fi
+                fi
+            else
+                local plain_choice=""
+                read -e -p "$(echo -e "${gl_huang}是否降级为普通 DNS 53？(Y/n): ${gl_bai}")" plain_choice
+                plain_choice=${plain_choice:-Y}
+                if [[ "$plain_choice" =~ ^[Yy]$ ]]; then
+                    apply_plain_dns_fallback
+                    DNS_PURIFY_RESULT="普通 DNS 53 fallback 已启用"
+                else
+                    DNS_PURIFY_RESULT="用户跳过"
+                    echo -e "${gl_huang}已跳过 DNS 净化，不影响后续 BBR/TCP 调优流程${gl_bai}"
+                    return 0
+                fi
+            fi
+        else
+            DNS_PURIFY_RESULT="DoT 成功"
+            echo -e "${gl_lv}✅ DoT 853 可达，继续使用 systemd-resolved + DNSOverTLS${gl_bai}"
         fi
     fi
     
@@ -3708,10 +4390,10 @@ DNSStubListener=yes
         fi
         
         # 创建临时DNS配置文件
-        cat > /etc/resolv.conf.dbus_fix_temp << TEMP_DNS
+cat > /etc/resolv.conf.dbus_fix_temp << TEMP_DNS
 # 临时DNS配置（D-Bus修复期间使用）
-nameserver $INTERFACE_DNS_PRIMARY
-nameserver $INTERFACE_DNS_SECONDARY
+nameserver $(plain_dns_ip "$INTERFACE_DNS_PRIMARY")
+nameserver $(plain_dns_ip "$INTERFACE_DNS_SECONDARY")
 TEMP_DNS
         
         # 使用临时DNS配置
@@ -4253,6 +4935,31 @@ if [[ -d "$PRE_STATE_DIR" ]]; then
     restore_path_state "/usr/local/bin/dns-purify-apply.sh" "dns-purify-apply.sh"
     restore_path_state "/etc/systemd/system/systemd-resolved.service.d/dbus-fix.conf" "dbus-fix.conf"
     restore_path_state "/etc/NetworkManager/conf.d/99-dns-purify.conf" "nm-99-dns-purify.conf"
+    restore_path_state "/etc/dnscrypt-proxy/dnscrypt-proxy.toml" "dnscrypt-proxy.toml"
+
+    # 恢复 dnscrypt-proxy 配置与服务状态（DoH fallback）
+    had_dnscrypt_proxy_pkg="false"
+    dnscrypt_proxy_was_enabled="false"
+    dnscrypt_proxy_was_active="false"
+    [[ -f "$PRE_STATE_DIR/had-dnscrypt-proxy.pkg" ]] && had_dnscrypt_proxy_pkg=$(cat "$PRE_STATE_DIR/had-dnscrypt-proxy.pkg" 2>/dev/null || echo "false")
+    [[ -f "$PRE_STATE_DIR/dnscrypt-proxy.was-enabled" ]] && dnscrypt_proxy_was_enabled=$(cat "$PRE_STATE_DIR/dnscrypt-proxy.was-enabled" 2>/dev/null || echo "false")
+    [[ -f "$PRE_STATE_DIR/dnscrypt-proxy.was-active" ]] && dnscrypt_proxy_was_active=$(cat "$PRE_STATE_DIR/dnscrypt-proxy.was-active" 2>/dev/null || echo "false")
+    if dpkg -s dnscrypt-proxy >/dev/null 2>&1; then
+        if [[ "$had_dnscrypt_proxy_pkg" == "true" ]]; then
+            if [[ "$dnscrypt_proxy_was_enabled" == "true" ]]; then
+                systemctl enable dnscrypt-proxy 2>/dev/null || true
+            else
+                systemctl disable dnscrypt-proxy 2>/dev/null || true
+            fi
+            if [[ "$dnscrypt_proxy_was_active" == "true" ]]; then
+                systemctl restart dnscrypt-proxy 2>/dev/null || systemctl start dnscrypt-proxy 2>/dev/null || true
+            else
+                systemctl stop dnscrypt-proxy 2>/dev/null || true
+            fi
+        else
+            systemctl disable --now dnscrypt-proxy 2>/dev/null || true
+        fi
+    fi
 
     if [[ -f "$PRE_STATE_DIR/ifup-resolved.exec" ]]; then
         case "$(cat "$PRE_STATE_DIR/ifup-resolved.exec" 2>/dev/null)" in
@@ -4484,6 +5191,15 @@ ROLLBACK_SCRIPT
     echo -e "${gl_huang}如需回滚，执行：${gl_bai}"
     echo "  bash $BACKUP_DIR/rollback.sh"
     echo ""
+
+    if [ "$DNS_PURIFY_RESULT" = "未执行" ]; then
+        case "$MODE_NAME" in
+            *DoH*) DNS_PURIFY_RESULT="DoH fallback 已启用" ;;
+            *普通*) DNS_PURIFY_RESULT="普通 DNS 53 成功" ;;
+            *国内*) DNS_PURIFY_RESULT="普通 DNS 53 成功" ;;
+            *) DNS_PURIFY_RESULT="DoT 成功" ;;
+        esac
+    fi
 
     echo -e "${gl_lv}DNS净化脚本执行完成${gl_bai}"
     echo "原作者：NSdesk"
@@ -5080,6 +5796,13 @@ one_click_optimize() {
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
     echo ""
 
+    local result_kernel="未执行"
+    local result_tcp="跳过"
+    local result_dns="跳过"
+    local result_realm="跳过"
+    local result_ipv6="用户跳过"
+    local dns_rollback="-"
+
     # 检测当前是否已运行 XanMod 内核
     local xanmod_running=0
     if uname -r | grep -qi 'xanmod'; then
@@ -5096,16 +5819,35 @@ one_click_optimize() {
 
         install_xanmod_kernel
         if [ $? -eq 0 ]; then
+            result_kernel="需要重启"
             echo ""
             echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
             echo -e "${gl_lv}  ✅ 内核安装完成！${gl_bai}"
             echo -e "${gl_lv}  重启后再次进入脚本，选择“一键全自动优化”即可继续阶段2${gl_bai}"
             echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
             echo ""
+            echo -e "${gl_kjlan}一键优化结果汇总：${gl_bai}"
+            echo -e "[!] XanMod / BBR v3：${result_kernel}"
+            echo -e "[-] TCP 调优：等待重启后执行"
+            echo -e "[-] DNS 净化：等待重启后执行"
+            echo -e "[-] Realm 修复：等待重启后执行"
+            echo -e "[-] IPv6：等待重启后执行"
+            echo ""
             server_reboot
+        else
+            echo ""
+            echo -e "${gl_hong}一键优化结果汇总：${gl_bai}"
+            echo -e "[x] XanMod / BBR v3：安装失败"
+            echo -e "[-] TCP 调优：未执行"
+            echo -e "[-] DNS 净化：未执行"
+            echo -e "[-] Realm 修复：未执行"
+            echo -e "[-] IPv6：未执行"
+            echo ""
+            break_end
         fi
     else
         # ===== 阶段2：全自动优化 =====
+        result_kernel="已运行"
         echo -e "${gl_lv}✅ 检测到 XanMod 内核已运行：$(uname -r)${gl_bai}"
         echo ""
         echo -e "${gl_huang}▶ 阶段 2/2：全自动网络优化${gl_bai}"
@@ -5120,15 +5862,38 @@ one_click_optimize() {
         AUTO_MODE=1
 
         echo -e "${gl_kjlan}━━━━━━ [1/4] BBR 直连优化 ━━━━━━${gl_bai}"
-        bbr_configure_direct
+        if bbr_configure_direct; then
+            result_tcp="已应用"
+        else
+            result_tcp="失败"
+        fi
 
         echo ""
         echo -e "${gl_kjlan}━━━━━━ [2/4] DNS 净化 ━━━━━━${gl_bai}"
-        dns_purify_and_harden
+        DNS_PURIFY_RESULT="未执行"
+        DNS_PURIFY_ROLLBACK=""
+        if dns_purify_and_harden; then
+            result_dns="${DNS_PURIFY_RESULT:-成功}"
+        else
+            result_dns="失败但未阻断"
+        fi
+        dns_rollback="${DNS_PURIFY_ROLLBACK:-"-"}"
 
         echo ""
         echo -e "${gl_kjlan}━━━━━━ [3/4] Realm 转发修复 ━━━━━━${gl_bai}"
-        realm_fix_timeout
+        local realm_detected="否"
+        if [ -f /etc/realm/config.json ] || systemctl list-unit-files 2>/dev/null | grep -q '^realm\.service'; then
+            realm_detected="是"
+        fi
+        if realm_fix_timeout; then
+            if [ "$realm_detected" = "是" ]; then
+                result_realm="成功"
+            else
+                result_realm="未检测到 Realm，已跳过"
+            fi
+        else
+            result_realm="失败但未阻断"
+        fi
 
         AUTO_MODE=""
 
@@ -5138,9 +5903,14 @@ one_click_optimize() {
         ipv6_choice=${ipv6_choice:-Y}
         if [[ "$ipv6_choice" =~ ^[Yy]$ ]]; then
             AUTO_MODE=1
-            disable_ipv6_permanent
+            if disable_ipv6_permanent; then
+                result_ipv6="已永久禁用"
+            else
+                result_ipv6="失败"
+            fi
             AUTO_MODE=""
         else
+            result_ipv6="用户跳过"
             echo -e "${gl_huang}已跳过 IPv6 禁用${gl_bai}"
         fi
 
@@ -5149,8 +5919,206 @@ one_click_optimize() {
         echo -e "${gl_lv}  ✅ 全部优化完成！${gl_bai}"
         echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
         echo ""
+        echo -e "${gl_kjlan}一键优化结果汇总：${gl_bai}"
+        echo -e "[✓] XanMod / BBR v3：${result_kernel}"
+        case "$result_tcp" in
+            *失败*) echo -e "[x] TCP 调优：${result_tcp}" ;;
+            *) echo -e "[✓] TCP 调优：${result_tcp}" ;;
+        esac
+        case "$result_dns" in
+            *失败*) echo -e "[!] DNS 净化：${result_dns}" ;;
+            *跳过*) echo -e "[-] DNS 净化：${result_dns}" ;;
+            *) echo -e "[✓] DNS 净化：${result_dns}" ;;
+        esac
+        case "$result_realm" in
+            *失败*) echo -e "[!] Realm 修复：${result_realm}" ;;
+            *跳过*) echo -e "[-] Realm 修复：${result_realm}" ;;
+            *) echo -e "[✓] Realm 修复：${result_realm}" ;;
+        esac
+        case "$result_ipv6" in
+            *失败*) echo -e "[!] IPv6：${result_ipv6}" ;;
+            *跳过*) echo -e "[-] IPv6：${result_ipv6}" ;;
+            *) echo -e "[✓] IPv6：${result_ipv6}" ;;
+        esac
+        echo ""
+        echo -e "${gl_kjlan}日志文件：${gl_bai}"
+        echo "$LOG_FILE"
+        echo ""
+        echo -e "${gl_kjlan}回滚信息：${gl_bai}"
+        echo "  DNS 回滚：${dns_rollback}"
+        echo "  IPv6 恢复：菜单 6 IPv6 管理 -> 取消永久禁用"
+        echo "  XanMod 卸载：菜单 2"
+        echo "  统一入口：菜单 13 回滚 / 卸载管理"
+        echo ""
         break_end
     fi
+}
+
+#=============================================================================
+# 回滚 / 卸载管理
+#=============================================================================
+
+rollback_confirm() {
+    local prompt="$1"
+    local confirm=""
+    read -e -p "$(echo -e "${gl_huang}${prompt} (Y/N): ${gl_bai}")" confirm
+    [[ "$confirm" =~ ^[Yy]$ ]]
+}
+
+remove_tcp_sysctl_config() {
+    echo -e "${gl_kjlan}=== 删除 TCP/sysctl 调优配置 ===${gl_bai}"
+    echo ""
+    echo "将处理以下路径："
+    echo "  $SYSCTL_CONF"
+    echo ""
+
+    if [ ! -e "$SYSCTL_CONF" ]; then
+        echo -e "${gl_huang}未检测到 $SYSCTL_CONF，无需删除${gl_bai}"
+        break_end
+        return 0
+    fi
+
+    rollback_confirm "确认移动该配置并重新加载 sysctl？" || {
+        echo "已取消"
+        break_end
+        return 1
+    }
+
+    local rollback_dir="/root/.net-tcp-tune_rollback/$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$rollback_dir"
+    mv "$SYSCTL_CONF" "$rollback_dir/99-bbr-ultimate.conf" 2>/dev/null || {
+        echo -e "${gl_hong}移动配置失败，请检查权限${gl_bai}"
+        break_end
+        return 1
+    }
+
+    sysctl --system >/dev/null 2>&1 || true
+    echo -e "${gl_lv}✅ 已移动配置到: $rollback_dir/99-bbr-ultimate.conf${gl_bai}"
+    echo -e "${gl_lv}✅ 已执行 sysctl --system${gl_bai}"
+    break_end
+}
+
+remove_bbr_persist_config() {
+    echo -e "${gl_kjlan}=== 删除 tc / MSS clamp / BBR 持久化 ===${gl_bai}"
+    echo ""
+    echo "将处理以下路径："
+    echo "  /etc/systemd/system/bbr-optimize-persist.service"
+    echo "  /usr/local/bin/bbr-optimize-apply.sh"
+    echo "并尝试删除本脚本添加的 iptables MSS clamp 规则。"
+    echo ""
+
+    rollback_confirm "确认删除这些持久化配置？" || {
+        echo "已取消"
+        break_end
+        return 1
+    }
+
+    systemctl disable --now bbr-optimize-persist.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/bbr-optimize-persist.service
+    rm -f /usr/local/bin/bbr-optimize-apply.sh
+    apply_mss_clamp disable >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    echo -e "${gl_lv}✅ 已清理 BBR 持久化服务、脚本和 MSS clamp 规则${gl_bai}"
+    break_end
+}
+
+restore_latest_dns_backup() {
+    echo -e "${gl_kjlan}=== 恢复 DNS 净化最近一次备份 ===${gl_bai}"
+    echo ""
+
+    local latest_rollback=""
+    latest_rollback=$(ls -t /root/.dns_purify_backup/*/rollback.sh 2>/dev/null | head -1)
+
+    if [ -z "$latest_rollback" ]; then
+        echo -e "${gl_huang}未找到 /root/.dns_purify_backup 下的 rollback.sh${gl_bai}"
+        break_end
+        return 1
+    fi
+
+    echo "将执行最近备份的回滚脚本："
+    echo "  $latest_rollback"
+    echo ""
+    rollback_confirm "确认执行 DNS 回滚？" || {
+        echo "已取消"
+        break_end
+        return 1
+    }
+
+    bash "$latest_rollback"
+    break_end
+}
+
+remove_bbr_shortcut_command() {
+    echo -e "${gl_kjlan}=== 卸载 bbr 快捷命令 ===${gl_bai}"
+    echo ""
+    echo "将删除："
+    echo "  /usr/local/bin/bbr"
+    echo ""
+    rollback_confirm "确认删除 /usr/local/bin/bbr？" || {
+        echo "已取消"
+        break_end
+        return 1
+    }
+
+    if [ -e /usr/local/bin/bbr ]; then
+        rm -f /usr/local/bin/bbr
+        echo -e "${gl_lv}✅ 已删除 /usr/local/bin/bbr${gl_bai}"
+    else
+        echo -e "${gl_huang}未检测到 /usr/local/bin/bbr${gl_bai}"
+    fi
+    echo "如需同时清理 shell alias，可运行：bash install-alias.sh uninstall"
+    break_end
+}
+
+show_rollback_backups() {
+    echo -e "${gl_kjlan}=== 备份目录查看 ===${gl_bai}"
+    echo ""
+    echo "[DNS 净化备份]"
+    ls -ld /root/.dns_purify_backup/* 2>/dev/null | tail -10 || echo "  未找到 /root/.dns_purify_backup"
+    echo ""
+    echo "[Realm 修复备份]"
+    ls -ld /root/.realm_fix_backup/* 2>/dev/null | tail -10 || echo "  未找到 /root/.realm_fix_backup"
+    echo ""
+    echo "[sysctl 备份]"
+    ls -l /etc/sysctl.conf.bak* /root/.net-tcp-tune_rollback/*/99-bbr-ultimate.conf 2>/dev/null || echo "  未找到 sysctl 相关备份"
+    echo ""
+    break_end
+}
+
+rollback_uninstall_manager() {
+    while true; do
+        clear
+        echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo -e "${gl_kjlan}   回滚 / 卸载管理${gl_bai}"
+        echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo ""
+        echo "1. 卸载 XanMod 内核"
+        echo "2. 删除 TCP/sysctl 调优配置"
+        echo "3. 删除 tc / MSS clamp / BBR 持久化"
+        echo "4. 恢复 DNS 净化最近一次备份"
+        echo "5. 恢复 IPv6（取消永久禁用）"
+        echo "6. 卸载快捷命令 /usr/local/bin/bbr"
+        echo "7. 查看备份目录"
+        echo "0. 返回主菜单"
+        echo ""
+        read -e -p "请输入选择: " rollback_choice
+
+        case "$rollback_choice" in
+            1) uninstall_xanmod ;;
+            2) remove_tcp_sysctl_config ;;
+            3) remove_bbr_persist_config ;;
+            4) restore_latest_dns_backup ;;
+            5) cancel_ipv6_permanent_disable ;;
+            6) remove_bbr_shortcut_command ;;
+            7) show_rollback_backups ;;
+            0) return 0 ;;
+            *)
+                echo "无效选择"
+                sleep 2
+                ;;
+        esac
+    done
 }
 
 # 主菜单
@@ -5190,6 +6158,10 @@ show_main_menu() {
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━ 一键优化 ━━━━━━━━━${gl_bai}"
     echo "11. ⭐ 一键全自动优化（BBR v3 + 网络调优）"
+    echo ""
+    echo -e "${gl_kjlan}━━━━━━ 预检 / 回滚 ━━━━━━${gl_bai}"
+    echo "12. 环境预检 / 兼容性检查"
+    echo "13. 回滚 / 卸载管理"
     echo ""
     echo "0. 退出脚本"
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
@@ -5241,6 +6213,12 @@ show_main_menu() {
         11)
             one_click_optimize
             ;;
+        12)
+            show_environment_precheck
+            ;;
+        13)
+            rollback_uninstall_manager
+            ;;
         0)
             echo "退出脚本"
             exit 0
@@ -5277,13 +6255,16 @@ update_xanmod_kernel() {
     echo "正在检查可用更新..."
     
     local xanmod_repo_file="/etc/apt/sources.list.d/xanmod-release.list"
+    local gpg_key_file="/usr/share/keyrings/xanmod-archive-keyring.gpg"
+    local xanmod_codename
+    xanmod_codename=$(get_xanmod_codename) || {
+        break_end
+        return 1
+    }
 
-    # 添加 XanMod 仓库（如果不存在）
-    if [ ! -f "$xanmod_repo_file" ]; then
-        echo "正在添加 XanMod 仓库..."
-
-        # 添加密钥（分步执行，避免管道 $? 问题）
-        local gpg_key_file="/usr/share/keyrings/xanmod-archive-keyring.gpg"
+    # 添加 XanMod 仓库密钥（分步执行，避免管道 $? 问题）
+    if [ ! -f "$gpg_key_file" ]; then
+        echo "正在添加 XanMod 仓库密钥..."
         local key_tmp=$(mktemp)
         local gpg_ok=false
 
@@ -5310,11 +6291,14 @@ update_xanmod_kernel() {
             break_end
             return 1
         fi
-
-        # 添加仓库（HTTPS）
-        echo "deb [signed-by=${gpg_key_file}] https://deb.xanmod.org releases main" | \
-            tee "$xanmod_repo_file" > /dev/null
     fi
+
+    # 添加/刷新 XanMod 仓库（按系统 VERSION_CODENAME 动态选择）
+    if ! write_xanmod_apt_source "$gpg_key_file" "$xanmod_repo_file"; then
+        break_end
+        return 1
+    fi
+    echo -e "${gl_kjlan}使用 XanMod APT 源: http://deb.xanmod.org ${xanmod_codename} main${gl_bai}"
 
     # 更新软件包列表
     echo "正在更新软件包列表..."

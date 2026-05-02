@@ -1,7 +1,7 @@
 #!/bin/bash
 #=============================================================================
 # 脚本名称: install-alias.sh
-# 功能描述: 为 BBR v3 / XanMod / TCP 网络调优脚本创建或卸载快捷别名
+# 功能描述: 为 BBR v3 / XanMod / TCP 网络调优脚本安装/卸载快捷命令
 # 使用方法:
 #   安装: bash install-alias.sh [install]
 #   卸载: bash install-alias.sh uninstall
@@ -14,6 +14,9 @@ RED='\033[1;31m'
 NC='\033[0m'
 
 MODE="${1:-install}"
+WRAPPER_PATH="/usr/local/bin/bbr"
+SCRIPT_URL='https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh'
+
 if [ "$MODE" != "install" ] && [ "$MODE" != "uninstall" ]; then
     echo -e "${RED}错误: 未知参数 '$MODE'${NC}"
     echo "使用方法:"
@@ -22,7 +25,8 @@ if [ "$MODE" != "install" ] && [ "$MODE" != "uninstall" ]; then
     exit 1
 fi
 
-CURRENT_SHELL=$(basename "$SHELL")
+CURRENT_SHELL=$(basename "${SHELL:-bash}")
+RC_FILE=""
 
 detect_rc_file() {
     if [ "$CURRENT_SHELL" = "zsh" ]; then
@@ -41,123 +45,161 @@ detect_rc_file() {
     fi
 }
 
-detect_rc_file
+remove_alias_block() {
+    local file="$1"
+    local temp_file="$2"
 
-uninstall_alias() {
-    echo -e "${CYAN}=== 卸载 net-tcp-tune 快捷别名 ===${NC}"
-    echo ""
-    echo -e "检测到 Shell: ${GREEN}${CURRENT_SHELL}${NC}"
-    echo -e "配置文件: ${GREEN}${RC_FILE}${NC}"
-    echo ""
+    sed '/^# ================ net-tcp-tune 快捷别名 ================/,/^# ================ net-tcp-tune 快捷别名结束 ================/d' "$file" > "$temp_file"
+}
 
-    if ! grep -q "net-tcp-tune 快捷别名" "$RC_FILE" 2>/dev/null; then
-        echo -e "${YELLOW}未找到已安装的别名，无需卸载${NC}"
-        echo ""
+can_install_system_command() {
+    if [ "$(id -u)" -eq 0 ]; then
         return 0
     fi
 
-    TEMP_FILE=$(mktemp)
-
-    if grep -q "^# ================" "$RC_FILE" 2>/dev/null; then
-        sed '/^# ================/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE" 2>/dev/null
-
-        if grep -q "net-tcp-tune 快捷别名" "$TEMP_FILE" 2>/dev/null; then
-            sed '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
-        fi
-    else
-        sed '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
-    fi
-
-    if ! diff -q "$RC_FILE" "$TEMP_FILE" >/dev/null 2>&1; then
-        cp "$RC_FILE" "${RC_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
-        mv "$TEMP_FILE" "$RC_FILE"
-
-        echo -e "${GREEN}✅ 别名已从 ${RC_FILE} 中移除${NC}"
-        echo ""
-        echo -e "${YELLOW}提示: 原配置文件已备份为 ${RC_FILE}.bak.*${NC}"
-        echo ""
-        echo -e "${CYAN}=== 现在生效，执行以下命令 ===${NC}"
-        echo ""
-        echo -e "${YELLOW}source ${RC_FILE}${NC}"
-        echo ""
-        echo "或者关闭终端重新打开，卸载即可生效。"
-        echo ""
-    else
-        rm -f "$TEMP_FILE"
-        echo -e "${YELLOW}未找到需要删除的内容${NC}"
-        echo ""
-    fi
+    [ -d /usr/local/bin ] && [ -w /usr/local/bin ]
 }
 
-install_alias() {
-    echo -e "${CYAN}=== 安装 net-tcp-tune 快捷别名 ===${NC}"
-    echo ""
-    echo -e "检测到 Shell: ${GREEN}${CURRENT_SHELL}${NC}"
-    echo -e "配置文件: ${GREEN}${RC_FILE}${NC}"
-    echo ""
+install_system_command() {
+    if ! mkdir -p /usr/local/bin 2>/dev/null; then
+        return 1
+    fi
 
-    ALIAS_CONTENT='
-# ========================================
-# net-tcp-tune 快捷别名（自动添加）
+    cat > "$WRAPPER_PATH" <<'WRAPPER'
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_URL='https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh'
+tmp_file=$(mktemp)
+cleanup() {
+    rm -f "$tmp_file"
+}
+trap cleanup EXIT
+
+curl -fsSL "${SCRIPT_URL}?$(date +%s)" -o "$tmp_file"
+bash "$tmp_file" "$@"
+WRAPPER
+
+    chmod +x "$WRAPPER_PATH"
+}
+
+install_alias_fallback() {
+    detect_rc_file
+
+    local alias_content
+    alias_content='
+# ================ net-tcp-tune 快捷别名 ================
 # 使用时间戳参数确保每次都获取最新版本，避免缓存
-# ========================================
 alias bbr="bash <(curl -fsSL \"https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh?\$(date +%s)\")"
+# ================ net-tcp-tune 快捷别名结束 ================
 '
 
     if grep -q "net-tcp-tune 快捷别名" "$RC_FILE" 2>/dev/null; then
-        echo -e "${YELLOW}配置已存在，正在更新...${NC}"
-
-        cp "$RC_FILE" "${RC_FILE}.bak"
-
-        if grep -q "^# ================" "$RC_FILE" 2>/dev/null; then
-            sed -i '/^# ================/,/^alias bbr=/d' "$RC_FILE" 2>/dev/null || sed -i '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE"
-        else
-            sed -i '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE"
-        fi
-
-        if grep -q "alias dog=" "$RC_FILE"; then
-            grep -v "alias dog=" "$RC_FILE" > "${RC_FILE}.tmp" && mv "${RC_FILE}.tmp" "$RC_FILE"
-        fi
-
-        echo "$ALIAS_CONTENT" >> "$RC_FILE"
-        echo -e "${GREEN}✅ 别名已更新到 ${RC_FILE}${NC}"
-        echo ""
-    else
-        echo "$ALIAS_CONTENT" >> "$RC_FILE"
-        echo -e "${GREEN}✅ 别名已添加到 ${RC_FILE}${NC}"
-        echo ""
+        cp "$RC_FILE" "${RC_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+        local temp_file
+        temp_file=$(mktemp)
+        remove_alias_block "$RC_FILE" "$temp_file"
+        mv "$temp_file" "$RC_FILE"
     fi
 
-    echo -e "${CYAN}=== 快捷命令 ===${NC}"
+    echo "$alias_content" >> "$RC_FILE"
+}
+
+uninstall_alias_fallback() {
+    detect_rc_file
+
+    if ! grep -q "net-tcp-tune 快捷别名" "$RC_FILE" 2>/dev/null; then
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp)
+    remove_alias_block "$RC_FILE" "$temp_file"
+
+    if ! diff -q "$RC_FILE" "$temp_file" >/dev/null 2>&1; then
+        cp "$RC_FILE" "${RC_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+        mv "$temp_file" "$RC_FILE"
+        return 0
+    fi
+
+    rm -f "$temp_file"
+    return 1
+}
+
+install_bbr_command() {
+    echo -e "${CYAN}=== 安装 bbr 快捷命令 ===${NC}"
     echo ""
-    echo -e "  ${GREEN}bbr${NC}   - 一键运行网络调优脚本"
+
+    if can_install_system_command && install_system_command; then
+        echo -e "${GREEN}✅ 已安装系统命令: ${WRAPPER_PATH}${NC}"
+        echo "安装方式: /usr/local/bin/bbr wrapper"
+        echo ""
+        echo "以后直接运行："
+        echo -e "  ${GREEN}bbr${NC}"
+        echo ""
+        echo "该命令每次执行都会拉取最新版 net-tcp-tune.sh，并支持传递参数。"
+    else
+        echo -e "${YELLOW}无法写入 /usr/local/bin，回退到 shell alias 方式${NC}"
+        if install_alias_fallback; then
+            echo -e "${GREEN}✅ 已写入 alias 到: ${RC_FILE}${NC}"
+            echo ""
+            echo "请执行以下命令使 alias 生效："
+            echo -e "  ${YELLOW}source ${RC_FILE}${NC}"
+            echo ""
+            echo "之后运行："
+            echo -e "  ${GREEN}bbr${NC}"
+        else
+            echo -e "${RED}❌ alias 安装失败${NC}"
+            exit 1
+        fi
+    fi
+
     echo ""
-    echo -e "${CYAN}=== 使用方法 ===${NC}"
+    echo -e "${CYAN}卸载方法：${NC}"
+    echo "  bash install-alias.sh uninstall"
     echo ""
-    echo "1. 重新加载配置："
-    echo -e "   ${YELLOW}source ${RC_FILE}${NC}"
+}
+
+uninstall_bbr_command() {
+    echo -e "${CYAN}=== 卸载 bbr 快捷命令 ===${NC}"
     echo ""
-    echo "2. 或者关闭终端重新打开"
+
+    local removed_system=false
+    local removed_alias=false
+
+    if [ -e "$WRAPPER_PATH" ]; then
+        if rm -f "$WRAPPER_PATH" 2>/dev/null; then
+            removed_system=true
+            echo -e "${GREEN}✅ 已删除 ${WRAPPER_PATH}${NC}"
+        else
+            echo -e "${YELLOW}⚠️  无法删除 ${WRAPPER_PATH}，请使用 root 权限重试${NC}"
+        fi
+    else
+        echo -e "${YELLOW}未检测到 ${WRAPPER_PATH}${NC}"
+    fi
+
+    if uninstall_alias_fallback; then
+        removed_alias=true
+        echo -e "${GREEN}✅ 已从 ${RC_FILE} 移除 alias block${NC}"
+        echo -e "${YELLOW}提示: 重新加载 shell 配置后 alias 清理生效：source ${RC_FILE}${NC}"
+    else
+        echo -e "${YELLOW}未检测到 shell alias block${NC}"
+    fi
+
     echo ""
-    echo "3. 然后直接输入快捷命令："
-    echo -e "   ${GREEN}bbr${NC}"
-    echo ""
-    echo -e "${CYAN}=== 卸载方法 ===${NC}"
-    echo ""
-    echo "如需卸载别名，请运行："
-    echo -e "   ${YELLOW}bash install-alias.sh uninstall${NC}"
-    echo ""
-    echo -e "${CYAN}=== 现在生效，执行以下命令 ===${NC}"
-    echo ""
-    echo -e "${YELLOW}source ${RC_FILE}${NC}"
+    if [ "$removed_system" = true ] || [ "$removed_alias" = true ]; then
+        echo -e "${GREEN}卸载完成${NC}"
+    else
+        echo -e "${YELLOW}未发现需要卸载的快捷命令${NC}"
+    fi
     echo ""
 }
 
 case "$MODE" in
     install)
-        install_alias
+        install_bbr_command
         ;;
     uninstall)
-        uninstall_alias
+        uninstall_bbr_command
         ;;
 esac
