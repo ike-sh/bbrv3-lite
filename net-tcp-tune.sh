@@ -2,17 +2,18 @@
 #=============================================================================
 # BBR v3 / XanMod / TCP 网络调优脚本
 # 功能：结合 XanMod 官方内核的稳定性 + 专业队列算法调优
-# 特点：保留 BBR v3、XanMod、TCP、DNS、IPv6、Realm timeout 相关能力
+# 特点：保留 BBR v3、XanMod、TCP、DNS、IPv6、预检与回滚相关能力
 #=============================================================================
 # 版本管理规则：
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.0: 移除小众中转 timeout 处理功能，精简主菜单、一键优化流程和回滚入口。
 # v5.1.1: 修复一键优化 IPv6 失败误报成功，并修复确认重启后菜单短暂重绘。
 # v5.1.0: 修复 XanMod 按 CPU level 选包，新增环境预检、一键汇总、DoH 端口避让、快捷命令与回滚入口。
 # v5.0.0 精简版: 仅保留 BBR v3 / XanMod / TCP 网络调优相关功能，删除非调优部署工具入口与实现。
 
-SCRIPT_VERSION="5.1.1"
+SCRIPT_VERSION="5.2.0"
 #=============================================================================
 
 #=============================================================================
@@ -28,7 +29,6 @@ SCRIPT_VERSION="5.1.1"
 #    步骤1 → 执行菜单选项 1：BBR v3 内核安装
 #    步骤2 → 执行菜单选项 3：BBR 直连/落地优化（智能带宽检测）
 #            选择子选项 1 进行自动检测
-#    步骤3 → 执行菜单选项 5：Realm转发timeout修复（如使用 Realm 转发）
 # 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 
@@ -5240,136 +5240,6 @@ ROLLBACK_SCRIPT
     break_end
 }
 
-#=============================================================================
-# Realm 转发首连超时修复（专项优化）
-#=============================================================================
-
-realm_fix_timeout() {
-    clear
-    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-    echo -e "${gl_kjlan}   Realm 转发首连超时修复（针对跨境线路优化）${gl_bai}"
-    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-    echo ""
-    echo -e "${gl_huang}功能说明：${gl_bai}"
-    echo "  • 连接跟踪模块加载 + 容量扩展（转发必需）"
-    echo "  • 强制 IPv4 + nodelay + reuse_port（优化 Realm 配置）"
-    echo "  • 提升 realm.service 文件句柄限制"
-    echo ""
-    echo -e "${gl_kjlan}已由其他功能覆盖（本功能不再重复设置）：${gl_bai}"
-    echo "  • MSS 钳制 → 功能3已配置"
-    echo "  • DNS 管理 → 功能4已配置"
-    echo "  • tcp_fin_timeout / tcp_fastopen → 功能3已配置"
-    echo ""
-    if [ "$AUTO_MODE" = "1" ]; then
-        confirm=y
-    else
-        read -e -p "是否继续执行修复？(y/n): " confirm
-    fi
-
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${gl_huang}已取消操作${gl_bai}"
-        return
-    fi
-
-    # 检查 root 权限
-    if [[ ${EUID:-0} -ne 0 ]]; then
-        echo -e "${gl_hong}错误：请以 root 身份运行（sudo -i 或 sudo bash）${gl_bai}"
-        return 1
-    fi
-
-    # 备份目录
-    BACKUP_DIR="/root/.realm_fix_backup/$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$BACKUP_DIR"
-    echo -e "${gl_lv}[1/4] 创建备份目录：$BACKUP_DIR${gl_bai}"
-
-    # 加载并持久化 nf_conntrack
-    echo -e "${gl_lv}[2/4] 加载/持久化 nf_conntrack（连接跟踪）${gl_bai}"
-    if command -v modprobe >/dev/null 2>&1; then
-        modprobe nf_conntrack 2>/dev/null || true
-    fi
-    mkdir -p /etc/modules-load.d
-    if ! grep -q '^nf_conntrack$' /etc/modules-load.d/conntrack.conf 2>/dev/null; then
-        echo nf_conntrack >> /etc/modules-load.d/conntrack.conf
-    fi
-
-    # 写入 Realm 专属 sysctl 配置（仅 conntrack_max，其余由功能3管理）
-    cat >/etc/sysctl.d/60-realm-tune.conf <<'SYSC'
-# Realm 转发专属优化（仅设置功能3未覆盖的参数）
-# tcp_fin_timeout / tcp_fastopen 由功能3的 99-net-tcp-tune.conf 统一管理
-
-# 连接跟踪容量（转发必需）
-net.netfilter.nf_conntrack_max = 262144
-SYSC
-    sysctl --system >/dev/null 2>&1
-    echo -e "${gl_lv}  ✓ nf_conntrack_max = 262144 已生效${gl_bai}"
-
-    # 修改 Realm 配置
-    echo -e "${gl_lv}[3/4] 优化 Realm 配置（IPv4 + nodelay + reuse_port）${gl_bai}"
-    realm_cfg="/etc/realm/config.json"
-    if [[ -f "$realm_cfg" ]]; then
-        cp -a "$realm_cfg" "$BACKUP_DIR/"
-
-        if command -v jq >/dev/null 2>&1; then
-            tmpfile=$(mktemp)
-            jq '.resolve = "ipv4" | .nodelay = true | .reuse_port = true' \
-                "$realm_cfg" >"$tmpfile" && mv "$tmpfile" "$realm_cfg"
-        else
-            echo -e "${gl_huang}  未安装 jq，使用文本方式修改（推荐安装 jq）${gl_bai}"
-            if ! grep -q '"resolve"' "$realm_cfg"; then
-                sed -i.bak '0,/{/s//{\n  "resolve": "ipv4",/' "$realm_cfg" || true
-            fi
-            if ! grep -q '"nodelay"' "$realm_cfg"; then
-                sed -i.bak '0,/{/s//{\n  "nodelay": true,/' "$realm_cfg" || true
-            fi
-            if ! grep -q '"reuse_port"' "$realm_cfg"; then
-                sed -i.bak '0,/{/s//{\n  "reuse_port": true,/' "$realm_cfg" || true
-            fi
-        fi
-
-        # 统一用文本替换确保 IPv6 监听改为 IPv4
-        sed -i.bak -E 's/"listen"\s*:\s*":::([0-9]+)"/"listen": "0.0.0.0:\1"/g' "$realm_cfg" 2>/dev/null || true
-        sed -i.bak -E 's/"listen"\s*:\s*"\[::\]:([0-9]+)"/"listen": "0.0.0.0:\1"/g' "$realm_cfg" 2>/dev/null || true
-        sed -i.bak 's/:::/0.0.0.0:/g' "$realm_cfg" 2>/dev/null || true
-        echo -e "${gl_lv}  ✓ Realm 配置已优化${gl_bai}"
-    else
-        echo -e "${gl_huang}  未找到 $realm_cfg，跳过 Realm 配置修改${gl_bai}"
-    fi
-
-    # realm.service 文件句柄限制
-    echo -e "${gl_lv}[4/4] 提升 realm.service 文件句柄限制${gl_bai}"
-    if systemctl list-unit-files 2>/dev/null | grep -q '^realm\.service'; then
-        mkdir -p /etc/systemd/system/realm.service.d
-        cat >/etc/systemd/system/realm.service.d/override.conf <<'OVR'
-[Service]
-LimitNOFILE=1048576
-OVR
-        systemctl daemon-reload
-        systemctl restart realm 2>/dev/null || echo -e "${gl_huang}  ⚠ realm 重启失败，请手动检查${gl_bai}"
-        echo -e "${gl_lv}  ✓ LimitNOFILE=1048576 已生效${gl_bai}"
-    else
-        echo -e "${gl_huang}  未发现 realm.service，跳过${gl_bai}"
-    fi
-
-    echo ""
-    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-    echo -e "${gl_lv}✅ Realm 优化完成！${gl_bai}"
-    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-    echo ""
-    echo -e "${gl_huang}📋 备份位置：${gl_bai}$BACKUP_DIR"
-    echo ""
-    echo -e "${gl_huang}🔍 快速验证：${gl_bai}"
-    echo "  • Realm 监听：  ss -tlnp | grep realm"
-    echo "  • conntrack：   sysctl net.netfilter.nf_conntrack_max"
-    echo "  • Realm 配置：  cat /etc/realm/config.json | grep -E 'resolve|nodelay|reuse_port'"
-    echo ""
-    echo -e "${gl_lv}💯 重启服务器后所有配置依然生效，无需重复执行！${gl_bai}"
-    echo ""
-}
-
-#=============================================================================
-# 内核参数优化 - 主菜单
-#=============================================================================
-
 run_speedtest() {
     while true; do
         clear
@@ -5828,7 +5698,6 @@ one_click_optimize() {
     local result_kernel="未执行"
     local result_tcp="跳过"
     local result_dns="跳过"
-    local result_realm="跳过"
     local result_ipv6="用户跳过"
     local dns_rollback="-"
 
@@ -5859,7 +5728,6 @@ one_click_optimize() {
             echo -e "[!] XanMod / BBR v3：${result_kernel}"
             echo -e "[-] TCP 调优：等待重启后执行"
             echo -e "[-] DNS 净化：等待重启后执行"
-            echo -e "[-] Realm 修复：等待重启后执行"
             echo -e "[-] IPv6：等待重启后执行"
             echo ""
             server_reboot
@@ -5869,7 +5737,6 @@ one_click_optimize() {
             echo -e "[x] XanMod / BBR v3：安装失败"
             echo -e "[-] TCP 调优：未执行"
             echo -e "[-] DNS 净化：未执行"
-            echo -e "[-] Realm 修复：未执行"
             echo -e "[-] IPv6：未执行"
             echo ""
             break_end
@@ -5881,16 +5748,15 @@ one_click_optimize() {
         echo ""
         echo -e "${gl_huang}▶ 阶段 2/2：全自动网络优化${gl_bai}"
         echo "将依次执行："
-        echo "  [1/4] 功能3 - BBR 直连优化（自动检测带宽）"
-        echo "  [2/4] 功能4 - DNS 净化（纯国外模式）"
-        echo "  [3/4] 功能5 - Realm 转发修复"
-        echo "  [4/4] 功能6 - 永久禁用 IPv6"
+        echo "  [1/3] 功能3 - BBR 直连优化（自动检测带宽）"
+        echo "  [2/3] 功能4 - DNS 净化（纯国外模式）"
+        echo "  [3/3] 功能5 - 永久禁用 IPv6"
         echo ""
         sleep 3
 
         AUTO_MODE=1
 
-        echo -e "${gl_kjlan}━━━━━━ [1/4] BBR 直连优化 ━━━━━━${gl_bai}"
+        echo -e "${gl_kjlan}━━━━━━ [1/3] BBR 直连优化 ━━━━━━${gl_bai}"
         if bbr_configure_direct; then
             result_tcp="已应用"
         else
@@ -5898,7 +5764,7 @@ one_click_optimize() {
         fi
 
         echo ""
-        echo -e "${gl_kjlan}━━━━━━ [2/4] DNS 净化 ━━━━━━${gl_bai}"
+        echo -e "${gl_kjlan}━━━━━━ [2/3] DNS 净化 ━━━━━━${gl_bai}"
         DNS_PURIFY_RESULT="未执行"
         DNS_PURIFY_ROLLBACK=""
         if dns_purify_and_harden; then
@@ -5908,26 +5774,10 @@ one_click_optimize() {
         fi
         dns_rollback="${DNS_PURIFY_ROLLBACK:-"-"}"
 
-        echo ""
-        echo -e "${gl_kjlan}━━━━━━ [3/4] Realm 转发修复 ━━━━━━${gl_bai}"
-        local realm_detected="否"
-        if [ -f /etc/realm/config.json ] || systemctl list-unit-files 2>/dev/null | grep -q '^realm\.service'; then
-            realm_detected="是"
-        fi
-        if realm_fix_timeout; then
-            if [ "$realm_detected" = "是" ]; then
-                result_realm="成功"
-            else
-                result_realm="未检测到 Realm，已跳过"
-            fi
-        else
-            result_realm="失败但未阻断"
-        fi
-
         AUTO_MODE=""
 
         echo ""
-        echo -e "${gl_kjlan}━━━━━━ [4/4] 禁用 IPv6（可选） ━━━━━━${gl_bai}"
+        echo -e "${gl_kjlan}━━━━━━ [3/3] 禁用 IPv6（可选） ━━━━━━${gl_bai}"
         read -e -p "$(echo -e "${gl_huang}是否永久禁用 IPv6？(Y/N) [Y]: ${gl_bai}")" ipv6_choice
         ipv6_choice=${ipv6_choice:-Y}
         if [[ "$ipv6_choice" =~ ^[Yy]$ ]]; then
@@ -5936,7 +5786,7 @@ one_click_optimize() {
             if ipv6_permanent_disabled_state; then
                 result_ipv6="已永久禁用"
             else
-                result_ipv6="禁用失败，请检查 /etc/sysctl.d/99-disable-ipv6.conf 或手动执行菜单 6"
+                result_ipv6="禁用失败，请检查 /etc/sysctl.d/99-disable-ipv6.conf 或手动执行菜单 IPv6 管理"
             fi
             AUTO_MODE=""
         else
@@ -5960,11 +5810,6 @@ one_click_optimize() {
             *跳过*) echo -e "[-] DNS 净化：${result_dns}" ;;
             *) echo -e "[✓] DNS 净化：${result_dns}" ;;
         esac
-        case "$result_realm" in
-            *失败*) echo -e "[!] Realm 修复：${result_realm}" ;;
-            *跳过*) echo -e "[-] Realm 修复：${result_realm}" ;;
-            *) echo -e "[✓] Realm 修复：${result_realm}" ;;
-        esac
         case "$result_ipv6" in
             *失败*) echo -e "[!] IPv6：${result_ipv6}" ;;
             *跳过*) echo -e "[-] IPv6：${result_ipv6}" ;;
@@ -5976,9 +5821,9 @@ one_click_optimize() {
         echo ""
         echo -e "${gl_kjlan}回滚信息：${gl_bai}"
         echo "  DNS 回滚：${dns_rollback}"
-        echo "  IPv6 恢复：菜单 6 IPv6 管理 -> 取消永久禁用"
+        echo "  IPv6 恢复：菜单 5 IPv6 管理 -> 取消永久禁用"
         echo "  XanMod 卸载：菜单 2"
-        echo "  统一入口：菜单 13 回滚 / 卸载管理"
+        echo "  统一入口：菜单 12 回滚 / 卸载管理"
         echo ""
         break_end
     fi
@@ -6107,9 +5952,6 @@ show_rollback_backups() {
     echo "[DNS 净化备份]"
     ls -ld /root/.dns_purify_backup/* 2>/dev/null | tail -10 || echo "  未找到 /root/.dns_purify_backup"
     echo ""
-    echo "[Realm 修复备份]"
-    ls -ld /root/.realm_fix_backup/* 2>/dev/null | tail -10 || echo "  未找到 /root/.realm_fix_backup"
-    echo ""
     echo "[sysctl 备份]"
     ls -l /etc/sysctl.conf.bak* /root/.net-tcp-tune_rollback/*/99-bbr-ultimate.conf 2>/dev/null || echo "  未找到 sysctl 相关备份"
     echo ""
@@ -6175,23 +6017,22 @@ show_main_menu() {
     echo -e "${gl_kjlan}[BBR/网络优化]${gl_bai}"
     echo "3. BBR 直连/落地优化（智能带宽检测）⭐ 推荐"
     echo "4. DNS 净化（抗污染/驯服 DHCP）"
-    echo "5. Realm 转发 timeout 修复 ⭐ 推荐"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━━ 系统配置 ━━━━━━━━━━━${gl_bai}"
-    echo "6. IPv6 管理（临时/永久禁用/取消）"
-    echo "7. 查看系统详细状态"
+    echo "5. IPv6 管理（临时/永久禁用/取消）"
+    echo "6. 查看系统详细状态"
     echo ""
     echo -e "${gl_kjlan}[网络测试]${gl_bai}"
-    echo "8. 服务器带宽测试"
-    echo "9. iperf3 单线程测试"
-    echo "10. 三网回程路由测试"
+    echo "7. 服务器带宽测试"
+    echo "8. iperf3 单线程测试"
+    echo "9. 三网回程路由测试"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━ 一键优化 ━━━━━━━━━${gl_bai}"
-    echo "11. ⭐ 一键全自动优化（BBR v3 + 网络调优）"
+    echo "10. ⭐ 一键全自动优化（BBR v3 + 网络调优）"
     echo ""
     echo -e "${gl_kjlan}━━━━━━ 预检 / 回滚 ━━━━━━${gl_bai}"
-    echo "12. 环境预检 / 兼容性检查"
-    echo "13. 回滚 / 卸载管理"
+    echo "11. 环境预检 / 兼容性检查"
+    echo "12. 回滚 / 卸载管理"
     echo ""
     echo "0. 退出脚本"
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
@@ -6222,31 +6063,27 @@ show_main_menu() {
             dns_purify_and_harden
             ;;
         5)
-            realm_fix_timeout
-            break_end
-            ;;
-        6)
             manage_ipv6
             ;;
-        7)
+        6)
             show_detailed_status
             ;;
-        8)
+        7)
             run_speedtest
             ;;
-        9)
+        8)
             iperf3_single_thread_test
             ;;
-        10)
+        9)
             run_backtrace
             ;;
-        11)
+        10)
             one_click_optimize
             ;;
-        12)
+        11)
             show_environment_precheck
             ;;
-        13)
+        12)
             rollback_uninstall_manager
             ;;
         0)
