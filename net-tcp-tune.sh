@@ -8,13 +8,13 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.5: 修复预检结论、小盘 SWAP 重复调整、普通 BBR 文案，以及 DNS 小盘提示。
 # v5.2.4: 增强小盘机器一键优化体验，统一磁盘空间检查，并补充 IPv6 恢复备份提示。
 # v5.2.3: 修复 DNS 净化安全检查在部分环境下将磁盘可用空间误判为 0MB 的问题。
 # v5.2.2: 修复永久禁用 IPv6 时将脚本自身 .ipv6-state-backup.conf 误报为 sysctl.d 冲突项的问题。
 # v5.2.1: 修复 /etc/sysctl.conf 中 disable_ipv6=0 覆盖永久禁用 IPv6 配置；永久禁用前自动备份并注释冲突项。
-# v5.2.0: 移除小众中转 timeout 处理功能，精简主菜单、一键优化流程和回滚入口。
 
-SCRIPT_VERSION="5.2.4"
+SCRIPT_VERSION="5.2.5"
 #=============================================================================
 
 #=============================================================================
@@ -361,6 +361,15 @@ run_remote_script() {
 
 get_root_available_mb() {
     df -Pm / 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+get_swapfile_size_mb() {
+    [ -e /swapfile ] || {
+        echo 0
+        return
+    }
+
+    du -m /swapfile 2>/dev/null | awk 'NR==1 {print $1}'
 }
 
 check_disk_space() {
@@ -1570,7 +1579,20 @@ check_and_suggest_swap() {
     local swap_total=$(free -m | awk 'NR==3{print $2}')
     local recommended_swap
     local need_swap=0
-    
+
+    # 计算推荐的SWAP大小
+    if [ "$mem_total" -lt 512 ]; then
+        recommended_swap=1024
+    elif [ "$mem_total" -lt 1024 ]; then
+        recommended_swap=$((mem_total * 2))
+    elif [ "$mem_total" -lt 2048 ]; then
+        recommended_swap=$((mem_total * 3 / 2))
+    elif [ "$mem_total" -lt 4096 ]; then
+        recommended_swap=$mem_total
+    else
+        recommended_swap=4096
+    fi
+
     # 判断是否需要SWAP
     if [ "$mem_total" -lt 2048 ]; then
         # 小于2GB内存，强烈建议配置SWAP
@@ -1584,20 +1606,13 @@ check_and_suggest_swap() {
     if [ "$need_swap" -eq 0 ]; then
         return 0
     fi
-    
-    # 计算推荐的SWAP大小
-    if [ "$mem_total" -lt 512 ]; then
-        recommended_swap=1024
-    elif [ "$mem_total" -lt 1024 ]; then
-        recommended_swap=$((mem_total * 2))
-    elif [ "$mem_total" -lt 2048 ]; then
-        recommended_swap=$((mem_total * 3 / 2))
-    elif [ "$mem_total" -lt 4096 ]; then
-        recommended_swap=$mem_total
-    else
-        recommended_swap=4096
+
+    if [ "$swap_total" -ge $((recommended_swap - 64)) ]; then
+        echo -e "${gl_lv}当前 SWAP 已满足推荐值，跳过调整${gl_bai}"
+        echo "  当前 SWAP: ${swap_total}MB | 推荐 SWAP: ${recommended_swap}MB"
+        return 0
     fi
-    
+
     # 显示建议信息
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
@@ -1620,6 +1635,28 @@ check_and_suggest_swap() {
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
     echo ""
+
+    local available_space_mb
+    local current_swapfile_mb
+    local needed_space_mb
+    available_space_mb=$(get_root_available_mb)
+    current_swapfile_mb=$(get_swapfile_size_mb)
+    [[ "$current_swapfile_mb" =~ ^[0-9]+$ ]] || current_swapfile_mb=0
+    needed_space_mb=$((recommended_swap + 128 - current_swapfile_mb))
+    [ "$needed_space_mb" -lt 128 ] && needed_space_mb=128
+
+    if ! [[ "$available_space_mb" =~ ^[0-9]+$ ]]; then
+        echo -e "${gl_huang}磁盘空间无法可靠读取，不建议调整 SWAP；保留当前 SWAP。${gl_bai}"
+        echo ""
+        return 0
+    fi
+
+    if [ "$available_space_mb" -lt "$needed_space_mb" ]; then
+        echo -e "${gl_huang}磁盘空间不足，不建议调整 SWAP；保留当前 SWAP。${gl_bai}"
+        echo "  根分区可用: ${available_space_mb}MB | 调整所需预留: ${needed_space_mb}MB"
+        echo ""
+        return 0
+    fi
     
     # 询问用户
     if [ "$AUTO_MODE" = "1" ]; then
@@ -1781,9 +1818,23 @@ apply_mss_clamp() {
 # BBR 配置函数（智能检测版）
 #=============================================================================
 
+get_bbr_tuning_label() {
+    local bbr_version=""
+
+    bbr_version=$(modinfo tcp_bbr 2>/dev/null | awk '/^version:/ {print $2}' | head -1)
+    if uname -r | grep -qi 'xanmod' || [ "$bbr_version" = "3" ]; then
+        echo "BBR v3 + FQ"
+    else
+        echo "系统普通 BBR + FQ"
+    fi
+}
+
 # 直连/落地优化配置
 bbr_configure_direct() {
-    echo -e "${gl_kjlan}=== 配置 BBR v3 + FQ 直连/落地优化（智能检测版） ===${gl_bai}"
+    local bbr_tuning_label
+    bbr_tuning_label=$(get_bbr_tuning_label)
+
+    echo -e "${gl_kjlan}=== 配置 ${bbr_tuning_label} 直连/落地优化（智能检测版） ===${gl_bai}"
     echo ""
     
     # 步骤 0：SWAP智能检测和建议
@@ -1865,7 +1916,7 @@ bbr_configure_direct() {
     fi
     
     cat > "$SYSCTL_CONF" << EOF
-# BBR v3 Direct/Endpoint Configuration (Intelligent Detection Edition)
+# ${bbr_tuning_label} Direct/Endpoint Configuration (Intelligent Detection Edition)
 # Generated on $(date)
 # Bandwidth: ${detected_bandwidth} Mbps | Region: ${region} | Buffer: ${buffer_mb} MB
 
@@ -2211,9 +2262,10 @@ LIMITSEOF
     echo ""
 
     # 最终判断
+    bbr_tuning_label=$(get_bbr_tuning_label)
     if [ "$actual_qdisc" = "fq" ] && [ "$actual_cc" = "bbr" ] && \
        [ "$actual_wmem" = "$buffer_bytes" ] && [ "$actual_rmem" = "$buffer_bytes" ]; then
-        echo -e "${gl_lv}✅ BBR v3 直连/落地优化配置完成并已生效！${gl_bai}"
+        echo -e "${gl_lv}✅ ${bbr_tuning_label} 直连/落地优化配置完成并已生效！${gl_bai}"
         echo -e "${gl_zi}配置说明: ${buffer_mb}MB 缓冲区（${detected_bandwidth} Mbps 带宽），适合直连/落地场景${gl_bai}"
     else
         echo -e "${gl_huang}⚠️ 配置已保存但部分参数未生效${gl_bai}"
@@ -2543,9 +2595,10 @@ show_environment_precheck() {
 
     local kernel_version
     kernel_version=$(uname -r)
-    local current_cc current_qdisc
+    local current_cc current_qdisc available_cc
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
 
     local xanmod_installed="否"
     if uname -r | grep -qi xanmod || dpkg-query -W -f='${Package}\n' 'linux-*xanmod*' 2>/dev/null | grep -q xanmod; then
@@ -2554,6 +2607,11 @@ show_environment_precheck() {
 
     local bbr_v3="否"
     is_bbr_v3_active && bbr_v3="是"
+
+    local regular_bbr_supported="否"
+    if [ "$current_cc" = "bbr" ] || echo "$available_cc" | grep -qw "bbr" || modinfo tcp_bbr >/dev/null 2>&1; then
+        regular_bbr_supported="是"
+    fi
 
     local grub_exists="否"
     if [ -d /boot/grub ] || command -v update-grub >/dev/null 2>&1 || command -v grub-mkconfig >/dev/null 2>&1; then
@@ -2595,9 +2653,16 @@ show_environment_precheck() {
         xanmod_codename="不可用"
     fi
 
+    local xanmod_candidates_raw
     local xanmod_candidates
-    xanmod_candidates=$(apt-cache search '^linux-xanmod' 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
-    [ -z "$xanmod_candidates" ] && xanmod_candidates="当前 apt-cache 无候选（未添加源或未 apt update）"
+    local xanmod_candidate_available=0
+    xanmod_candidates_raw=$(apt-cache search '^linux-xanmod' 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
+    if [ -n "$xanmod_candidates_raw" ]; then
+        xanmod_candidates="$xanmod_candidates_raw"
+        xanmod_candidate_available=1
+    else
+        xanmod_candidates="当前 apt-cache 无候选（未添加源或未 apt update）"
+    fi
 
     local dot_status="不可达"
     if tcp_port_reachable "1.1.1.1" 853 || tcp_port_reachable "8.8.8.8" 853; then
@@ -2627,7 +2692,17 @@ show_environment_precheck() {
         swap_state="已启用"
     fi
 
+    local root_available_mb
     local disk_free
+    local root_space_state="unknown"
+    root_available_mb=$(get_root_available_mb)
+    if [[ "$root_available_mb" =~ ^[0-9]+$ ]]; then
+        if [ "$root_available_mb" -lt 3072 ]; then
+            root_space_state="low"
+        else
+            root_space_state="ok"
+        fi
+    fi
     disk_free=$(df -h / 2>/dev/null | awk 'NR==2 {print $4 " 可用 / 总计 " $2}' || echo "未知")
 
     echo -e "${gl_kjlan}[基础环境]${gl_bai}"
@@ -2644,9 +2719,11 @@ show_environment_precheck() {
     echo -e "${gl_kjlan}[当前网络内核状态]${gl_bai}"
     echo "  当前内核: ${kernel_version}"
     echo "  拥塞控制: ${current_cc}"
+    echo "  可用拥塞控制: ${available_cc:-未知}"
     echo "  队列算法: ${current_qdisc}"
     echo "  是否已安装/运行 XanMod: ${xanmod_installed}"
     echo "  是否 BBR v3: ${bbr_v3}"
+    echo "  是否支持普通 BBR: ${regular_bbr_supported}"
     echo "  GRUB: ${grub_exists}"
     echo "  旧内核包: ${old_kernel_status}"
     echo ""
@@ -2671,6 +2748,24 @@ show_environment_precheck() {
         conclusion="不支持：容器/OpenVZ/LXC 环境通常不能自行更换内核"
     elif [ "$has_systemd" != "是" ] || [ "$has_systemctl" != "是" ]; then
         conclusion="谨慎：非完整 systemd 环境，DNS 净化和服务持久化可能不可用"
+    elif [ "$root_space_state" = "low" ]; then
+        if [ "$bbr_v3" = "是" ] || [ "$xanmod_installed" = "是" ]; then
+            conclusion="推荐：当前已具备 XanMod / BBR v3，但根分区可用空间不足 3GB，不建议重新安装内核；可执行 TCP 调优 / DNS / IPv6。"
+        elif [ "$regular_bbr_supported" = "是" ]; then
+            conclusion="推荐：不建议安装 XanMod / BBR v3；当前内核支持普通 BBR，可执行轻量优化（TCP 调优 / DNS / IPv6）。"
+        else
+            conclusion="不推荐：磁盘空间不足，且当前内核不支持 BBR；建议扩容磁盘或更换支持 BBR 的内核。"
+        fi
+    elif [ "$root_space_state" = "unknown" ]; then
+        conclusion="谨慎：无法可靠读取根分区可用空间，暂不推荐完整安装 XanMod / BBR v3；请确认至少 3GB 可用空间后再继续。"
+    elif [ "$bbr_v3" = "是" ] || [ "$xanmod_installed" = "是" ]; then
+        conclusion="推荐：当前已具备 XanMod / BBR v3，可执行 TCP 调优、DNS 和 IPv6 管理。"
+    elif [ "$xanmod_candidate_available" -eq 0 ]; then
+        if [ "$regular_bbr_supported" = "是" ]; then
+            conclusion="谨慎：当前 apt-cache 无 linux-xanmod 候选，需要添加源/apt update 后再确认；当前内核支持普通 BBR，可先执行轻量优化。"
+        else
+            conclusion="谨慎：当前 apt-cache 无 linux-xanmod 候选，需要添加源/apt update 后再确认；暂不推荐完整安装。"
+        fi
     elif [ "$cpu_arch" = "x86_64" ] && [[ "$os_id" =~ ^(debian|ubuntu)$ ]]; then
         conclusion="推荐：适合完整安装 XanMod + BBR v3，并执行 TCP 调优"
     elif [ "$cpu_arch" = "aarch64" ] && [[ "$os_id" =~ ^(debian|ubuntu)$ ]]; then
@@ -3442,6 +3537,7 @@ dns_purify_and_harden() {
     echo ""
     
     local pre_check_failed=false
+    local disk_space_failed=false
     
     # 检查1: 磁盘空间（至少需要100MB）
     echo -n "  → 检查磁盘空间... "
@@ -3452,6 +3548,7 @@ dns_purify_and_harden() {
     elif [ "$available_space" -lt 100 ]; then
         echo -e "${gl_hong}失败 (可用: ${available_space}MB, 需要: 100MB)${gl_bai}"
         pre_check_failed=true
+        disk_space_failed=true
     else
         echo -e "${gl_lv}通过 (可用: ${available_space}MB)${gl_bai}"
     fi
@@ -3514,6 +3611,13 @@ dns_purify_and_harden() {
         echo -e "${gl_hong}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
         echo ""
         echo -e "${gl_huang}系统环境不满足安全执行条件，拒绝执行以避免风险。${gl_bai}"
+        if [ "$disk_space_failed" = true ]; then
+            echo ""
+            echo -e "${gl_huang}磁盘空间提示：${gl_bai}"
+            echo "  - 当前根分区可用空间不足 100MB。"
+            echo "  - 小盘机器可检查 /swapfile、旧内核包、apt 缓存。"
+            echo "  - DNS 净化已安全跳过，未修改系统 DNS。"
+        fi
         echo ""
         echo "请先解决上述问题，然后重试。"
         echo ""
