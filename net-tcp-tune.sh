@@ -8,12 +8,13 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.1: 修复 /etc/sysctl.conf 中 disable_ipv6=0 覆盖永久禁用 IPv6 配置；永久禁用前自动备份并注释冲突项。
 # v5.2.0: 移除小众中转 timeout 处理功能，精简主菜单、一键优化流程和回滚入口。
 # v5.1.1: 修复一键优化 IPv6 失败误报成功，并修复确认重启后菜单短暂重绘。
 # v5.1.0: 修复 XanMod 按 CPU level 选包，新增环境预检、一键汇总、DoH 端口避让、快捷命令与回滚入口。
 # v5.0.0 精简版: 仅保留 BBR v3 / XanMod / TCP 网络调优相关功能，删除非调优部署工具入口与实现。
 
-SCRIPT_VERSION="5.2.0"
+SCRIPT_VERSION="5.2.1"
 #=============================================================================
 
 #=============================================================================
@@ -498,6 +499,40 @@ ipv6_permanent_disabled_state() {
     [ "$ipv6_all" = "1" ] && [ "$ipv6_default" = "1" ] && [ "$ipv6_lo" = "1" ]
 }
 
+comment_ipv6_sysctl_conf_conflicts() {
+    local sysctl_conf="/etc/sysctl.conf"
+    local conflict_pattern='^[[:space:]]*(net\.ipv6\.conf\.(all|default|lo)\.disable_ipv6[[:space:]]*=[[:space:]]*0([[:space:]]*(#.*)?)?)$'
+    local backup_file
+    local other_conflicts
+
+    if [ -f "$sysctl_conf" ] && grep -Eq "$conflict_pattern" "$sysctl_conf"; then
+        backup_file="/etc/sysctl.conf.bak.disable_ipv6_conflict.$(date +%Y%m%d_%H%M%S)"
+
+        if ! cp "$sysctl_conf" "$backup_file"; then
+            echo -e "${gl_hong}❌ 备份 /etc/sysctl.conf 失败，已停止修改${gl_bai}"
+            return 1
+        fi
+
+        if ! sed -i -E "s|$conflict_pattern|# disabled by bbrv3-lite: \1|" "$sysctl_conf"; then
+            echo -e "${gl_hong}❌ 注释 /etc/sysctl.conf IPv6 冲突项失败${gl_bai}"
+            return 1
+        fi
+
+        echo -e "${gl_lv}✅ 已备份并注释 /etc/sysctl.conf 中的 IPv6 冲突项${gl_bai}"
+        echo "  备份文件: ${backup_file}"
+    else
+        echo -e "${gl_lv}✅ 未发现 /etc/sysctl.conf 中的 IPv6 冲突项${gl_bai}"
+    fi
+
+    other_conflicts=$(grep -RnsE "$conflict_pattern" /etc/sysctl.d /run/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d 2>/dev/null || true)
+    if [ -n "$other_conflicts" ]; then
+        echo -e "${gl_huang}⚠️  检测到其他 sysctl.d 文件中仍存在 disable_ipv6=0，请留意是否继续覆盖:${gl_bai}"
+        echo "$other_conflicts" | sed 's/^/  /'
+    fi
+
+    return 0
+}
+
 disable_ipv6_permanent() {
     clear
     echo -e "${gl_kjlan}=== 永久禁用IPv6 ===${gl_bai}"
@@ -537,7 +572,7 @@ disable_ipv6_permanent() {
     case "$confirm" in
         [Yy])
             echo ""
-            echo -e "${gl_zi}[步骤 1/3] 备份当前IPv6状态...${gl_bai}"
+            echo -e "${gl_zi}[步骤 1/4] 备份当前IPv6状态...${gl_bai}"
             
             # 读取当前IPv6状态并备份
             local ipv6_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
@@ -555,8 +590,16 @@ BACKUPEOF
             
             echo -e "${gl_lv}✅ 状态已备份${gl_bai}"
             echo ""
-            
-            echo -e "${gl_zi}[步骤 2/3] 创建永久禁用配置...${gl_bai}"
+
+            echo -e "${gl_zi}[步骤 2/4] 清理 /etc/sysctl.conf IPv6 冲突项...${gl_bai}"
+            if ! comment_ipv6_sysctl_conf_conflicts; then
+                echo ""
+                break_end
+                return 1
+            fi
+            echo ""
+
+            echo -e "${gl_zi}[步骤 3/4] 创建永久禁用配置...${gl_bai}"
             
             # 创建永久禁用配置文件
             cat > /etc/sysctl.d/99-disable-ipv6.conf << EOF
@@ -568,8 +611,8 @@ EOF
             
             echo -e "${gl_lv}✅ 配置文件已创建${gl_bai}"
             echo ""
-            
-            echo -e "${gl_zi}[步骤 3/3] 应用配置...${gl_bai}"
+
+            echo -e "${gl_zi}[步骤 4/4] 应用配置...${gl_bai}"
             
             # 应用配置
             sysctl --system >/dev/null 2>&1

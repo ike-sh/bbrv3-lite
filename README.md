@@ -1,6 +1,6 @@
 # BBR v3 / XanMod / TCP 网络调优脚本
 
-当前版本：v5.2.0
+当前版本：v5.2.1
 
 本精简版只保留网络调优相关功能，聚焦 XanMod 内核、BBR v3、TCP 参数调优、DNS 净化、IPv6 管理，以及必要的测速、预检和回滚能力。
 
@@ -136,6 +136,8 @@ v5.1.0 起，一键优化最后会输出结果汇总，标记每一步成功、�
 
 v5.1.1 起，IPv6 汇总状态以真实 sysctl 检测为准：只有 `net.ipv6.conf.all.disable_ipv6`、`net.ipv6.conf.default.disable_ipv6`、`net.ipv6.conf.lo.disable_ipv6` 三项均为 `1` 时，才显示 IPv6 已永久禁用。
 
+v5.2.1 起，如果系统已有 `/etc/sysctl.conf` 中的 `disable_ipv6=0`，脚本会在永久禁用 IPv6 前自动备份并注释冲突项，避免 `sysctl --system` 后旧配置覆盖禁用结果。
+
 ## 回滚 / 卸载
 
 功能 12：回滚 / 卸载管理提供统一入口：
@@ -162,6 +164,11 @@ v5.1.1 起，IPv6 汇总状态以真实 sysctl 检测为准：只有 `net.ipv6.c
 - 换内核前建议先给 VPS 做快照。
 - OpenVZ/LXC 等容器虚拟化环境通常不支持自行更换内核。
 - 生产机请谨慎执行内核安装、DNS 修改、IPv6 禁用等操作，建议确保有控制台或救援模式可用。
+
+## v5.2.1 更新记录
+
+- 修复 `/etc/sysctl.conf` 中 `disable_ipv6=0` 覆盖永久禁用 IPv6 配置的问题。
+- IPv6 永久禁用前自动备份并注释冲突项。
 
 ## v5.2.0 更新记录
 
