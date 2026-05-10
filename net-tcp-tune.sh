@@ -8,13 +8,13 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.4: 增强小盘机器一键优化体验，统一磁盘空间检查，并补充 IPv6 恢复备份提示。
 # v5.2.3: 修复 DNS 净化安全检查在部分环境下将磁盘可用空间误判为 0MB 的问题。
 # v5.2.2: 修复永久禁用 IPv6 时将脚本自身 .ipv6-state-backup.conf 误报为 sysctl.d 冲突项的问题。
 # v5.2.1: 修复 /etc/sysctl.conf 中 disable_ipv6=0 覆盖永久禁用 IPv6 配置；永久禁用前自动备份并注释冲突项。
 # v5.2.0: 移除小众中转 timeout 处理功能，精简主菜单、一键优化流程和回滚入口。
-# v5.1.1: 修复一键优化 IPv6 失败误报成功，并修复确认重启后菜单短暂重绘。
 
-SCRIPT_VERSION="5.2.3"
+SCRIPT_VERSION="5.2.4"
 #=============================================================================
 
 #=============================================================================
@@ -359,20 +359,51 @@ run_remote_script() {
     return $rc
 }
 
+get_root_available_mb() {
+    df -Pm / 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
 check_disk_space() {
     local required_gb=$1
     local required_space_mb=$((required_gb * 1024))
-    local available_space_mb=$(df -m / | awk 'NR==2 {print $4}')
+    local available_space_mb
+    local available_space_gb
 
-    if [ "$available_space_mb" -lt "$required_space_mb" ]; then
-        echo -e "${gl_huang}警告: ${gl_bai}磁盘空间不足！"
-        echo "当前可用: $((available_space_mb/1024))G | 最低需求: ${required_gb}G"
+    DISK_SPACE_CHECK_ABORTED=0
+    DISK_SPACE_CHECK_REASON=""
+
+    available_space_mb=$(get_root_available_mb)
+
+    if ! [[ "$available_space_mb" =~ ^[0-9]+$ ]]; then
+        echo -e "${gl_huang}警告: ${gl_bai}无法可靠读取根分区可用空间。"
+        echo "最低需求: ${required_gb}G"
         read -e -p "是否继续？(Y/N): " continue_choice
         case "$continue_choice" in
             [Yy]) return 0 ;;
-            *) return 1 ;;
+            *)
+                DISK_SPACE_CHECK_ABORTED=1
+                DISK_SPACE_CHECK_REASON="unreadable"
+                return 1
+                ;;
         esac
     fi
+
+    if [ "$available_space_mb" -lt "$required_space_mb" ]; then
+        available_space_gb=$(awk -v mb="$available_space_mb" 'BEGIN {printf "%.1f", mb / 1024}')
+        echo -e "${gl_huang}警告: ${gl_bai}磁盘空间不足！"
+        echo "当前可用: ${available_space_mb}MB（约 ${available_space_gb}G） | 最低需求: ${required_gb}G"
+        read -e -p "是否继续？(Y/N): " continue_choice
+        case "$continue_choice" in
+            [Yy]) return 0 ;;
+            *)
+                DISK_SPACE_CHECK_ABORTED=1
+                DISK_SPACE_CHECK_REASON="insufficient"
+                return 1
+                ;;
+        esac
+    fi
+
+    return 0
 }
 
 check_swap() {
@@ -749,12 +780,16 @@ cancel_ipv6_permanent_disable() {
                 echo "  - 所有相关配置文件已清理"
                 echo "  - IPv6 已完全恢复到执行永久禁用前的状态"
                 echo "  - 重启后此状态依然保持"
+                echo "  - 如果之前脚本注释过 /etc/sysctl.conf 中的 IPv6 冲突项，可查看备份: /etc/sysctl.conf.bak.disable_ipv6_conflict.*"
+                echo "  - 如需完全恢复手动配置，请自行对比备份"
             else
                 echo -e "${gl_huang}⚠️  IPv6 状态: 禁用（值=${ipv6_status}）${gl_bai}"
                 echo ""
                 echo "可能原因："
                 echo "  - 系统中存在其他IPv6禁用配置"
                 echo "  - 手动执行 sysctl -w 命令重新启用IPv6"
+                echo "  - 如果之前脚本注释过 /etc/sysctl.conf 中的 IPv6 冲突项，可查看备份: /etc/sysctl.conf.bak.disable_ipv6_conflict.*"
+                echo "  - 如需完全恢复手动配置，请自行对比备份"
             fi
             ;;
         *)
@@ -3411,7 +3446,7 @@ dns_purify_and_harden() {
     # 检查1: 磁盘空间（至少需要100MB）
     echo -n "  → 检查磁盘空间... "
     local available_space
-    available_space=$(df -Pm / 2>/dev/null | awk 'NR==2 {print $4}')
+    available_space=$(get_root_available_mb)
     if ! [[ "$available_space" =~ ^[0-9]+$ ]]; then
         echo -e "${gl_huang}警告 (无法读取磁盘空间，跳过硬性拦截)${gl_bai}"
     elif [ "$available_space" -lt 100 ]; then
@@ -5738,6 +5773,25 @@ iperf3_single_thread_test() {
 # 一键全自动优化
 #=============================================================================
 
+system_supports_regular_bbr() {
+    local available_cc
+
+    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+    if echo "$available_cc" | grep -qw "bbr"; then
+        return 0
+    fi
+
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe tcp_bbr >/dev/null 2>&1 || true
+        available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+        if echo "$available_cc" | grep -qw "bbr"; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 one_click_optimize() {
     clear
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
@@ -5749,7 +5803,11 @@ one_click_optimize() {
     local result_tcp="跳过"
     local result_dns="跳过"
     local result_ipv6="用户跳过"
+    local result_light="未启用"
     local dns_rollback="-"
+    local run_network_stage=0
+    local light_mode=0
+    local light_choice=""
 
     # 检测当前是否已运行 XanMod 内核
     local xanmod_running=0
@@ -5765,6 +5823,8 @@ one_click_optimize() {
         echo "重启后再次进入脚本，选择“一键全自动优化”即可继续阶段2"
         echo ""
 
+        DISK_SPACE_CHECK_ABORTED=0
+        DISK_SPACE_CHECK_REASON=""
         install_xanmod_kernel
         if [ $? -eq 0 ]; then
             result_kernel="需要重启"
@@ -5781,22 +5841,87 @@ one_click_optimize() {
             echo -e "[-] IPv6：等待重启后执行"
             echo ""
             server_reboot
+            return 0
         else
-            echo ""
-            echo -e "${gl_hong}一键优化结果汇总：${gl_bai}"
-            echo -e "[x] XanMod / BBR v3：安装失败"
-            echo -e "[-] TCP 调优：未执行"
-            echo -e "[-] DNS 净化：未执行"
-            echo -e "[-] IPv6：未执行"
-            echo ""
-            break_end
+            if [ "${DISK_SPACE_CHECK_ABORTED:-0}" = "1" ]; then
+                echo ""
+                if system_supports_regular_bbr; then
+                    if [ "${DISK_SPACE_CHECK_REASON:-}" = "unreadable" ]; then
+                        echo -e "${gl_huang}无法可靠读取根分区可用空间，不建议安装 XanMod / BBR v3 内核；但系统内核支持普通 BBR，可继续执行轻量优化（TCP 调优 / DNS 净化 / IPv6 管理）。${gl_bai}"
+                    else
+                        echo -e "${gl_huang}当前磁盘空间不足，不建议安装 XanMod / BBR v3 内核；但系统内核支持普通 BBR，可继续执行轻量优化（TCP 调优 / DNS 净化 / IPv6 管理）。${gl_bai}"
+                    fi
+                    echo -e "${gl_huang}注意：这不会安装 XanMod，也不会把系统普通 BBR 视为 BBR v3。${gl_bai}"
+                    read -e -p "$(echo -e "${gl_huang}是否继续轻量优化？(Y/N): ${gl_bai}")" light_choice
+                    if [[ "$light_choice" =~ ^[Yy]$ ]]; then
+                        if [ "${DISK_SPACE_CHECK_REASON:-}" = "unreadable" ]; then
+                            result_kernel="跳过（无法读取磁盘空间，未安装 XanMod / BBR v3）"
+                        else
+                            result_kernel="跳过（磁盘空间不足，未安装 XanMod / BBR v3）"
+                        fi
+                        result_light="已继续执行"
+                        light_mode=1
+                        run_network_stage=1
+                    else
+                        echo ""
+                        echo -e "${gl_hong}一键优化结果汇总：${gl_bai}"
+                        echo -e "[x] XanMod / BBR v3：安装失败或已跳过"
+                        echo -e "[-] 轻量优化：用户取消"
+                        echo -e "[-] TCP 调优：未执行"
+                        echo -e "[-] DNS 净化：未执行"
+                        echo -e "[-] IPv6：未执行"
+                        echo ""
+                        break_end
+                        return 1
+                    fi
+                else
+                    if [ "${DISK_SPACE_CHECK_REASON:-}" = "unreadable" ]; then
+                        echo -e "${gl_hong}无法可靠读取根分区可用空间，且当前内核未检测到普通 BBR 支持。${gl_bai}"
+                    else
+                        echo -e "${gl_hong}当前磁盘空间不足，且当前内核未检测到普通 BBR 支持。${gl_bai}"
+                    fi
+                    echo -e "${gl_huang}请扩容磁盘，或更换支持 BBR 的内核后再执行一键优化。${gl_bai}"
+                    echo ""
+                    echo -e "${gl_hong}一键优化结果汇总：${gl_bai}"
+                    echo -e "[x] XanMod / BBR v3：安装失败或已跳过"
+                    echo -e "[-] 轻量优化：当前内核不支持普通 BBR"
+                    echo -e "[-] TCP 调优：未执行"
+                    echo -e "[-] DNS 净化：未执行"
+                    echo -e "[-] IPv6：未执行"
+                    echo ""
+                    break_end
+                    return 1
+                fi
+            else
+                echo ""
+                echo -e "${gl_hong}一键优化结果汇总：${gl_bai}"
+                echo -e "[x] XanMod / BBR v3：安装失败"
+                echo -e "[-] TCP 调优：未执行"
+                echo -e "[-] DNS 净化：未执行"
+                echo -e "[-] IPv6：未执行"
+                echo ""
+                break_end
+                return 1
+            fi
         fi
     else
-        # ===== 阶段2：全自动优化 =====
         result_kernel="已运行"
-        echo -e "${gl_lv}✅ 检测到 XanMod 内核已运行：$(uname -r)${gl_bai}"
-        echo ""
-        echo -e "${gl_huang}▶ 阶段 2/2：全自动网络优化${gl_bai}"
+        run_network_stage=1
+    fi
+
+    if [ $run_network_stage -eq 1 ]; then
+        # ===== 阶段2：全自动优化 =====
+        if [ $light_mode -eq 1 ]; then
+            echo ""
+            echo -e "${gl_lv}✅ 系统内核支持普通 BBR，继续执行轻量优化${gl_bai}"
+            echo ""
+            echo -e "${gl_huang}▶ 轻量优化：TCP 调优 / DNS 净化 / IPv6 管理${gl_bai}"
+        else
+            echo ""
+            echo -e "${gl_lv}✅ 检测到 XanMod 内核已运行：$(uname -r)${gl_bai}"
+            echo ""
+            echo -e "${gl_huang}▶ 阶段 2/2：全自动网络优化${gl_bai}"
+        fi
         echo "将依次执行："
         echo "  [1/3] 功能3 - BBR 直连优化（自动检测带宽）"
         echo "  [2/3] 功能4 - DNS 净化（纯国外模式）"
@@ -5846,11 +5971,20 @@ one_click_optimize() {
 
         echo ""
         echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-        echo -e "${gl_lv}  ✅ 全部优化完成！${gl_bai}"
+        if [ $light_mode -eq 1 ]; then
+            echo -e "${gl_lv}  ✅ 轻量优化完成！${gl_bai}"
+        else
+            echo -e "${gl_lv}  ✅ 全部优化完成！${gl_bai}"
+        fi
         echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
         echo ""
         echo -e "${gl_kjlan}一键优化结果汇总：${gl_bai}"
-        echo -e "[✓] XanMod / BBR v3：${result_kernel}"
+        if [ $light_mode -eq 1 ]; then
+            echo -e "[-] XanMod / BBR v3：${result_kernel}"
+            echo -e "[✓] 轻量优化：${result_light}"
+        else
+            echo -e "[✓] XanMod / BBR v3：${result_kernel}"
+        fi
         case "$result_tcp" in
             *失败*) echo -e "[x] TCP 调优：${result_tcp}" ;;
             *) echo -e "[✓] TCP 调优：${result_tcp}" ;;

@@ -76,7 +76,41 @@ cleanup() {
 }
 trap cleanup EXIT
 
-curl -fsSL "${SCRIPT_URL}?$(date +%s)" -o "$tmp_file"
+download_script() {
+    local url="$1"
+    local output="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$output"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 60 -O "$output" "$url"
+    else
+        echo "错误: 未找到 curl 或 wget，无法下载 net-tcp-tune.sh" >&2
+        return 1
+    fi
+}
+
+download_url="${SCRIPT_URL}?$(date +%s)"
+if ! download_script "$download_url" "$tmp_file"; then
+    echo "错误: 下载 net-tcp-tune.sh 失败" >&2
+    exit 1
+fi
+
+if [ ! -s "$tmp_file" ]; then
+    echo "错误: 下载文件为空，已取消执行" >&2
+    exit 1
+fi
+
+if head -n 1 "$tmp_file" | grep -qiE '<!DOCTYPE|<html'; then
+    echo "错误: 下载内容像 HTML 错误页，已取消执行" >&2
+    exit 1
+fi
+
+if ! head -n 5 "$tmp_file" | sed 's/^\xef\xbb\xbf//' | grep -q '^#!'; then
+    echo "错误: 下载脚本缺少 shebang，已取消执行" >&2
+    exit 1
+fi
+
 bash "$tmp_file" "$@"
 WRAPPER
 
