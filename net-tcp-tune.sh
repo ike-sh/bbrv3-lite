@@ -8,13 +8,13 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.2: 修复永久禁用 IPv6 时将脚本自身 .ipv6-state-backup.conf 误报为 sysctl.d 冲突项的问题。
 # v5.2.1: 修复 /etc/sysctl.conf 中 disable_ipv6=0 覆盖永久禁用 IPv6 配置；永久禁用前自动备份并注释冲突项。
 # v5.2.0: 移除小众中转 timeout 处理功能，精简主菜单、一键优化流程和回滚入口。
 # v5.1.1: 修复一键优化 IPv6 失败误报成功，并修复确认重启后菜单短暂重绘。
 # v5.1.0: 修复 XanMod 按 CPU level 选包，新增环境预检、一键汇总、DoH 端口避让、快捷命令与回滚入口。
-# v5.0.0 精简版: 仅保留 BBR v3 / XanMod / TCP 网络调优相关功能，删除非调优部署工具入口与实现。
 
-SCRIPT_VERSION="5.2.1"
+SCRIPT_VERSION="5.2.2"
 #=============================================================================
 
 #=============================================================================
@@ -524,7 +524,11 @@ comment_ipv6_sysctl_conf_conflicts() {
         echo -e "${gl_lv}✅ 未发现 /etc/sysctl.conf 中的 IPv6 冲突项${gl_bai}"
     fi
 
-    other_conflicts=$(grep -RnsE "$conflict_pattern" /etc/sysctl.d /run/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d 2>/dev/null || true)
+    other_conflicts=$(
+        grep -RnsE "$conflict_pattern" /etc/sysctl.d /run/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d 2>/dev/null \
+            | grep -vE '(^|/)\.ipv6-state-backup\.conf:' \
+            || true
+    )
     if [ -n "$other_conflicts" ]; then
         echo -e "${gl_huang}⚠️  检测到其他 sysctl.d 文件中仍存在 disable_ipv6=0，请留意是否继续覆盖:${gl_bai}"
         echo "$other_conflicts" | sed 's/^/  /'
