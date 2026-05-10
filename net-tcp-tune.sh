@@ -8,13 +8,13 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.6: 修复最小化系统无 wget 时 speedtest 自动安装失败的问题，下载逻辑支持 curl/wget fallback。
 # v5.2.5: 修复预检结论、小盘 SWAP 重复调整、普通 BBR 文案，以及 DNS 小盘提示。
 # v5.2.4: 增强小盘机器一键优化体验，统一磁盘空间检查，并补充 IPv6 恢复备份提示。
 # v5.2.3: 修复 DNS 净化安全检查在部分环境下将磁盘可用空间误判为 0MB 的问题。
 # v5.2.2: 修复永久禁用 IPv6 时将脚本自身 .ipv6-state-backup.conf 误报为 sysctl.d 冲突项的问题。
-# v5.2.1: 修复 /etc/sysctl.conf 中 disable_ipv6=0 覆盖永久禁用 IPv6 配置；永久禁用前自动备份并注释冲突项。
 
-SCRIPT_VERSION="5.2.5"
+SCRIPT_VERSION="5.2.6"
 #=============================================================================
 
 #=============================================================================
@@ -943,6 +943,21 @@ server_reboot() {
 # 带宽检测和缓冲区计算函数
 #=============================================================================
 
+download_speedtest_archive() {
+    local download_url="$1"
+    local output_file="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 60 "$download_url" -o "$output_file"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 60 "$download_url" -O "$output_file"
+    else
+        return 127
+    fi
+
+    [ -s "$output_file" ]
+}
+
 # 带宽检测函数
 detect_bandwidth() {
     # 所有交互式输出重定向到stderr，避免被命令替换捕获
@@ -988,17 +1003,32 @@ detect_bandwidth() {
                         ;;
                 esac
                 
-                cd /tmp
-                wget -q "$download_url" -O speedtest.tgz && \
-                tar -xzf speedtest.tgz && \
-                mv speedtest /usr/local/bin/ && \
-                rm -f speedtest.tgz
-                
-                if [ $? -ne 0 ]; then
+                if ! cd /tmp; then
+                    echo -e "${gl_hong}无法切换到 /tmp，安装失败，将使用通用值${gl_bai}" >&2
+                    echo "500"
+                    return 1
+                fi
+
+                rm -f speedtest.tgz speedtest
+                if ! download_speedtest_archive "$download_url" speedtest.tgz; then
+                    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+                        echo -e "${gl_hong}未找到 curl 或 wget，无法自动下载 speedtest${gl_bai}" >&2
+                    else
+                        echo -e "${gl_hong}speedtest 下载失败或文件为空${gl_bai}" >&2
+                    fi
                     echo -e "${gl_hong}安装失败，将使用通用值${gl_bai}" >&2
                     echo "500"
                     return 1
                 fi
+
+                if ! tar -xzf speedtest.tgz || ! mv speedtest /usr/local/bin/; then
+                    rm -f speedtest.tgz speedtest
+                    echo -e "${gl_hong}安装失败，将使用通用值${gl_bai}" >&2
+                    echo "500"
+                    return 1
+                fi
+
+                rm -f speedtest.tgz
             fi
             
             # 智能测速：获取附近服务器列表，按距离依次尝试
@@ -1166,17 +1196,32 @@ detect_bandwidth() {
                         ;;
                 esac
                 
-                cd /tmp
-                wget -q "$download_url" -O speedtest.tgz && \
-                tar -xzf speedtest.tgz && \
-                mv speedtest /usr/local/bin/ && \
-                rm -f speedtest.tgz
-                
-                if [ $? -ne 0 ]; then
+                if ! cd /tmp; then
+                    echo -e "${gl_hong}无法切换到 /tmp，安装失败，将使用默认值 1000 Mbps${gl_bai}" >&2
+                    echo "1000"
+                    return 1
+                fi
+
+                rm -f speedtest.tgz speedtest
+                if ! download_speedtest_archive "$download_url" speedtest.tgz; then
+                    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+                        echo -e "${gl_hong}未找到 curl 或 wget，无法自动下载 speedtest${gl_bai}" >&2
+                    else
+                        echo -e "${gl_hong}speedtest 下载失败或文件为空${gl_bai}" >&2
+                    fi
                     echo -e "${gl_hong}安装失败，将使用默认值 1000 Mbps${gl_bai}" >&2
                     echo "1000"
                     return 1
                 fi
+
+                if ! tar -xzf speedtest.tgz || ! mv speedtest /usr/local/bin/; then
+                    rm -f speedtest.tgz speedtest
+                    echo -e "${gl_hong}安装失败，将使用默认值 1000 Mbps${gl_bai}" >&2
+                    echo "1000"
+                    return 1
+                fi
+
+                rm -f speedtest.tgz
                 echo -e "${gl_lv}✅ speedtest 安装成功${gl_bai}" >&2
                 echo "" >&2
             fi
@@ -5476,14 +5521,13 @@ run_speedtest() {
             }
             
             echo "正在下载..."
-            if [ "$cpu_arch" = "aarch64" ]; then
-                curl -Lo "$tarball_name" "$download_url"
-            else
-                wget -q "$download_url"
-            fi
-            
-            if [ $? -ne 0 ]; then
-                echo -e "${gl_hong}下载失败！${gl_bai}"
+            rm -f "$tarball_name" speedtest
+            if ! download_speedtest_archive "$download_url" "$tarball_name"; then
+                if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+                    echo -e "${gl_hong}未找到 curl 或 wget，无法自动下载 speedtest${gl_bai}"
+                else
+                    echo -e "${gl_hong}下载失败或文件为空！${gl_bai}"
+                fi
                 break_end
                 return 1
             fi
