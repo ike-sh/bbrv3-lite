@@ -3,7 +3,7 @@
 当前版本：v5.2.7
 
 本精简版只保留网络调优相关功能，聚焦 XanMod 内核、BBR v3、TCP 参数调优、DNS 净化、IPv6 管理，以及必要的测速、预检和回滚能力。
-
+原项目：https://github.com/Eric86777/vps-tcp-tune
 原项目 License 保持不变，详见 [LICENSE](LICENSE)。
 
 ## 安装快捷命令
