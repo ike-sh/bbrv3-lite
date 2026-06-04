@@ -41,7 +41,14 @@ detect_rc_file() {
     fi
 
     if [ ! -f "$RC_FILE" ]; then
-        touch "$RC_FILE"
+        if [ "$MODE" = "uninstall" ]; then
+            return 0
+        fi
+
+        if ! touch "$RC_FILE"; then
+            echo -e "${RED}错误: 无法写入 shell 配置文件 ${RC_FILE}${NC}" >&2
+            return 1
+        fi
     fi
 }
 
@@ -111,6 +118,11 @@ if ! head -n 5 "$tmp_file" | sed 's/^\xef\xbb\xbf//' | grep -q '^#!'; then
     exit 1
 fi
 
+if ! grep -q 'SCRIPT_VERSION=' "$tmp_file"; then
+    echo "错误: 下载脚本缺少 SCRIPT_VERSION 标识，已取消执行" >&2
+    exit 1
+fi
+
 bash "$tmp_file" "$@"
 WRAPPER
 
@@ -118,15 +130,33 @@ WRAPPER
 }
 
 install_alias_fallback() {
-    detect_rc_file
+    detect_rc_file || return 1
 
     local alias_content
-    alias_content='
+    alias_content=$(cat <<'ALIAS'
 # ================ net-tcp-tune 快捷别名 ================
 # 使用时间戳参数确保每次都获取最新版本，避免缓存
-alias bbr="bash <(curl -fsSL \"https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh?\$(date +%s)\")"
+bbr() {
+    local tmp_file
+    tmp_file="$(mktemp)" || return 1
+    trap 'rm -f "$tmp_file"' RETURN
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 60 "https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh?$(date +%s)" -o "$tmp_file" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 60 -O "$tmp_file" "https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh?$(date +%s)" || return 1
+    else
+        echo "错误: 未找到 curl 或 wget，无法下载 net-tcp-tune.sh" >&2
+        return 1
+    fi
+    if [ ! -s "$tmp_file" ]; then echo "错误: 下载文件为空" >&2; return 1; fi
+    if head -n 1 "$tmp_file" | grep -qiE '<!DOCTYPE|<html'; then echo "错误: 下载到了 HTML 页面" >&2; return 1; fi
+    if ! head -n 20 "$tmp_file" | sed 's/^\xef\xbb\xbf//' | grep -q '^#!'; then echo "错误: 下载脚本缺少 shebang" >&2; return 1; fi
+    if ! grep -q 'SCRIPT_VERSION=' "$tmp_file"; then echo "错误: 下载脚本缺少 SCRIPT_VERSION 标识" >&2; return 1; fi
+    bash "$tmp_file" "$@"
+}
 # ================ net-tcp-tune 快捷别名结束 ================
-'
+ALIAS
+)
 
     if grep -q "net-tcp-tune 快捷别名" "$RC_FILE" 2>/dev/null; then
         cp "$RC_FILE" "${RC_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
@@ -140,7 +170,7 @@ alias bbr="bash <(curl -fsSL \"https://raw.githubusercontent.com/ike-sh/bbrv3-li
 }
 
 uninstall_alias_fallback() {
-    detect_rc_file
+    detect_rc_file || return 1
 
     if ! grep -q "net-tcp-tune 快捷别名" "$RC_FILE" 2>/dev/null; then
         return 1
@@ -173,17 +203,17 @@ install_bbr_command() {
         echo ""
         echo "该命令每次执行都会拉取最新版 net-tcp-tune.sh，并支持传递参数。"
     else
-        echo -e "${YELLOW}无法写入 /usr/local/bin，回退到 shell alias 方式${NC}"
+        echo -e "${YELLOW}无法写入 /usr/local/bin，回退到 shell function 方式${NC}"
         if install_alias_fallback; then
-            echo -e "${GREEN}✅ 已写入 alias 到: ${RC_FILE}${NC}"
+            echo -e "${GREEN}✅ 已写入 bbr function 到: ${RC_FILE}${NC}"
             echo ""
-            echo "请执行以下命令使 alias 生效："
+            echo "请执行以下命令使快捷函数生效："
             echo -e "  ${YELLOW}source ${RC_FILE}${NC}"
             echo ""
             echo "之后运行："
             echo -e "  ${GREEN}bbr${NC}"
         else
-            echo -e "${RED}❌ alias 安装失败${NC}"
+            echo -e "${RED}❌ 快捷函数安装失败${NC}"
             exit 1
         fi
     fi
@@ -214,10 +244,10 @@ uninstall_bbr_command() {
 
     if uninstall_alias_fallback; then
         removed_alias=true
-        echo -e "${GREEN}✅ 已从 ${RC_FILE} 移除 alias block${NC}"
-        echo -e "${YELLOW}提示: 重新加载 shell 配置后 alias 清理生效：source ${RC_FILE}${NC}"
+        echo -e "${GREEN}✅ 已从 ${RC_FILE} 移除快捷命令 block${NC}"
+        echo -e "${YELLOW}提示: 重新加载 shell 配置后清理生效：source ${RC_FILE}${NC}"
     else
-        echo -e "${YELLOW}未检测到 shell alias block${NC}"
+        echo -e "${YELLOW}未检测到 shell 快捷命令 block${NC}"
     fi
 
     echo ""

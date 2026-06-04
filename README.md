@@ -1,6 +1,6 @@
 # BBR v3 / XanMod / TCP 网络调优脚本
 
-当前版本：v5.2.7
+当前版本：v5.2.8
 
 本精简版只保留网络调优相关功能，聚焦 XanMod 内核、BBR v3、TCP 参数调优、DNS 净化、IPv6 管理，以及必要的测速、预检和回滚能力。
 
@@ -21,7 +21,7 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/inst
 bbr
 ```
 
-安装脚本会优先写入 `/usr/local/bin/bbr`。如果当前用户无法写入 `/usr/local/bin`，会自动回退到 shell alias 方式，并提示执行 `source ~/.bashrc` 或 `source ~/.zshrc`。
+安装脚本会优先写入 `/usr/local/bin/bbr`。如果当前用户无法写入 `/usr/local/bin`，会自动回退到 shell function 方式，并提示执行 `source ~/.bashrc` 或 `source ~/.zshrc`。
 
 卸载快捷命令：
 
@@ -29,7 +29,17 @@ bbr
 bash install-alias.sh uninstall
 ```
 
-卸载时会同时尝试删除 `/usr/local/bin/bbr` 和 shell alias block。
+卸载时会同时尝试删除 `/usr/local/bin/bbr` 和 shell 快捷命令 block。
+
+## 本地验证
+
+```bash
+bash -n net-tcp-tune.sh
+bash -n install-alias.sh
+grep -n 'SCRIPT_VERSION=' net-tcp-tune.sh
+bash install-alias.sh uninstall
+if command -v shellcheck >/dev/null 2>&1; then shellcheck net-tcp-tune.sh install-alias.sh; fi
+```
 
 ## 在线运行
 
@@ -150,6 +160,8 @@ v5.2.6 起，speedtest 自动安装下载支持 curl/wget fallback；下载失�
 
 v5.2.7 起，DNS 已存在有效配置并跳过重复执行时，一键优化汇总会显示“已配置，跳过重复执行”，不再误显示“未执行”。
 
+v5.2.8 起，远程脚本、快捷命令 fallback、依赖安装判断、IPv6 取消永久禁用和 speedtest 自动安装路径增加安全校验；测速工具失败时仍降级到默认带宽，不阻断 TCP 调优流程。
+
 ## 回滚 / 卸载
 
 功能 12：回滚 / 卸载管理提供统一入口：
@@ -176,6 +188,15 @@ v5.2.7 起，DNS 已存在有效配置并跳过重复执行时，一键优化汇
 - 换内核前建议先给 VPS 做快照。
 - OpenVZ/LXC 等容器虚拟化环境通常不支持自行更换内核。
 - 生产机请谨慎执行内核安装、DNS 修改、IPv6 禁用等操作，建议确保有控制台或救援模式可用。
+
+## v5.2.8 更新记录
+
+- shell fallback 从单行 alias 改为 `bbr()` 函数，支持 curl/wget 下载、空文件、HTML、shebang 和 `SCRIPT_VERSION` 校验。
+- 远程脚本校验增加 `SCRIPT_VERSION` 与项目标识检查，下载内容不像本项目脚本时拒绝执行。
+- 依赖安装改为区分命令存在性与包安装状态，Debian/Ubuntu 使用 `dpkg -s`，RHEL 系使用 `rpm -q`。
+- IPv6 取消永久禁用会校验备份值，只恢复 0/1；可安全识别脚本注释标记时自动恢复 `/etc/sysctl.conf`。
+- speedtest 自动安装增加 tar 可读性、路径穿越、按文件抽取和安装后版本验证；失败时继续使用默认带宽值。
+- 新增 GitHub Actions CI，并补充本地验证命令。
 
 ## v5.2.7 更新记录
 

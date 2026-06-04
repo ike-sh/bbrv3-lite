@@ -8,13 +8,13 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.8: 加固 wrapper/远程脚本校验、依赖安装判断、IPv6 恢复与 speedtest 安全解压。
 # v5.2.7: 修复 DNS 已配置并跳过重复执行时，一键优化汇总误显示“未执行”的文案问题。
 # v5.2.6: 修复最小化系统无 wget 时 speedtest 自动安装失败的问题，下载逻辑支持 curl/wget fallback。
 # v5.2.5: 修复预检结论、小盘 SWAP 重复调整、普通 BBR 文案，以及 DNS 小盘提示。
 # v5.2.4: 增强小盘机器一键优化体验，统一磁盘空间检查，并补充 IPv6 恢复备份提示。
-# v5.2.3: 修复 DNS 净化安全检查在部分环境下将磁盘可用空间误判为 0MB 的问题。
 
-SCRIPT_VERSION="5.2.7"
+SCRIPT_VERSION="5.2.8"
 #=============================================================================
 
 #=============================================================================
@@ -231,7 +231,64 @@ clean_sysctl_conf() {
     sed -i '/^net\.ipv4\.tcp_congestion_control/s/^/# /' /etc/sysctl.conf 2>/dev/null
 }
 
-install_package() {
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+ensure_commands() {
+    local missing_commands=()
+    local command_name
+
+    for command_name in "$@"; do
+        if ! command_exists "$command_name"; then
+            missing_commands+=("$command_name")
+        fi
+    done
+
+    if [ "${#missing_commands[@]}" -gt 0 ]; then
+        echo "错误: 缺少必要命令: ${missing_commands[*]}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+package_installed() {
+    local package="$1"
+    local os_release="/etc/os-release"
+    local os_id=""
+    local os_like=""
+    local detection
+
+    if [ -r "$os_release" ]; then
+        # shellcheck disable=SC1090,SC1091
+        . "$os_release"
+        os_id="${ID:-}"
+        os_like="${ID_LIKE:-}"
+    fi
+
+    detection="${os_id,,} ${os_like,,}"
+
+    if [[ "$detection" =~ (debian|ubuntu) ]]; then
+        command_exists dpkg && dpkg -s "$package" >/dev/null 2>&1
+        return $?
+    fi
+
+    if [[ "$detection" =~ (rhel|centos|fedora|rocky|alma|redhat) ]]; then
+        command_exists rpm && rpm -q "$package" >/dev/null 2>&1
+        return $?
+    fi
+
+    if command_exists dpkg; then
+        dpkg -s "$package" >/dev/null 2>&1
+    elif command_exists rpm; then
+        rpm -q "$package" >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+ensure_packages() {
     local packages=("$@")
     local missing_packages=()
     local os_release="/etc/os-release"
@@ -242,7 +299,7 @@ install_package() {
     local install_cmd=()
 
     for package in "${packages[@]}"; do
-        if ! command -v "$package" &>/dev/null; then
+        if ! package_installed "$package"; then
             missing_packages+=("$package")
         fi
     done
@@ -252,24 +309,28 @@ install_package() {
     fi
 
     if [ -r "$os_release" ]; then
-        # shellcheck disable=SC1091
+        # shellcheck disable=SC1090,SC1091
         . "$os_release"
-        os_id="${ID,,}"
-        os_like="${ID_LIKE,,}"
+        os_id="${ID:-}"
+        os_like="${ID_LIKE:-}"
     fi
 
-    local detection="${os_id} ${os_like}"
+    local detection="${os_id,,} ${os_like,,}"
 
     if [[ "$detection" =~ (debian|ubuntu) ]]; then
+        if ! command_exists apt-get; then
+            echo "错误: 未找到 apt-get，无法自动安装依赖: ${missing_packages[*]}" >&2
+            return 1
+        fi
         pkg_manager="apt"
         update_cmd=(apt-get update)
         install_cmd=(apt-get install -y)
     elif [[ "$detection" =~ (rhel|centos|fedora|rocky|alma|redhat) ]]; then
-        if command -v dnf &>/dev/null; then
+        if command_exists dnf; then
             pkg_manager="dnf"
             update_cmd=(dnf makecache)
             install_cmd=(dnf install -y)
-        elif command -v yum &>/dev/null; then
+        elif command_exists yum; then
             pkg_manager="yum"
             update_cmd=(yum makecache)
             install_cmd=(yum install -y)
@@ -299,13 +360,17 @@ install_package() {
     done
 }
 
+install_package() {
+    ensure_packages "$@"
+}
+
 safe_download_script() {
     local url=$1
     local output_file=$2
 
-    if command -v curl &>/dev/null; then
+    if command_exists curl; then
         curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$output_file"
-    elif command -v wget &>/dev/null; then
+    elif command_exists wget; then
         wget -qO "$output_file" "$url"
     else
         return 1
@@ -326,7 +391,15 @@ verify_downloaded_script() {
     fi
 
     # 检查 shebang，同时处理 UTF-8 BOM (ef bb bf) 开头的情况
-    head -n 5 "$file" | sed 's/^\xef\xbb\xbf//' | grep -q '^#!'
+    if ! head -n 5 "$file" | sed 's/^\xef\xbb\xbf//' | grep -q '^#!'; then
+        return 1
+    fi
+
+    if ! grep -q 'SCRIPT_VERSION=' "$file"; then
+        return 1
+    fi
+
+    grep -q 'BBR v3 / XanMod / TCP' "$file"
 }
 
 run_remote_script() {
@@ -347,7 +420,7 @@ run_remote_script() {
     fi
 
     if ! verify_downloaded_script "$tmp_file"; then
-        echo -e "${gl_hong}❌ 脚本校验失败，已取消执行${gl_bai}"
+        echo -e "${gl_hong}❌ 下载内容不像本项目脚本，已取消执行${gl_bai}"
         rm -f "$tmp_file"
         return 1
     fi
@@ -416,7 +489,10 @@ check_disk_space() {
 }
 
 check_swap() {
-    local swap_total=$(free -m | awk 'NR==3{print $2}')
+    ensure_commands free || return 1
+
+    local swap_total
+    swap_total=$(free -m | awk 'NR==3{print $2}')
 
     if [ "$swap_total" -eq 0 ]; then
         echo -e "${gl_huang}检测到无虚拟内存，正在创建 1G SWAP...${gl_bai}"
@@ -490,6 +566,11 @@ disable_ipv6_temporary() {
     echo "此操作将临时禁用IPv6，重启后自动恢复"
     echo "------------------------------------------------"
     echo ""
+
+    if ! ensure_commands sysctl; then
+        break_end
+        return 1
+    fi
     
     read -e -p "$(echo -e "${gl_huang}确认临时禁用IPv6？(Y/N): ${gl_bai}")" confirm
     
@@ -577,6 +658,58 @@ comment_ipv6_sysctl_conf_conflicts() {
     return 0
 }
 
+restore_ipv6_sysctl_conf_conflicts() {
+    local sysctl_conf="/etc/sysctl.conf"
+    local restore_pattern='^[[:space:]]*#[[:space:]]*disabled by bbrv3-lite:[[:space:]]*(net\.ipv6\.conf\.(all|default|lo)\.disable_ipv6[[:space:]]*=[[:space:]]*0([[:space:]]*(#.*)?)?)$'
+    local backup_file
+
+    if [ ! -f "$sysctl_conf" ] || ! grep -Eq "$restore_pattern" "$sysctl_conf"; then
+        return 2
+    fi
+
+    backup_file="/etc/sysctl.conf.bak.restore_ipv6_conflict.$(date +%Y%m%d_%H%M%S)"
+    if ! cp "$sysctl_conf" "$backup_file"; then
+        echo -e "${gl_hong}❌ 备份 /etc/sysctl.conf 失败，已跳过自动恢复${gl_bai}"
+        return 1
+    fi
+
+    if ! sed -i -E "s|$restore_pattern|\1|" "$sysctl_conf"; then
+        echo -e "${gl_hong}❌ 恢复 /etc/sysctl.conf IPv6 注释项失败${gl_bai}"
+        return 1
+    fi
+
+    echo -e "${gl_lv}✅ 已恢复脚本注释的 /etc/sysctl.conf IPv6 配置项${gl_bai}"
+    echo "  恢复前备份: ${backup_file}"
+    return 0
+}
+
+read_ipv6_backup_value() {
+    local backup_file="$1"
+    local key="$2"
+    local value
+
+    value=$(
+        awk -F'=' -v wanted_key="$key" '
+            {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+            }
+            $1 == wanted_key {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+                print $2
+                exit
+            }
+        ' "$backup_file" 2>/dev/null
+    )
+
+    if [[ "$value" =~ ^[01]$ ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    echo -e "${gl_huang}⚠️  备份值 ${key} 异常，使用安全默认值 0${gl_bai}" >&2
+    printf '0\n'
+}
+
 disable_ipv6_permanent() {
     clear
     echo -e "${gl_kjlan}=== 永久禁用IPv6 ===${gl_bai}"
@@ -584,6 +717,11 @@ disable_ipv6_permanent() {
     echo "此操作将永久禁用IPv6，重启后仍然生效"
     echo "------------------------------------------------"
     echo ""
+
+    if ! ensure_commands sysctl; then
+        break_end
+        return 1
+    fi
     
     # 检查是否已经永久禁用
     if [ -f /etc/sysctl.d/99-disable-ipv6.conf ]; then
@@ -707,9 +845,14 @@ cancel_ipv6_permanent_disable() {
     clear
     echo -e "${gl_kjlan}=== 取消永久禁用IPv6 ===${gl_bai}"
     echo ""
-    echo "此操作将完全还原到执行永久禁用前的状态"
+    echo "此操作将恢复 IPv6 运行状态，并尽可能恢复脚本写入的 sysctl.conf 注释项"
     echo "------------------------------------------------"
     echo ""
+
+    if ! ensure_commands sysctl; then
+        break_end
+        return 1
+    fi
     
     # 检查是否存在永久禁用配置
     if [ ! -f /etc/sysctl.d/99-disable-ipv6.conf ]; then
@@ -723,10 +866,11 @@ cancel_ipv6_permanent_disable() {
         return 1
     fi
     
-    read -e -p "$(echo -e "${gl_huang}确认取消永久禁用并恢复原始状态？(Y/N): ${gl_bai}")" confirm
+    read -e -p "$(echo -e "${gl_huang}确认取消永久禁用并恢复 IPv6 运行状态？(Y/N): ${gl_bai}")" confirm
     
     case "$confirm" in
         [Yy])
+            local sysctl_conf_restore_status="none"
             echo ""
             echo -e "${gl_zi}[步骤 1/4] 删除永久禁用配置...${gl_bai}"
             
@@ -744,15 +888,18 @@ cancel_ipv6_permanent_disable() {
                 
                 echo -e "${gl_zi}[步骤 3/4] 从备份还原原始状态...${gl_bai}"
                 
-                # 读取备份的原始值
-                local backup_all=$(grep 'net.ipv6.conf.all.disable_ipv6' /etc/sysctl.d/.ipv6-state-backup.conf | awk -F'=' '{print $2}')
-                local backup_default=$(grep 'net.ipv6.conf.default.disable_ipv6' /etc/sysctl.d/.ipv6-state-backup.conf | awk -F'=' '{print $2}')
-                local backup_lo=$(grep 'net.ipv6.conf.lo.disable_ipv6' /etc/sysctl.d/.ipv6-state-backup.conf | awk -F'=' '{print $2}')
+                # 读取备份的原始值，仅接受 0/1，异常时使用安全默认值 0
+                local backup_all
+                local backup_default
+                local backup_lo
+                backup_all=$(read_ipv6_backup_value /etc/sysctl.d/.ipv6-state-backup.conf 'net.ipv6.conf.all.disable_ipv6')
+                backup_default=$(read_ipv6_backup_value /etc/sysctl.d/.ipv6-state-backup.conf 'net.ipv6.conf.default.disable_ipv6')
+                backup_lo=$(read_ipv6_backup_value /etc/sysctl.d/.ipv6-state-backup.conf 'net.ipv6.conf.lo.disable_ipv6')
                 
                 # 恢复原始值
-                sysctl -w net.ipv6.conf.all.disable_ipv6=${backup_all} >/dev/null 2>&1
-                sysctl -w net.ipv6.conf.default.disable_ipv6=${backup_default} >/dev/null 2>&1
-                sysctl -w net.ipv6.conf.lo.disable_ipv6=${backup_lo} >/dev/null 2>&1
+                sysctl -w "net.ipv6.conf.all.disable_ipv6=${backup_all}" >/dev/null 2>&1
+                sysctl -w "net.ipv6.conf.default.disable_ipv6=${backup_default}" >/dev/null 2>&1
+                sysctl -w "net.ipv6.conf.lo.disable_ipv6=${backup_lo}" >/dev/null 2>&1
                 
                 # 删除备份文件
                 rm -f /etc/sysctl.d/.ipv6-state-backup.conf
@@ -773,7 +920,23 @@ cancel_ipv6_permanent_disable() {
             fi
             
             echo ""
-            echo -e "${gl_zi}[步骤 4/4] 应用配置...${gl_bai}"
+            echo -e "${gl_zi}[步骤 4/4] 恢复 sysctl.conf 标记并应用配置...${gl_bai}"
+            local restore_rc=0
+            restore_ipv6_sysctl_conf_conflicts
+            restore_rc=$?
+            case "$restore_rc" in
+                0)
+                    sysctl_conf_restore_status="restored"
+                    ;;
+                2)
+                    sysctl_conf_restore_status="none"
+                    echo -e "${gl_huang}⚠️  未发现脚本标记的 /etc/sysctl.conf IPv6 注释项${gl_bai}"
+                    ;;
+                *)
+                    sysctl_conf_restore_status="failed"
+                    echo -e "${gl_huang}⚠️  无法安全恢复 /etc/sysctl.conf 注释项，已保留备份供手动对比${gl_bai}"
+                    ;;
+            esac
             
             # 应用配置
             sysctl --system >/dev/null 2>&1
@@ -786,11 +949,15 @@ cancel_ipv6_permanent_disable() {
                 echo -e "${gl_lv}✅ IPv6 已恢复启用${gl_bai}"
                 echo ""
                 echo -e "${gl_zi}说明：${gl_bai}"
-                echo "  - 所有相关配置文件已清理"
-                echo "  - IPv6 已完全恢复到执行永久禁用前的状态"
+                echo "  - 永久禁用配置文件已清理"
+                if [ "$sysctl_conf_restore_status" = "restored" ]; then
+                    echo "  - 脚本注释的 /etc/sysctl.conf IPv6 冲突项已自动恢复"
+                else
+                    echo "  - 已恢复 IPv6 运行状态，并保留 sysctl.conf 备份供手动对比"
+                fi
                 echo "  - 重启后此状态依然保持"
                 echo "  - 如果之前脚本注释过 /etc/sysctl.conf 中的 IPv6 冲突项，可查看备份: /etc/sysctl.conf.bak.disable_ipv6_conflict.*"
-                echo "  - 如需完全恢复手动配置，请自行对比备份"
+                echo "  - 如需核对手动配置，请自行对比备份"
             else
                 echo -e "${gl_huang}⚠️  IPv6 状态: 禁用（值=${ipv6_status}）${gl_bai}"
                 echo ""
@@ -798,7 +965,7 @@ cancel_ipv6_permanent_disable() {
                 echo "  - 系统中存在其他IPv6禁用配置"
                 echo "  - 手动执行 sysctl -w 命令重新启用IPv6"
                 echo "  - 如果之前脚本注释过 /etc/sysctl.conf 中的 IPv6 冲突项，可查看备份: /etc/sysctl.conf.bak.disable_ipv6_conflict.*"
-                echo "  - 如需完全恢复手动配置，请自行对比备份"
+                echo "  - 已清理脚本永久禁用配置，并保留 sysctl.conf 备份供手动对比"
             fi
             ;;
         *)
@@ -841,7 +1008,7 @@ manage_ipv6() {
         echo "------------------------------------------------"
         echo "1. 临时禁用IPv6（重启后恢复）"
         echo "2. 永久禁用IPv6（重启后仍生效）"
-        echo "3. 取消永久禁用（完全还原）"
+        echo "3. 取消永久禁用（恢复运行状态）"
         echo "0. 返回主菜单"
         echo "------------------------------------------------"
         read -e -p "请输入选择: " choice
@@ -875,6 +1042,7 @@ manage_ipv6() {
 auto_cleanup_legacy_mtu() {
     # 检测旧版 MTU 优化配置文件是否存在
     [ -f /usr/local/etc/mtu-optimize.conf ] || return 0
+    ensure_commands ip || return 0
 
     # 恢复默认路由 MTU
     local default_route
@@ -947,15 +1115,113 @@ download_speedtest_archive() {
     local download_url="$1"
     local output_file="$2"
 
-    if command -v curl >/dev/null 2>&1; then
+    if command_exists curl; then
         curl -fsSL --connect-timeout 10 --max-time 60 "$download_url" -o "$output_file"
-    elif command -v wget >/dev/null 2>&1; then
+    elif command_exists wget; then
         wget -q -T 60 "$download_url" -O "$output_file"
     else
         return 127
     fi
 
-    [ -s "$output_file" ]
+    [ -s "$output_file" ] || return 1
+    ensure_commands tar || return 1
+    tar -tzf "$output_file" >/dev/null 2>&1
+}
+
+speedtest_archive_safe_entries() {
+    local archive_file="$1"
+    local entries
+    local entry
+
+    entries=$(tar -tzf "$archive_file") || return 1
+
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        case "$entry" in
+            /*|../*|*/../*|*/..|..|-*)
+                return 1
+                ;;
+        esac
+    done <<< "$entries"
+
+    return 0
+}
+
+find_speedtest_archive_entry() {
+    local archive_file="$1"
+    local entries
+    local entry
+
+    entries=$(tar -tzf "$archive_file") || return 1
+
+    while IFS= read -r entry; do
+        if [ "${entry##*/}" = "speedtest" ]; then
+            printf '%s\n' "$entry"
+            return 0
+        fi
+    done <<< "$entries"
+
+    return 1
+}
+
+extract_speedtest_binary() {
+    local archive_file="$1"
+    local output_file="$2"
+    local speedtest_entry
+
+    speedtest_archive_safe_entries "$archive_file" || return 1
+    speedtest_entry=$(find_speedtest_archive_entry "$archive_file") || return 1
+
+    if ! tar -xOzf "$archive_file" -- "$speedtest_entry" > "$output_file"; then
+        rm -f "$output_file"
+        return 1
+    fi
+
+    if [ ! -s "$output_file" ]; then
+        rm -f "$output_file"
+        return 1
+    fi
+
+    chmod +x "$output_file"
+}
+
+install_speedtest_cli() {
+    local download_url="$1"
+    local tarball_name="${2:-speedtest.tgz}"
+    local install_path="/usr/local/bin/speedtest"
+    local temp_dir
+    local archive_file
+    local candidate_file
+
+    temp_dir=$(mktemp -d /tmp/speedtest-install.XXXXXX) || return 1
+    archive_file="${temp_dir}/${tarball_name}"
+    candidate_file="${temp_dir}/speedtest"
+
+    if ! download_speedtest_archive "$download_url" "$archive_file"; then
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    if ! extract_speedtest_binary "$archive_file" "$candidate_file"; then
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    if ! mv "$candidate_file" "$install_path"; then
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    chmod +x "$install_path"
+
+    if ! "$install_path" --version >/dev/null 2>&1 && ! "$install_path" -V >/dev/null 2>&1; then
+        rm -f "$install_path"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    rm -rf "$temp_dir"
+    return 0
 }
 
 # 带宽检测函数
@@ -1003,32 +1269,16 @@ detect_bandwidth() {
                         ;;
                 esac
                 
-                if ! cd /tmp; then
-                    echo -e "${gl_hong}无法切换到 /tmp，安装失败，将使用通用值${gl_bai}" >&2
-                    echo "500"
-                    return 1
-                fi
-
-                rm -f speedtest.tgz speedtest
-                if ! download_speedtest_archive "$download_url" speedtest.tgz; then
-                    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+                if ! install_speedtest_cli "$download_url" "speedtest.tgz"; then
+                    if ! command_exists curl && ! command_exists wget; then
                         echo -e "${gl_hong}未找到 curl 或 wget，无法自动下载 speedtest${gl_bai}" >&2
                     else
-                        echo -e "${gl_hong}speedtest 下载失败或文件为空${gl_bai}" >&2
+                        echo -e "${gl_hong}speedtest 下载、校验或安装失败${gl_bai}" >&2
                     fi
                     echo -e "${gl_hong}安装失败，将使用通用值${gl_bai}" >&2
                     echo "500"
                     return 1
                 fi
-
-                if ! tar -xzf speedtest.tgz || ! mv speedtest /usr/local/bin/; then
-                    rm -f speedtest.tgz speedtest
-                    echo -e "${gl_hong}安装失败，将使用通用值${gl_bai}" >&2
-                    echo "500"
-                    return 1
-                fi
-
-                rm -f speedtest.tgz
             fi
             
             # 智能测速：获取附近服务器列表，按距离依次尝试
@@ -1196,32 +1446,16 @@ detect_bandwidth() {
                         ;;
                 esac
                 
-                if ! cd /tmp; then
-                    echo -e "${gl_hong}无法切换到 /tmp，安装失败，将使用默认值 1000 Mbps${gl_bai}" >&2
-                    echo "1000"
-                    return 1
-                fi
-
-                rm -f speedtest.tgz speedtest
-                if ! download_speedtest_archive "$download_url" speedtest.tgz; then
-                    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+                if ! install_speedtest_cli "$download_url" "speedtest.tgz"; then
+                    if ! command_exists curl && ! command_exists wget; then
                         echo -e "${gl_hong}未找到 curl 或 wget，无法自动下载 speedtest${gl_bai}" >&2
                     else
-                        echo -e "${gl_hong}speedtest 下载失败或文件为空${gl_bai}" >&2
+                        echo -e "${gl_hong}speedtest 下载、校验或安装失败${gl_bai}" >&2
                     fi
                     echo -e "${gl_hong}安装失败，将使用默认值 1000 Mbps${gl_bai}" >&2
                     echo "1000"
                     return 1
                 fi
-
-                if ! tar -xzf speedtest.tgz || ! mv speedtest /usr/local/bin/; then
-                    rm -f speedtest.tgz speedtest
-                    echo -e "${gl_hong}安装失败，将使用默认值 1000 Mbps${gl_bai}" >&2
-                    echo "1000"
-                    return 1
-                fi
-
-                rm -f speedtest.tgz
                 echo -e "${gl_lv}✅ speedtest 安装成功${gl_bai}" >&2
                 echo "" >&2
             fi
@@ -2679,13 +2913,13 @@ show_environment_precheck() {
     local xanmod_codename="不可用"
     local xanmod_source_status="未检查"
     if xanmod_codename=$(get_xanmod_codename 2>/dev/null); then
-        if command -v curl >/dev/null 2>&1; then
+        if command_exists curl; then
             if curl -fsSL --max-time 6 "http://deb.xanmod.org/dists/${xanmod_codename}/Release" -o /dev/null 2>/dev/null; then
                 xanmod_source_status="可访问"
             else
                 xanmod_source_status="不可访问或被网络拦截"
             fi
-        elif command -v wget >/dev/null 2>&1; then
+        elif command_exists wget; then
             if wget -q --timeout=6 --spider "http://deb.xanmod.org/dists/${xanmod_codename}/Release" 2>/dev/null; then
                 xanmod_source_status="可访问"
             else
@@ -2852,6 +3086,7 @@ install_xanmod_kernel() {
         echo -e "${gl_kjlan}检测到 ARM64 架构，使用专用安装脚本${gl_bai}"
 
         install_package curl coreutils || return 1
+        ensure_commands curl sha256sum sha512sum || return 1
 
         local tmp_dir
         tmp_dir=$(mktemp -d 2>/dev/null)
@@ -2945,6 +3180,7 @@ install_xanmod_kernel() {
     check_disk_space 3 || return 1
     check_swap
     install_package wget gnupg || { echo -e "${gl_hong}错误: 无法安装必要依赖 wget/gnupg${gl_bai}"; return 1; }
+    ensure_commands wget gpg || { echo -e "${gl_hong}错误: 必要命令 wget/gpg 不可用${gl_bai}"; return 1; }
 
     # 添加 XanMod GPG 密钥（分步执行，避免管道 $? 只检查最后一条命令）
     echo "正在添加 XanMod 仓库密钥..."
@@ -5515,37 +5751,17 @@ run_speedtest() {
                     ;;
             esac
             
-            cd /tmp || {
-                echo -e "${gl_hong}错误: 无法切换到 /tmp 目录${gl_bai}"
-                break_end
-                return 1
-            }
-            
-            echo "正在下载..."
-            rm -f "$tarball_name" speedtest
-            if ! download_speedtest_archive "$download_url" "$tarball_name"; then
-                if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+            echo "正在下载并安装..."
+            if ! install_speedtest_cli "$download_url" "$tarball_name"; then
+                if ! command_exists curl && ! command_exists wget; then
                     echo -e "${gl_hong}未找到 curl 或 wget，无法自动下载 speedtest${gl_bai}"
                 else
-                    echo -e "${gl_hong}下载失败或文件为空！${gl_bai}"
+                    echo -e "${gl_hong}下载、校验或安装失败！${gl_bai}"
                 fi
                 break_end
                 return 1
             fi
-            
-            echo "正在解压..."
-            tar -xzf "$tarball_name"
-            
-            if [ $? -ne 0 ]; then
-                echo -e "${gl_hong}解压失败！${gl_bai}"
-                rm -f "$tarball_name"
-                break_end
-                return 1
-            fi
-            
-            mv speedtest /usr/local/bin/
-            rm -f "$tarball_name"
-            
+
             echo -e "${gl_lv}✅ Speedtest 安装成功！${gl_bai}"
             echo ""
         else
@@ -6275,7 +6491,7 @@ remove_bbr_shortcut_command() {
     else
         echo -e "${gl_huang}未检测到 /usr/local/bin/bbr${gl_bai}"
     fi
-    echo "如需同时清理 shell alias，可运行：bash install-alias.sh uninstall"
+    echo "如需同时清理 shell 快捷命令，可运行：bash install-alias.sh uninstall"
     break_end
 }
 
