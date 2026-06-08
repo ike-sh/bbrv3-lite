@@ -4,7 +4,7 @@
 # XanMod 官方 APT 仅支持 x86_64；ARM64 使用社区构建（可选）或系统自带 BBR。
 #=============================================================================
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 COMMUNITY_REPO="zijiren233/xanmod-arm64"
 COMMUNITY_API="https://api.github.com/repos/${COMMUNITY_REPO}/releases/latest"
 
@@ -155,9 +155,12 @@ install_community_debs() {
     echo -e "${gl_lv}SHA256 校验通过（如 Release 提供 digest）${gl_bai}"
     echo "安装内核包..."
     if ! dpkg -i "$image_deb" "$headers_deb"; then
-        echo -e "${gl_hong}错误: dpkg 安装失败${gl_bai}"
-        rm -rf "$tmp_dir"
-        return 1
+        echo -e "${gl_huang}dpkg 安装未完全成功，尝试 apt-get -f install 修复依赖...${gl_bai}"
+        if ! DEBIAN_FRONTEND=noninteractive apt-get -f install -y; then
+            echo -e "${gl_hong}错误: dpkg 安装及依赖修复均失败${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
     fi
 
     update-grub 2>/dev/null || true
@@ -208,6 +211,10 @@ main() {
         echo -e "${gl_huang}当前内核支持普通 BBR，但不是 BBR v3 / XanMod。${gl_bai}"
         echo -e "${gl_zi}可跳过内核安装，直接执行菜单 3（轻量 TCP 调优）。${gl_bai}"
         echo ""
+        if [ "$AUTO_MODE" = "1" ]; then
+            echo -e "${gl_zi}AUTO_MODE: 跳过社区内核安装，使用轻量 TCP 调优。${gl_bai}"
+            exit 0
+        fi
         read -e -p "是否仍尝试安装社区 XanMod ARM64 内核？(Y/N): " keep_going
         case "$keep_going" in
             [Yy]) ;;
@@ -233,14 +240,18 @@ main() {
     echo ""
     echo -e "${gl_huang}将安装社区维护的 ARM64 XanMod 内核（非 XanMod 官方）${gl_bai}"
     echo -e "${gl_huang}来源: https://github.com/${COMMUNITY_REPO}${gl_bai}"
-    read -e -p "确认继续？(Y/N): " confirm
-    case "$confirm" in
-        [Yy]) ;;
-        *)
-            echo "已取消"
-            exit 1
-            ;;
-    esac
+    if [ "$AUTO_MODE" = "1" ]; then
+        echo -e "${gl_zi}AUTO_MODE: 自动继续社区内核安装${gl_bai}"
+    else
+        read -e -p "确认继续？(Y/N): " confirm
+        case "$confirm" in
+            [Yy]) ;;
+            *)
+                echo "已取消"
+                exit 1
+                ;;
+        esac
+    fi
 
     if install_community_debs; then
         echo ""

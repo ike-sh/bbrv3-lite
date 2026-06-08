@@ -8,6 +8,7 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.13: ARM64 AUTO_MODE 透传；bbrv3arm.sh dpkg 依赖自动修复。
 # v5.2.12: ARM64 脚本迁入仓库 bbrv3arm.sh，移除 jhb.ovh 第三方依赖。
 # v5.2.11: 内存检测兼容、DNS 预生成回滚增强、ARM64 下载安全加固。
 # v5.2.10: DNS 净化 DoT/DoH 自动模式免交互、清理未使用日志封装、返回值明确化。
@@ -18,7 +19,7 @@
 # v5.2.5: 修复预检结论、小盘 SWAP 重复调整、普通 BBR 文案，以及 DNS 小盘提示。
 # v5.2.4: 增强小盘机器一键优化体验，统一磁盘空间检查，并补充 IPv6 恢复备份提示。
 
-SCRIPT_VERSION="5.2.12"
+SCRIPT_VERSION="5.2.13"
 #=============================================================================
 
 #=============================================================================
@@ -468,7 +469,8 @@ run_arm64_kernel_install() {
     echo -e "${gl_kjlan}使用 ARM64 安装脚本: ${arm_script}${gl_bai}"
     echo -e "${gl_zi}脚本来源: ike-sh/bbrv3-lite 仓库 bbrv3arm.sh${gl_bai}"
 
-    bash "$arm_script"
+    # 透传 AUTO_MODE，供 bbrv3arm.sh 在一键优化时跳过交互确认
+    AUTO_MODE="${AUTO_MODE:-}" bash "$arm_script"
     rc=$?
     [ "$cleanup" -eq 1 ] && rm -f "$arm_script"
     return $rc
@@ -3211,16 +3213,19 @@ install_xanmod_kernel() {
     echo "支持系统: Debian/Ubuntu (x86_64 & ARM64)"
     echo -e "${gl_huang}警告: 将升级 Linux 内核，请提前备份重要数据！${gl_bai}"
     echo "------------------------------------------------"
-    read -e -p "确定继续安装吗？(Y/N): " choice
-
-    case "$choice" in
-        [Yy])
-            ;;
-        *)
-            echo "已取消安装"
-            return 1
-            ;;
-    esac
+    if [ "$AUTO_MODE" = "1" ]; then
+        echo -e "${gl_zi}AUTO_MODE: 自动继续内核安装${gl_bai}"
+    else
+        read -e -p "确定继续安装吗？(Y/N): " choice
+        case "$choice" in
+            [Yy])
+                ;;
+            *)
+                echo "已取消安装"
+                return 1
+                ;;
+        esac
+    fi
     
     # 检测 CPU 架构
     local cpu_arch=$(uname -m)
@@ -6277,8 +6282,11 @@ one_click_optimize() {
 
         DISK_SPACE_CHECK_ABORTED=0
         DISK_SPACE_CHECK_REASON=""
+        AUTO_MODE=1
         install_xanmod_kernel
-        if [ $? -eq 0 ]; then
+        local install_rc=$?
+        AUTO_MODE=""
+        if [ $install_rc -eq 0 ]; then
             result_kernel="需要重启"
             echo ""
             echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
