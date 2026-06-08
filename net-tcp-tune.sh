@@ -8,13 +8,14 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.9: 一键优化自动模式免交互、GPG 官方源优先、TCP 调优返回值修正、下载超时统一。
 # v5.2.8: 加固 wrapper/远程脚本校验、依赖安装判断、IPv6 恢复与 speedtest 安全解压。
 # v5.2.7: 修复 DNS 已配置并跳过重复执行时，一键优化汇总误显示“未执行”的文案问题。
 # v5.2.6: 修复最小化系统无 wget 时 speedtest 自动安装失败的问题，下载逻辑支持 curl/wget fallback。
 # v5.2.5: 修复预检结论、小盘 SWAP 重复调整、普通 BBR 文案，以及 DNS 小盘提示。
 # v5.2.4: 增强小盘机器一键优化体验，统一磁盘空间检查，并补充 IPv6 恢复备份提示。
 
-SCRIPT_VERSION="5.2.8"
+SCRIPT_VERSION="5.2.9"
 #=============================================================================
 
 #=============================================================================
@@ -371,7 +372,7 @@ safe_download_script() {
     if command_exists curl; then
         curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$output_file"
     elif command_exists wget; then
-        wget -qO "$output_file" "$url"
+        wget -q -T 60 -O "$output_file" "$url"
     else
         return 1
     fi
@@ -1236,8 +1237,14 @@ detect_bandwidth() {
     echo "3. 手动选择预设档位（9个常用带宽档位）" >&2
     echo "" >&2
     
-    read -e -p "请输入选择 [1]: " bw_choice
-    bw_choice=${bw_choice:-1}
+    local bw_choice=""
+    if [ "$AUTO_MODE" = "1" ]; then
+        bw_choice=1
+        echo -e "${gl_zi}[自动模式] 使用带宽自动检测${gl_bai}" >&2
+    else
+        read -e -p "请输入选择 [1]: " bw_choice
+        bw_choice=${bw_choice:-1}
+    fi
 
     case "$bw_choice" in
         1)
@@ -1370,10 +1377,15 @@ detect_bandwidth() {
                 echo -e "${gl_huang}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}" >&2
                 echo "" >&2
                 
-                # 询问用户确认
-                read -e -p "是否使用默认值 1000 Mbps？(Y/N) [Y]: " use_default
-                use_default=${use_default:-Y}
-                
+                # 询问用户确认（自动模式直接使用默认值）
+                local use_default="Y"
+                if [ "$AUTO_MODE" = "1" ]; then
+                    echo -e "${gl_zi}[自动模式] 测速失败，使用默认 1000 Mbps${gl_bai}" >&2
+                else
+                    read -e -p "是否使用默认值 1000 Mbps？(Y/N) [Y]: " use_default
+                    use_default=${use_default:-Y}
+                fi
+
                 case "$use_default" in
                     [Yy])
                         echo "" >&2
@@ -2129,27 +2141,32 @@ bbr_configure_direct() {
     # 地区选择（影响缓冲区大小：高延迟地区需要更大缓冲区）
     local region="asia"
     local region_choice=""
-    echo ""
-    echo -e "${gl_kjlan}请选择服务器主要服务的地区：${gl_bai}"
-    echo ""
-    echo "1. 亚太地区（港/日/新/韩等）⭐ 推荐"
-    echo "   延迟较低（RTT < 100ms），使用标准缓冲区"
-    echo ""
-    echo "2. 美国/欧洲（跨太平洋/大西洋）"
-    echo "   延迟较高（RTT 150-300ms），使用大缓冲区"
-    echo ""
-    read -e -p "请输入选择 [1]: " region_choice
-    region_choice=${region_choice:-1}
-    case "$region_choice" in
-        2) region="overseas" ;;
-        *) region="asia" ;;
-    esac
+    if [ "$AUTO_MODE" = "1" ]; then
+        region="asia"
+        echo -e "${gl_zi}[自动模式] 使用亚太地区默认缓冲区配置${gl_bai}"
+    else
+        echo ""
+        echo -e "${gl_kjlan}请选择服务器主要服务的地区：${gl_bai}"
+        echo ""
+        echo "1. 亚太地区（港/日/新/韩等）⭐ 推荐"
+        echo "   延迟较低（RTT < 100ms），使用标准缓冲区"
+        echo ""
+        echo "2. 美国/欧洲（跨太平洋/大西洋）"
+        echo "   延迟较高（RTT 150-300ms），使用大缓冲区"
+        echo ""
+        read -e -p "请输入选择 [1]: " region_choice
+        region_choice=${region_choice:-1}
+        case "$region_choice" in
+            2) region="overseas" ;;
+            *) region="asia" ;;
+        esac
+    fi
 
     local buffer_mb=$(calculate_buffer_size "$detected_bandwidth" "$region")
     local buffer_bytes=$((buffer_mb * 1024 * 1024))
     
     echo -e "${gl_lv}✅ 将使用 ${buffer_mb}MB 缓冲区配置${gl_bai}"
-    sleep 2
+    [ "$AUTO_MODE" != "1" ] && sleep 2
     
     echo ""
     echo -e "${gl_zi}[步骤 3/6] 清理配置冲突...${gl_bai}"
@@ -2546,12 +2563,14 @@ LIMITSEOF
        [ "$actual_wmem" = "$buffer_bytes" ] && [ "$actual_rmem" = "$buffer_bytes" ]; then
         echo -e "${gl_lv}✅ ${bbr_tuning_label} 直连/落地优化配置完成并已生效！${gl_bai}"
         echo -e "${gl_zi}配置说明: ${buffer_mb}MB 缓冲区（${detected_bandwidth} Mbps 带宽），适合直连/落地场景${gl_bai}"
-    else
-        echo -e "${gl_huang}⚠️ 配置已保存但部分参数未生效${gl_bai}"
-        echo -e "${gl_huang}建议执行以下操作：${gl_bai}"
-        echo "1. 检查是否有其他配置文件冲突"
-        echo "2. 重启服务器使配置完全生效: reboot"
+        return 0
     fi
+
+    echo -e "${gl_huang}⚠️ 配置已保存但部分参数未生效${gl_bai}"
+    echo -e "${gl_huang}建议执行以下操作：${gl_bai}"
+    echo "1. 检查是否有其他配置文件冲突"
+    echo "2. 重启服务器使配置完全生效: reboot"
+    return 1
 }
 
 #=============================================================================
@@ -2671,6 +2690,39 @@ get_xanmod_codename() {
     fi
 
     echo "$version_codename"
+}
+
+import_xanmod_gpg_key() {
+    local gpg_key_file="$1"
+    local key_tmp
+    local gpg_ok=false
+
+    key_tmp=$(mktemp) || return 1
+
+    echo "正在添加 XanMod 仓库密钥..."
+
+    # 优先从 XanMod 官方源下载
+    if wget -qO "$key_tmp" --timeout=30 "https://dl.xanmod.org/archive.key" 2>/dev/null && \
+       [ -s "$key_tmp" ]; then
+        if gpg --dearmor -o "$gpg_key_file" --yes < "$key_tmp" 2>/dev/null; then
+            gpg_ok=true
+        fi
+    fi
+
+    # 官方源失败时回退到镜像
+    if [ "$gpg_ok" = false ]; then
+        echo -e "${gl_huang}官方源失败，尝试镜像源...${gl_bai}"
+        if wget -qO "$key_tmp" --timeout=30 "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/archive.key" 2>/dev/null && \
+           [ -s "$key_tmp" ]; then
+            if gpg --dearmor -o "$gpg_key_file" --yes < "$key_tmp" 2>/dev/null; then
+                gpg_ok=true
+            fi
+        fi
+    fi
+
+    rm -f "$key_tmp"
+
+    [ "$gpg_ok" = true ]
 }
 
 write_xanmod_apt_source() {
@@ -3182,34 +3234,8 @@ install_xanmod_kernel() {
     install_package wget gnupg || { echo -e "${gl_hong}错误: 无法安装必要依赖 wget/gnupg${gl_bai}"; return 1; }
     ensure_commands wget gpg || { echo -e "${gl_hong}错误: 必要命令 wget/gpg 不可用${gl_bai}"; return 1; }
 
-    # 添加 XanMod GPG 密钥（分步执行，避免管道 $? 只检查最后一条命令）
-    echo "正在添加 XanMod 仓库密钥..."
     local gpg_key_file="/usr/share/keyrings/xanmod-archive-keyring.gpg"
-    local key_tmp=$(mktemp)
-    local gpg_ok=false
-
-    # 尝试1: 从镜像源下载
-    if wget -qO "$key_tmp" "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/archive.key" 2>/dev/null && \
-       [ -s "$key_tmp" ]; then
-        if gpg --dearmor -o "$gpg_key_file" --yes < "$key_tmp" 2>/dev/null; then
-            gpg_ok=true
-        fi
-    fi
-
-    # 尝试2: 从 XanMod 官方源下载
-    if [ "$gpg_ok" = false ]; then
-        echo -e "${gl_huang}镜像源失败，尝试 XanMod 官方源...${gl_bai}"
-        if wget -qO "$key_tmp" "https://dl.xanmod.org/archive.key" 2>/dev/null && \
-           [ -s "$key_tmp" ]; then
-            if gpg --dearmor -o "$gpg_key_file" --yes < "$key_tmp" 2>/dev/null; then
-                gpg_ok=true
-            fi
-        fi
-    fi
-
-    rm -f "$key_tmp"
-
-    if [ "$gpg_ok" = false ]; then
+    if ! import_xanmod_gpg_key "$gpg_key_file"; then
         echo -e "${gl_hong}错误: GPG 密钥导入失败，无法继续安装${gl_bai}"
         echo "请检查网络连接后重试"
         return 1
@@ -6678,31 +6704,8 @@ update_xanmod_kernel() {
         return 1
     }
 
-    # 添加 XanMod 仓库密钥（分步执行，避免管道 $? 问题）
     if [ ! -f "$gpg_key_file" ]; then
-        echo "正在添加 XanMod 仓库密钥..."
-        local key_tmp=$(mktemp)
-        local gpg_ok=false
-
-        if wget -qO "$key_tmp" "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/archive.key" 2>/dev/null && \
-           [ -s "$key_tmp" ]; then
-            if gpg --dearmor -o "$gpg_key_file" --yes < "$key_tmp" 2>/dev/null; then
-                gpg_ok=true
-            fi
-        fi
-
-        if [ "$gpg_ok" = false ]; then
-            if wget -qO "$key_tmp" "https://dl.xanmod.org/archive.key" 2>/dev/null && \
-               [ -s "$key_tmp" ]; then
-                if gpg --dearmor -o "$gpg_key_file" --yes < "$key_tmp" 2>/dev/null; then
-                    gpg_ok=true
-                fi
-            fi
-        fi
-
-        rm -f "$key_tmp"
-
-        if [ "$gpg_ok" = false ]; then
+        if ! import_xanmod_gpg_key "$gpg_key_file"; then
             echo -e "${gl_hong}错误: GPG 密钥导入失败${gl_bai}"
             break_end
             return 1
@@ -6949,6 +6952,7 @@ parse_args() {
                 ;;
             --debug)
                 LOG_LEVEL="DEBUG"
+                enable_strict_mode
                 log_debug "调试模式已启用"
                 shift
                 ;;

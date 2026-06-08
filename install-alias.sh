@@ -123,6 +123,11 @@ if ! grep -q 'SCRIPT_VERSION=' "$tmp_file"; then
     exit 1
 fi
 
+if ! grep -q 'BBR v3 / XanMod / TCP' "$tmp_file"; then
+    echo "错误: 下载脚本缺少项目标识，已取消执行" >&2
+    exit 1
+fi
+
 bash "$tmp_file" "$@"
 WRAPPER
 
@@ -152,6 +157,7 @@ bbr() {
     if head -n 1 "$tmp_file" | grep -qiE '<!DOCTYPE|<html'; then echo "错误: 下载到了 HTML 页面" >&2; return 1; fi
     if ! head -n 20 "$tmp_file" | sed 's/^\xef\xbb\xbf//' | grep -q '^#!'; then echo "错误: 下载脚本缺少 shebang" >&2; return 1; fi
     if ! grep -q 'SCRIPT_VERSION=' "$tmp_file"; then echo "错误: 下载脚本缺少 SCRIPT_VERSION 标识" >&2; return 1; fi
+    if ! grep -q 'BBR v3 / XanMod / TCP' "$tmp_file"; then echo "错误: 下载脚本缺少项目标识" >&2; return 1; fi
     bash "$tmp_file" "$@"
 }
 # ================ net-tcp-tune 快捷别名结束 ================

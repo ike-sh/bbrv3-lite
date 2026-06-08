@@ -11,15 +11,5 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Bash syntax
-        run: |
-          bash -n net-tcp-tune.sh
-          bash -n install-alias.sh
-
-      - name: ShellCheck
-        run: |
-          if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck -S error net-tcp-tune.sh install-alias.sh
-          else
-            echo "shellcheck not available; skipping"
-          fi
+      - name: Validate
+        run: bash scripts/validate.sh

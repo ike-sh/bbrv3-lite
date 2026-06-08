@@ -1,6 +1,6 @@
 # BBR v3 / XanMod / TCP 网络调优脚本
 
-当前版本：v5.2.8
+当前版本：v5.2.9
 
 本精简版只保留网络调优相关功能，聚焦 XanMod 内核、BBR v3、TCP 参数调优、DNS 净化、IPv6 管理，以及必要的测速、预检和回滚能力。
 原项目：https://github.com/Eric86777/vps-tcp-tune
@@ -34,11 +34,8 @@ bash install-alias.sh uninstall
 ## 本地验证
 
 ```bash
-bash -n net-tcp-tune.sh
-bash -n install-alias.sh
-grep -n 'SCRIPT_VERSION=' net-tcp-tune.sh
+bash scripts/validate.sh
 bash install-alias.sh uninstall
-if command -v shellcheck >/dev/null 2>&1; then shellcheck net-tcp-tune.sh install-alias.sh; fi
 ```
 
 ## 在线运行
@@ -188,6 +185,13 @@ v5.2.8 起，远程脚本、快捷命令 fallback、依赖安装判断、IPv6 �
 - 换内核前建议先给 VPS 做快照。
 - OpenVZ/LXC 等容器虚拟化环境通常不支持自行更换内核。
 - 生产机请谨慎执行内核安装、DNS 修改、IPv6 禁用等操作，建议确保有控制台或救援模式可用。
+
+## v5.2.9 更新记录
+
+- 一键全自动优化（功能 10）在 `AUTO_MODE` 下不再阻塞等待带宽测速失败确认、地区选择等交互。
+- XanMod GPG 密钥改为优先从官方 `dl.xanmod.org` 下载，镜像源仅作回退；安装与更新共用 `import_xanmod_gpg_key()`。
+- `bbr_configure_direct` 在 sysctl 验证未全部生效时返回非零，一键优化汇总能正确标记 TCP 调优失败。
+- `safe_download_script` 的 wget 分支补充 60 秒超时；`install-alias.sh` 增加与主脚本一致的项目标识校验。
 
 ## v5.2.8 更新记录
 
