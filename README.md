@@ -1,6 +1,6 @@
 # BBR v3 / XanMod / TCP 网络调优脚本
 
-当前版本：v5.2.11
+当前版本：v5.2.12
 
 本精简版只保留网络调优相关功能，聚焦 XanMod 内核、BBR v3、TCP 参数调优、DNS 净化、IPv6 管理，以及必要的测速、预检和回滚能力。
 原项目：https://github.com/Eric86777/vps-tcp-tune
@@ -79,7 +79,7 @@ chmod +x net-tcp-tune.sh
 | --- | --- | --- |
 | Debian 12 bookworm / Debian 13 trixie + KVM + x86_64 | 完整支持 | 推荐环境，支持 XanMod + BBR v3 + TCP 调优 |
 | Ubuntu 22.04 / 24.04 或常见 LTS + KVM + x86_64 | 完整支持 | 使用系统自身 codename 添加 XanMod 源 |
-| Debian/Ubuntu ARM64 | 实验/部分支持 | 如脚本已有 ARM64 逻辑，可尝试；建议先做快照 |
+| Debian/Ubuntu ARM64 | 实验/部分支持 | 使用仓库内 `bbrv3arm.sh`；社区 XanMod 内核，建议先做快照 |
 | Rocky / Alma / CentOS / Fedora / RHEL | 部分支持 | sysctl、测速等功能可尝试，不保证 XanMod 安装 |
 | OpenVZ / LXC / Docker 容器 | 不建议/通常不支持 | 通常不能自行更换内核 |
 | Alpine | 非主要目标 | 仅少量逻辑可能兼容 |
@@ -185,6 +185,12 @@ v5.2.8 起，远程脚本、快捷命令 fallback、依赖安装判断、IPv6 �
 - 换内核前建议先给 VPS 做快照。
 - OpenVZ/LXC 等容器虚拟化环境通常不支持自行更换内核。
 - 生产机请谨慎执行内核安装、DNS 修改、IPv6 禁用等操作，建议确保有控制台或救援模式可用。
+
+## v5.2.12 更新记录
+
+- 新增仓库内 `bbrv3arm.sh`，ARM64 不再从 `jhb.ovh` 下载第三方脚本。
+- ARM64 优先使用同目录脚本，在线场景从 `ike-sh/bbrv3-lite` raw 拉取并校验。
+- 社区 XanMod ARM64 内核可选安装（`zijiren233/xanmod-arm64` GitHub Release + SHA256 digest）。
 
 ## v5.2.11 更新记录
 

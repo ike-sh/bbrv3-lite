@@ -8,6 +8,7 @@ cd "$ROOT_DIR"
 echo "==> Bash syntax check"
 bash -n net-tcp-tune.sh
 bash -n install-alias.sh
+bash -n bbrv3arm.sh
 bash -n scripts/validate.sh
 
 echo "==> Version marker"
@@ -15,7 +16,7 @@ grep -n 'SCRIPT_VERSION=' net-tcp-tune.sh | head -1
 
 echo "==> ShellCheck (optional)"
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck -S error net-tcp-tune.sh install-alias.sh scripts/validate.sh
+    shellcheck -S error net-tcp-tune.sh install-alias.sh bbrv3arm.sh scripts/validate.sh
 else
     echo "shellcheck not available; skipped"
 fi
