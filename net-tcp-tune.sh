@@ -8,6 +8,7 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.10: DNS 净化 DoT/DoH 自动模式免交互、清理未使用日志封装、返回值明确化。
 # v5.2.9: 一键优化自动模式免交互、GPG 官方源优先、TCP 调优返回值修正、下载超时统一。
 # v5.2.8: 加固 wrapper/远程脚本校验、依赖安装判断、IPv6 恢复与 speedtest 安全解压。
 # v5.2.7: 修复 DNS 已配置并跳过重复执行时，一键优化汇总误显示“未执行”的文案问题。
@@ -15,7 +16,7 @@
 # v5.2.5: 修复预检结论、小盘 SWAP 重复调整、普通 BBR 文案，以及 DNS 小盘提示。
 # v5.2.4: 增强小盘机器一键优化体验，统一磁盘空间检查，并补充 IPv6 恢复备份提示。
 
-SCRIPT_VERSION="5.2.9"
+SCRIPT_VERSION="5.2.10"
 #=============================================================================
 
 #=============================================================================
@@ -161,8 +162,6 @@ log() {
 
 # 便捷日志函数
 log_error() { log "ERROR" "$@"; }
-log_warn()  { log "WARN" "$@"; }
-log_info()  { log "INFO" "$@"; }
 log_debug() { log "DEBUG" "$@"; }
 
 #=============================================================================
@@ -3792,11 +3791,11 @@ dns_purify_and_harden() {
         echo ""
         DNS_PURIFY_RESULT="已配置，跳过重复执行"
         if [ "$AUTO_MODE" = "1" ]; then
-            return
+            return 0
         fi
         read -e -p "$(echo -e "${gl_huang}如需重新配置请输入 y，返回主菜单按回车: ${gl_bai}")" dns_reconfig
         if [[ ! "$dns_reconfig" =~ ^[Yy]$ ]]; then
-            return
+            return 0
         fi
         echo ""
     fi
@@ -3836,7 +3835,8 @@ dns_purify_and_harden() {
 
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "${gl_huang}已取消操作${gl_bai}"
-        return
+        DNS_PURIFY_RESULT="用户跳过"
+        return 0
     fi
 
     # ==================== 终极安全检查 ====================
@@ -4568,8 +4568,13 @@ ROLLBACK_SCRIPT
             echo ""
 
             local doh_choice=""
-            read -e -p "$(echo -e "${gl_huang}是否自动切换到 DoH 443 模式？(Y/n): ${gl_bai}")" doh_choice
-            doh_choice=${doh_choice:-Y}
+            if [ "$AUTO_MODE" = "1" ]; then
+                doh_choice=Y
+                echo -e "${gl_zi}[自动模式] DoT 853 不可达，自动尝试 DoH 443${gl_bai}"
+            else
+                read -e -p "$(echo -e "${gl_huang}是否自动切换到 DoH 443 模式？(Y/n): ${gl_bai}")" doh_choice
+                doh_choice=${doh_choice:-Y}
+            fi
 
             if [[ "$doh_choice" =~ ^[Yy]$ ]]; then
                 if configure_dnscrypt_proxy; then
@@ -4585,8 +4590,13 @@ ROLLBACK_SCRIPT
                 else
                     echo -e "${gl_huang}⚠️  DoH 443 模式启用失败${gl_bai}"
                     local plain_choice=""
-                    read -e -p "$(echo -e "${gl_huang}是否降级为普通 DNS 53？(Y/n): ${gl_bai}")" plain_choice
-                    plain_choice=${plain_choice:-Y}
+                    if [ "$AUTO_MODE" = "1" ]; then
+                        plain_choice=Y
+                        echo -e "${gl_zi}[自动模式] 降级为普通 DNS 53${gl_bai}"
+                    else
+                        read -e -p "$(echo -e "${gl_huang}是否降级为普通 DNS 53？(Y/n): ${gl_bai}")" plain_choice
+                        plain_choice=${plain_choice:-Y}
+                    fi
                     if [[ "$plain_choice" =~ ^[Yy]$ ]]; then
                         auto_rollback_dns_purify
                         apply_plain_dns_fallback
@@ -4600,8 +4610,13 @@ ROLLBACK_SCRIPT
                 fi
             else
                 local plain_choice=""
-                read -e -p "$(echo -e "${gl_huang}是否降级为普通 DNS 53？(Y/n): ${gl_bai}")" plain_choice
-                plain_choice=${plain_choice:-Y}
+                if [ "$AUTO_MODE" = "1" ]; then
+                    plain_choice=Y
+                    echo -e "${gl_zi}[自动模式] 降级为普通 DNS 53${gl_bai}"
+                else
+                    read -e -p "$(echo -e "${gl_huang}是否降级为普通 DNS 53？(Y/n): ${gl_bai}")" plain_choice
+                    plain_choice=${plain_choice:-Y}
+                fi
                 if [[ "$plain_choice" =~ ^[Yy]$ ]]; then
                     apply_plain_dns_fallback
                     DNS_PURIFY_RESULT="普通 DNS 53 fallback 已启用"
@@ -5735,6 +5750,7 @@ ROLLBACK_SCRIPT
     echo ""
 
     break_end
+    return 0
 }
 
 run_speedtest() {
