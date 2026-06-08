@@ -8,6 +8,7 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.11: 内存检测兼容、DNS 预生成回滚增强、ARM64 下载安全加固。
 # v5.2.10: DNS 净化 DoT/DoH 自动模式免交互、清理未使用日志封装、返回值明确化。
 # v5.2.9: 一键优化自动模式免交互、GPG 官方源优先、TCP 调优返回值修正、下载超时统一。
 # v5.2.8: 加固 wrapper/远程脚本校验、依赖安装判断、IPv6 恢复与 speedtest 安全解压。
@@ -16,7 +17,7 @@
 # v5.2.5: 修复预检结论、小盘 SWAP 重复调整、普通 BBR 文案，以及 DNS 小盘提示。
 # v5.2.4: 增强小盘机器一键优化体验，统一磁盘空间检查，并补充 IPv6 恢复备份提示。
 
-SCRIPT_VERSION="5.2.10"
+SCRIPT_VERSION="5.2.11"
 #=============================================================================
 
 #=============================================================================
@@ -443,6 +444,27 @@ get_swapfile_size_mb() {
     }
 
     du -m /swapfile 2>/dev/null | awk 'NR==1 {print $1}'
+}
+
+# 读取可用内存（MB）；兼容新版 available 列与旧版 free 列
+get_available_mem_mb() {
+    local mem_line avail free_col
+    mem_line=$(free -m 2>/dev/null | awk '/^Mem:/')
+    [ -n "$mem_line" ] || return 1
+
+    avail=$(echo "$mem_line" | awk '{print $7}')
+    if [[ "$avail" =~ ^[0-9]+$ ]] && [ "$avail" -gt 0 ]; then
+        echo "$avail"
+        return 0
+    fi
+
+    free_col=$(echo "$mem_line" | awk '{print $4}')
+    if [[ "$free_col" =~ ^[0-9]+$ ]]; then
+        echo "$free_col"
+        return 0
+    fi
+
+    return 1
 }
 
 check_disk_space() {
@@ -3147,6 +3169,8 @@ install_xanmod_kernel() {
         fi
 
         local script_url="https://jhb.ovh/jb/bbrv3arm.sh"
+        local script_host
+        script_host=$(printf '%s' "$script_url" | sed -E 's#^https?://([^/]+)/.*#\1#')
         local sha256_url="${script_url}.sha256"
         local sha512_url="${script_url}.sha512"
         local script_path="${tmp_dir}/bbrv3arm.sh"
@@ -3154,21 +3178,40 @@ install_xanmod_kernel() {
         local sha512_path="${tmp_dir}/bbrv3arm.sh.sha512"
 
         echo "日志: 正在下载 ARM64 安装脚本到临时目录 ${tmp_dir}"
+        echo -e "${gl_huang}安全提示: ARM64 使用第三方脚本（${script_host}），已通过 SHA256/SHA512 校验，建议审查后执行${gl_bai}"
 
-        if ! curl -fsSL "$script_url" -o "$script_path"; then
+        if ! curl -fsSL --connect-timeout 15 --max-time 120 "$script_url" -o "$script_path"; then
             echo -e "${gl_hong}错误: ARM64 安装脚本下载失败${gl_bai}"
             rm -rf "$tmp_dir"
             return 1
         fi
 
-        if ! curl -fsSL "$sha256_url" -o "$sha256_path"; then
+        if ! curl -fsSL --connect-timeout 15 --max-time 60 "$sha256_url" -o "$sha256_path"; then
             echo -e "${gl_hong}错误: 未能获取发布方提供的 SHA256 校验文件${gl_bai}"
             rm -rf "$tmp_dir"
             return 1
         fi
 
-        if ! curl -fsSL "$sha512_url" -o "$sha512_path"; then
+        if ! curl -fsSL --connect-timeout 15 --max-time 60 "$sha512_url" -o "$sha512_path"; then
             echo -e "${gl_hong}错误: 未能获取发布方提供的 SHA512 校验文件${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+
+        if [ ! -s "$script_path" ]; then
+            echo -e "${gl_hong}错误: 下载的 ARM64 脚本为空${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+
+        if head -n 1 "$script_path" | grep -qiE '<!DOCTYPE|<html'; then
+            echo -e "${gl_hong}错误: 下载内容像 HTML 错误页，已取消执行${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+
+        if ! head -n 5 "$script_path" | sed 's/^\xef\xbb\xbf//' | grep -q '^#!'; then
+            echo -e "${gl_hong}错误: ARM64 脚本缺少 shebang，已取消执行${gl_bai}"
             rm -rf "$tmp_dir"
             return 1
         fi
@@ -3863,8 +3906,11 @@ dns_purify_and_harden() {
     
     # 检查2: 内存（至少需要50MB可用）
     echo -n "  → 检查可用内存... "
-    local available_mem=$(free -m | awk 'NR==2 {print $7}')
-    if [ "$available_mem" -lt 50 ]; then
+    local available_mem
+    available_mem=$(get_available_mem_mb)
+    if ! [[ "$available_mem" =~ ^[0-9]+$ ]]; then
+        echo -e "${gl_huang}警告 (无法读取可用内存，跳过硬性拦截)${gl_bai}"
+    elif [ "$available_mem" -lt 50 ]; then
         echo -e "${gl_hong}失败 (可用: ${available_mem}MB, 需要: 50MB)${gl_bai}"
         pre_check_failed=true
     else
@@ -4068,13 +4114,13 @@ dns_purify_and_harden() {
         echo "$existing_dropin|$dropin_key" >> "$PRE_STATE_DIR/networkd-dropins.map"
     done
 
-    # 预生成基础回滚脚本，确保 DoH/降级/跳过分支也有可用回滚入口
+    # 预生成增强回滚脚本，确保 DoH/降级/中断分支也有完整回滚入口
     cat > "$BACKUP_DIR/rollback.sh" << 'ROLLBACK_SCRIPT'
 #!/bin/bash
-# DNS配置基础回滚脚本
+# DNS配置增强回滚脚本（预生成）
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  DNS配置基础回滚脚本"
+echo "  DNS配置增强回滚脚本"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
@@ -4093,7 +4139,13 @@ restore_path_state() {
     fi
 }
 
+restore_path_state "/etc/dhcp/dhclient.conf" "dhclient.conf"
+restore_path_state "/etc/network/interfaces" "interfaces"
 restore_path_state "/etc/systemd/resolved.conf" "resolved.conf"
+restore_path_state "/etc/systemd/system/dns-purify-persist.service" "dns-purify-persist.service"
+restore_path_state "/usr/local/bin/dns-purify-apply.sh" "dns-purify-apply.sh"
+restore_path_state "/etc/systemd/system/systemd-resolved.service.d/dbus-fix.conf" "dbus-fix.conf"
+restore_path_state "/etc/NetworkManager/conf.d/99-dns-purify.conf" "nm-99-dns-purify.conf"
 restore_path_state "/etc/dnscrypt-proxy/dnscrypt-proxy.toml" "dnscrypt-proxy.toml"
 
 if command -v systemctl >/dev/null 2>&1; then
@@ -4162,7 +4214,23 @@ else
     restore_path_state "/etc/resolv.conf" "resolv.conf"
 fi
 
-echo "基础回滚完成。"
+if [[ -f "$PRE_STATE_DIR/ifup-resolved.exec" ]]; then
+    case "$(cat "$PRE_STATE_DIR/ifup-resolved.exec" 2>/dev/null)" in
+        executable)
+            [[ -e /etc/network/if-up.d/resolved ]] && chmod +x /etc/network/if-up.d/resolved 2>/dev/null || true
+            ;;
+        not_executable)
+            [[ -e /etc/network/if-up.d/resolved ]] && chmod -x /etc/network/if-up.d/resolved 2>/dev/null || true
+            ;;
+        absent)
+            rm -f /etc/network/if-up.d/resolved 2>/dev/null || true
+            ;;
+    esac
+fi
+
+systemctl daemon-reload 2>/dev/null || true
+
+echo "增强回滚完成。"
 ROLLBACK_SCRIPT
     chmod +x "$BACKUP_DIR/rollback.sh"
 
