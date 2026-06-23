@@ -1,6 +1,6 @@
 # BBR v3 / XanMod / TCP 网络调优脚本
 
-当前版本：v5.2.13
+当前版本：v5.2.14
 
 本精简版只保留网络调优相关功能，聚焦 XanMod 内核、BBR v3、TCP 参数调优、DNS 净化、IPv6 管理，以及必要的测速、预检和回滚能力。
 原项目：https://github.com/Eric86777/vps-tcp-tune
@@ -185,6 +185,12 @@ v5.2.8 起，远程脚本、快捷命令 fallback、依赖安装判断、IPv6 �
 - 换内核前建议先给 VPS 做快照。
 - OpenVZ/LXC 等容器虚拟化环境通常不支持自行更换内核。
 - 生产机请谨慎执行内核安装、DNS 修改、IPv6 禁用等操作，建议确保有控制台或救援模式可用。
+
+## v5.2.14 更新记录
+
+- 内核安装前增加 Secure Boot 预检，自动模式下检测到启用会中止，避免无人值守重启后断联。
+- XanMod x86_64 安装前增加 APT dry-run，若预演会移除 `isc-dhcp-client`、`ifupdown`、`systemd-resolved`、`resolvconf`、`network-manager`、`dhcpcd5` 等网络关键包则中止。
+- 内核安装前会将已安装网络关键包标记为 manual，安装后在 ifupdown DHCP 环境确认 `dhclient` 可用，降低内网 DHCP 机器丢 DNS/断网风险。
 
 ## v5.2.13 更新记录
 

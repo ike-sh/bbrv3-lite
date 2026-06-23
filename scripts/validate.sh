@@ -12,7 +12,12 @@ bash -n bbrv3arm.sh
 bash -n scripts/validate.sh
 
 echo "==> Version marker"
-grep -n 'SCRIPT_VERSION=' net-tcp-tune.sh | head -1
+grep -m1 -n 'SCRIPT_VERSION=' net-tcp-tune.sh
+
+echo "==> Kernel install safety guards"
+grep -q 'check_secure_boot_before_kernel_install()' net-tcp-tune.sh
+grep -q 'guard_apt_install_keeps_network_stack()' net-tcp-tune.sh
+grep -q 'verify_network_stack_after_kernel_install()' net-tcp-tune.sh
 
 echo "==> ShellCheck (optional)"
 if command -v shellcheck >/dev/null 2>&1; then

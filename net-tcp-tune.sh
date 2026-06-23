@@ -8,6 +8,7 @@
 # 1. 大版本更新时修改 SCRIPT_VERSION，并更新版本备注（保留最新5条）
 # 2. 小修复时更新版本备注，用于快速识别脚本是否已更新
 #=============================================================================
+# v5.2.14: 内核安装增加 Secure Boot 预检、APT 移除预演与 DHCP 网络栈保护。
 # v5.2.13: ARM64 AUTO_MODE 透传；bbrv3arm.sh dpkg 依赖自动修复。
 # v5.2.12: ARM64 脚本迁入仓库 bbrv3arm.sh，移除 jhb.ovh 第三方依赖。
 # v5.2.11: 内存检测兼容、DNS 预生成回滚增强、ARM64 下载安全加固。
@@ -19,7 +20,7 @@
 # v5.2.5: 修复预检结论、小盘 SWAP 重复调整、普通 BBR 文案，以及 DNS 小盘提示。
 # v5.2.4: 增强小盘机器一键优化体验，统一磁盘空间检查，并补充 IPv6 恢复备份提示。
 
-SCRIPT_VERSION="5.2.13"
+SCRIPT_VERSION="5.2.14"
 #=============================================================================
 
 #=============================================================================
@@ -368,6 +369,145 @@ ensure_packages() {
 
 install_package() {
     ensure_packages "$@"
+}
+
+network_guard_packages() {
+    printf '%s\n' \
+        isc-dhcp-client \
+        ifupdown \
+        systemd-resolved \
+        resolvconf \
+        network-manager \
+        dhcpcd5
+}
+
+ifupdown_dhcp_environment_detected() {
+    local file
+
+    for file in /etc/network/interfaces /etc/network/interfaces.d/*; do
+        [ -f "$file" ] || continue
+        if grep -Eq '^[[:space:]]*iface[[:space:]]+[^[:space:]]+[[:space:]]+inet[[:space:]]+dhcp' "$file"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+check_secure_boot_before_kernel_install() {
+    local sb_state=""
+    local confirm=""
+
+    if ! command_exists mokutil; then
+        return 0
+    fi
+
+    sb_state=$(mokutil --sb-state 2>/dev/null || true)
+    if ! printf '%s\n' "$sb_state" | grep -Eqi 'SecureBoot[[:space:]]+enabled'; then
+        return 0
+    fi
+
+    echo -e "${gl_huang}⚠️  检测到 Secure Boot 已启用${gl_bai}"
+    echo "第三方 XanMod / 社区内核可能无法通过 Secure Boot 校验，重启后可能进不了新内核。"
+    echo "建议先在控制台确认可回滚旧内核，或关闭 Secure Boot 后再继续。"
+
+    if [ "${AUTO_MODE:-}" = "1" ]; then
+        echo -e "${gl_hong}AUTO_MODE 下已中止内核安装，避免无人值守重启后断联。${gl_bai}"
+        return 1
+    fi
+
+    read -e -p "确认已了解风险并继续安装？(Y/N): " confirm
+    case "$confirm" in
+        [Yy]) return 0 ;;
+        *)
+            echo "已取消内核安装"
+            return 1
+            ;;
+    esac
+}
+
+mark_installed_network_packages_manual() {
+    local package
+    local marked=0
+
+    command_exists apt-mark || return 0
+
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        if package_installed "$package"; then
+            apt-mark manual "$package" >/dev/null 2>&1 || true
+            marked=1
+        fi
+    done < <(network_guard_packages)
+
+    if [ "$marked" -eq 1 ]; then
+        echo -e "${gl_lv}✅ 已保护已安装的网络关键包，降低被自动清理风险${gl_bai}"
+    fi
+}
+
+guard_apt_install_keeps_network_stack() {
+    local target_package="$1"
+    local sim_output=""
+    local package
+    local removed_packages=()
+
+    command_exists apt-get || return 0
+
+    echo -e "${gl_kjlan}正在预演 APT 安装事务，检查是否会移除网络关键包...${gl_bai}"
+    if ! sim_output=$(DEBIAN_FRONTEND=noninteractive apt-get -s install -y "$target_package" 2>&1); then
+        echo -e "${gl_hong}错误: APT 安装预演失败，已中止以避免破坏网络环境${gl_bai}"
+        printf '%s\n' "$sim_output"
+        return 1
+    fi
+
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        if printf '%s\n' "$sim_output" | grep -Eq "^Remv[[:space:]]+${package}([[:space:]]|$)"; then
+            removed_packages+=("$package")
+        fi
+    done < <(network_guard_packages)
+
+    if [ "${#removed_packages[@]}" -gt 0 ]; then
+        echo -e "${gl_hong}错误: APT 预演显示会移除网络关键包: ${removed_packages[*]}${gl_bai}"
+        echo "为避免 DHCP / DNS 断联，已中止内核安装。请先检查 apt 依赖冲突或手动固定网络包。"
+        echo "相关 APT 预演摘要："
+        printf '%s\n' "$sim_output" | grep -E '^(Remv|Inst|Conf)[[:space:]]' || true
+        return 1
+    fi
+
+    echo -e "${gl_lv}✅ APT 预演通过，未发现网络关键包会被移除${gl_bai}"
+    return 0
+}
+
+verify_network_stack_after_kernel_install() {
+    local resolv_nameservers=""
+
+    if ifupdown_dhcp_environment_detected; then
+        echo -e "${gl_kjlan}检测到 ifupdown DHCP 配置，正在确认 DHCP 客户端可用...${gl_bai}"
+        if ! package_installed isc-dhcp-client || ! command_exists dhclient; then
+            echo -e "${gl_huang}⚠️  未检测到可用 dhclient，尝试恢复 isc-dhcp-client...${gl_bai}"
+            if ! command_exists apt-get || ! DEBIAN_FRONTEND=noninteractive apt-get install -y isc-dhcp-client; then
+                echo -e "${gl_hong}错误: 无法恢复 isc-dhcp-client。请先修复 DHCP 客户端后再重启。${gl_bai}"
+                return 1
+            fi
+        fi
+
+        if ! command_exists dhclient; then
+            echo -e "${gl_hong}错误: dhclient 仍不可用。请先修复 DHCP 客户端后再重启。${gl_bai}"
+            return 1
+        fi
+
+        echo -e "${gl_lv}✅ DHCP 客户端可用${gl_bai}"
+    fi
+
+    if [ -f /etc/resolv.conf ]; then
+        resolv_nameservers=$(grep -E '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+        if [ -z "$resolv_nameservers" ]; then
+            echo -e "${gl_huang}⚠️  /etc/resolv.conf 暂未读取到 nameserver；如重启前 DNS 异常，请先修复解析配置。${gl_bai}"
+        fi
+    fi
+
+    return 0
 }
 
 safe_download_script() {
@@ -3229,11 +3369,15 @@ install_xanmod_kernel() {
     
     # 检测 CPU 架构
     local cpu_arch=$(uname -m)
+
+    check_secure_boot_before_kernel_install || return 1
     
     # ARM64：使用本仓库 bbrv3arm.sh（不再依赖 jhb.ovh）
     if [ "$cpu_arch" = "aarch64" ]; then
         echo -e "${gl_kjlan}检测到 ARM64 架构，使用本仓库安装脚本${gl_bai}"
+        mark_installed_network_packages_manual
         if run_arm64_kernel_install; then
+            verify_network_stack_after_kernel_install || return 1
             echo -e "${gl_lv}ARM 内核安装流程完成${gl_bai}"
             return 0
         fi
@@ -3255,6 +3399,7 @@ install_xanmod_kernel() {
     # 环境准备
     check_disk_space 3 || return 1
     check_swap
+    mark_installed_network_packages_manual
     install_package wget gnupg || { echo -e "${gl_hong}错误: 无法安装必要依赖 wget/gnupg${gl_bai}"; return 1; }
     ensure_commands wget gpg || { echo -e "${gl_hong}错误: 必要命令 wget/gpg 不可用${gl_bai}"; return 1; }
 
@@ -3302,6 +3447,11 @@ install_xanmod_kernel() {
     echo -e "  当前 XanMod APT 源: ${gl_lv}http://deb.xanmod.org ${xanmod_codename} main${gl_bai}"
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
 
+    if ! guard_apt_install_keeps_network_stack "$selected_xanmod_pkg"; then
+        rm -f "$xanmod_repo_file"
+        return 1
+    fi
+
     # 安装 XanMod 内核
     apt-get install -y "$selected_xanmod_pkg"
 
@@ -3314,6 +3464,11 @@ install_xanmod_kernel() {
     # 验证内核是否真正安装成功
     if ! dpkg-query -W -f='${Status}' "$selected_xanmod_pkg" 2>/dev/null | grep -q "install ok installed"; then
         echo -e "${gl_hong}内核包安装验证失败！${gl_bai}"
+        rm -f "$xanmod_repo_file"
+        return 1
+    fi
+
+    if ! verify_network_stack_after_kernel_install; then
         rm -f "$xanmod_repo_file"
         return 1
     fi
