@@ -73,7 +73,7 @@ write_sysctl_profile() {
     local temp
     temp=$(mktemp) || return 1
     render_sysctl_profile > "$temp" || { rm -f -- "$temp"; return 1; }
-    atomic_install "$temp" "$SYSCTL_FILE" 0644
+    atomic_install "$temp" "$SYSCTL_FILE" 0644 || { rm -f -- "$temp"; return 1; }
     rm -f -- "$temp"
 }
 

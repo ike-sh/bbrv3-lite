@@ -12,7 +12,7 @@ for file in src/*.sh scripts/*.sh tests/*.sh install-alias.sh; do bash -n "$file
 bash -n net-tcp-tune.sh
 
 echo "==> Generated artifact markers"
-grep -Fq 'SCRIPT_VERSION="7.0.0"' net-tcp-tune.sh
+grep -Fq 'SCRIPT_VERSION="7.0.1"' net-tcp-tune.sh
 grep -Fq 'Configuration is data and is never sourced' net-tcp-tune.sh
 grep -Fq 'tc qdisc replace dev "$iface" root handle 1: htb default 10' net-tcp-tune.sh
 grep -Fq 'tc qdisc replace dev "$iface" parent 1:10 handle 10: fq' net-tcp-tune.sh
@@ -21,6 +21,7 @@ if grep -Eq 'source[[:space:]]+.*bbrv3-lite\.conf' net-tcp-tune.sh; then echo "u
 
 echo "==> Core tests"
 bash tests/test_core.sh
+bash tests/test_installer.sh
 
 if [[ "${SKIP_RELEASE_CHECKSUM:-0}" != 1 && -f SHA256SUMS ]]; then
     echo "==> Release checksums"
@@ -29,7 +30,7 @@ fi
 
 echo "==> ShellCheck"
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck -S warning net-tcp-tune.sh scripts/build.sh scripts/release.sh scripts/validate.sh tests/test_core.sh tests/integration_tc.sh install-alias.sh
+    shellcheck -S warning net-tcp-tune.sh scripts/build.sh scripts/release.sh scripts/validate.sh tests/test_core.sh tests/test_installer.sh tests/integration_tc.sh install-alias.sh
 else
     echo "shellcheck unavailable; skipped"
 fi

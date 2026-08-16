@@ -110,7 +110,7 @@ save_config() {
     done
     temp=$(mktemp) || return 1
     write_config_stream > "$temp"
-    atomic_install "$temp" "$file" 0600
+    atomic_install "$temp" "$file" 0600 || { rm -f -- "$temp"; return 1; }
     rm -f -- "$temp"
 }
 

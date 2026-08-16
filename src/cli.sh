@@ -7,6 +7,7 @@ show_help() {
 ${SCRIPT_NAME} v${SCRIPT_VERSION} - measured BBR/HTB/FQ tuning
 
 Usage:
+  ${0##*/} auto
   ${0##*/} detect [--interface DEV] [--target HOST]
   ${0##*/} install [--profile balanced|adaptive] [--role proxy|mixed|bulk]
                      [--bandwidth MBIT --rtt MS] [--interface DEV]
@@ -16,7 +17,7 @@ Usage:
   ${0##*/} tc enable RATE [--interface DEV] [--knee RATE] [--margin PERCENT]
   ${0##*/} tc disable|status|stats [--interface DEV]
   ${0##*/} measure deps
-  ${0##*/} measure probe --peer HOST [--port 5201] [--duration 10] [--parallel 4]
+  ${0##*/} measure probe|verify --peer HOST [--port 5201] [--duration 10] [--parallel 4]
   ${0##*/} measure sweep --peer HOST [--nominal MBIT] [--low MBIT --high MBIT]
                          [--step MBIT] [--duration 8] [--parallel 1]
                          [--margin 3] [--loss-threshold 0.1] [--cap 5000] [--force-scan]
@@ -24,6 +25,7 @@ Usage:
   ${0##*/} dns status|apply [auto|dot|plain]|restore
   ${0##*/} ipv6 status|disable [temporary|permanent]|restore
   ${0##*/} baseline info|adopt [--interface DEV]
+  ${0##*/} verify
   ${0##*/} restore
   ${0##*/} uninstall [--purge-state]
   ${0##*/} update | version | help
@@ -84,7 +86,7 @@ cmd_measure() {
     local action="${1:-}"; shift || true
     local peer="" port=5201 iface=auto duration=10 parallel=4 nominal=0 low=0 high=0 step=0 margin=3 threshold=0.1 force=0 cap=5000
     [[ "$action" == deps ]] && { install_measure_dependencies; return; }
-    [[ "$action" == probe || "$action" == sweep ]] || { die "measure 子命令应为 deps/probe/sweep"; return 1; }
+    [[ "$action" == probe || "$action" == sweep || "$action" == verify ]] || { die "measure 子命令应为 deps/probe/sweep/verify"; return 1; }
     [[ "$action" == sweep ]] && { duration=8; parallel=1; }
     while (($#)); do
         case "$1" in
@@ -97,6 +99,7 @@ cmd_measure() {
     done
     [[ -n "$peer" ]] || { die "需要 --peer HOST"; return 1; }
     if [[ "$action" == probe ]]; then measure_probe "$peer" "$port" "$iface" "$duration" "$parallel"
+    elif [[ "$action" == verify ]]; then measure_verify "$peer" "$port" "$iface" "$duration"
     else measure_sweep "$peer" "$port" "$iface" "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$threshold" "$force" "$cap"; fi
 }
 
@@ -115,23 +118,206 @@ cmd_baseline() {
     case "$action" in info) baseline_info ;; adopt) baseline_adopt "$iface" ;; *) die "baseline 子命令应为 info/adopt" ;; esac
 }
 
+ensure_interactive_measure_dependencies() {
+    local -a missing=() command
+    for command in iperf3 jq ping; do command_exists "$command" || missing+=("$command"); done
+    ((${#missing[@]} == 0)) && return 0
+    log WARN "自动调优需要: ${missing[*]}"
+    confirm "现在安装测量依赖？" y || { die "缺少测量依赖，已取消"; return 1; }
+    install_measure_dependencies || return 1
+    require_commands iperf3 jq ping timeout
+}
+
+interactive_select_peer() {
+    local choice spec
+    printf '%s\n' '测速对端：' '  1) 自动选择公共节点（Leaseweb / OVH / Clouvider）' '  2) 自有 iperf3 服务器（推荐）'
+    read -r -p '选择 [1]: ' choice || return 1
+    case "${choice:-1}" in
+        1) spec=$(auto_pick_peer) || return 1 ;;
+        2) read -r -p '对端 HOST[:PORT]（IPv6 用 [ADDR]:PORT）: ' spec || return 1 ;;
+        *) die "无效对端选择"; return 1 ;;
+    esac
+    parse_peer_spec "$spec" || return 1
+    peer_port_open "$PEER_HOST" "$PEER_PORT" || { die "无法连接 $PEER_HOST:$PEER_PORT"; return 1; }
+    WIZARD_PEER="$PEER_HOST"; WIZARD_PORT="$PEER_PORT"
+}
+
+auto_tune_wizard() {
+    require_root
+    [[ -t 0 ]] || { die "auto 向导需要交互终端"; return 1; }
+    local bandwidth_input nominal=0 role_choice role=mixed rtt=0 profile=balanced estimate="动态估算" path_rate summary recommend knee measured no_knee
+    WIZARD_PEER=""; WIZARD_PORT=5201
+    printf '\n%s v%s 自动调优\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+    printf '首次修改前会保存不可覆盖的基线：%s\n' "$BASELINE_DIR"
+    printf '包含本工具涉及的 sysctl、配置/服务、qdisc/class，以及 IPv4/IPv6 路由快照。\n\n'
+    ensure_interactive_measure_dependencies || return 1
+
+    read -r -p '标称带宽 Mbit/s（a=自动测量，0=仅安装 BBR+FQ）[a]: ' bandwidth_input || return 1
+    bandwidth_input="${bandwidth_input:-a}"
+    if [[ "$bandwidth_input" != a && "$bandwidth_input" != auto ]]; then
+        is_uint "$bandwidth_input" && (( bandwidth_input <= 1000000 )) || { die "带宽必须是非负整数或 a"; return 1; }
+        nominal="$bandwidth_input"
+    fi
+
+    if [[ "$nominal" != 0 || "$bandwidth_input" == a || "$bandwidth_input" == auto ]]; then
+        interactive_select_peer || return 1
+        rtt=$(median_ping_ms "$WIZARD_PEER"); [[ -n "$rtt" ]] || rtt=0
+    fi
+
+    printf '%s\n' '用途：1) 混合业务  2) 代理/转发  3) 大文件吞吐'
+    read -r -p '选择 [1]: ' role_choice || return 1
+    case "${role_choice:-1}" in 1) role=mixed ;; 2) role=proxy ;; 3) role=bulk ;; *) die "无效用途"; return 1 ;; esac
+    if (( nominal > 0 && rtt > 0 )); then
+        profile=adaptive
+        estimate="约 $(human_bytes "$(estimate_sweep_bytes "$((nominal * 13 / 10))" 5 20)") 上行"
+    elif [[ -n "${WIZARD_PEER:-}" ]]; then
+        estimate="将按实测带宽动态计算，扫描上限 5000 Mbit/s"
+    else
+        estimate="不运行测速"
+    fi
+
+    printf '\n执行摘要\n'
+    printf '  网卡/用途       auto / %s\n' "$role"
+    printf '  标称带宽        %s\n' "$([[ "$bandwidth_input" == a || "$bandwidth_input" == auto ]] && echo 自动测量 || echo "${nominal} Mbit/s")"
+    [[ -n "${WIZARD_PEER:-}" ]] && printf '  iperf3 对端     %s:%s（RTT %sms）\n' "$WIZARD_PEER" "$WIZARD_PORT" "${rtt:-unknown}"
+    printf '  预计时间/流量   约 3–8 分钟 / %s\n' "$estimate"
+    printf '  持久化位置      %s + %s\n' "$CONFIG_FILE" "$SERVICE_FILE"
+    confirm "确认开始？" || { log INFO "已取消，未修改系统"; return 0; }
+
+    install_base_tuning auto "$profile" "$role" "$nominal" "$rtt" || return 1
+    if [[ -z "${WIZARD_PEER:-}" ]]; then
+        verify_system_state
+        return
+    fi
+    if (( nominal > 0 )); then
+        path_rate=$((nominal * 40 / 100)); ((path_rate < 1)) && path_rate=1
+        measure_path_check "$WIZARD_PEER" "$WIZARD_PORT" auto "$path_rate" || return 1
+    fi
+    measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto "$nominal" 0 0 0 5 1 3 0.1 1 5000 || return 1
+    summary="$MEASURE_RUN_DIR/summary.tsv"
+    recommend=$(summary_value "$summary" RECOMMEND)
+    knee=$(summary_value "$summary" BROKE_AT); knee="${knee:-0}"
+    measured=$(summary_value "$summary" UNSHAPED_MBIT)
+    no_knee=$(summary_value "$summary" NO_KNEE)
+
+    if [[ -n "$measured" && "$rtt" -gt 0 ]]; then
+        load_config || return 1
+        SYSCTL_PROFILE=adaptive; BANDWIDTH_MBIT=$(awk -v g="$measured" 'BEGIN {printf "%d", g+0.5}'); RTT_MS="$rtt"; ROLE="$role"
+        apply_sysctl_profile || return 1
+        save_config || return 1
+    fi
+    if [[ -n "$recommend" ]]; then
+        tc_enable "$recommend" auto "$knee" 3 || return 1
+    else
+        log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
+        tc_disable auto || return 1
+    fi
+    verify_system_state || return 1
+    measure_verify "$WIZARD_PEER" "$WIZARD_PORT" auto 6 || return 1
+    printf '\n'
+    log OK "自动调优和复验完成"
+    show_status
+    log INFO "扫描记录: $summary"
+}
+
+menu_run() {
+    local rc
+    set +e
+    ( set -Eeuo pipefail; "$@" )
+    rc=$?
+    set -e
+    (( rc == 0 )) || log WARN "操作失败（exit $rc）；系统不会把本次操作报告为成功"
+    return 0
+}
+
+measurement_menu() {
+    local choice spec
+    printf '%s\n' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/四流复验' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    [[ "$choice" == 0 ]] && return 0
+    interactive_select_peer || return 1
+    case "$choice" in
+        1) measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto 0 0 0 0 5 1 3 0.1 1 5000 ;;
+        2) measure_probe "$WIZARD_PEER" "$WIZARD_PORT" auto 8 4 ;;
+        3) measure_verify "$WIZARD_PEER" "$WIZARD_PORT" auto 8 ;;
+        *) die "无效选择" ;;
+    esac
+}
+
+tc_menu() {
+    local choice rate
+    printf '%s\n' '1) 状态/统计' '2) 临时试跑速率' '3) 持久启用速率' '4) 关闭整形并保留 FQ' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    case "$choice" in
+        1) tc_status auto ;;
+        2) read -r -p '速率 Mbit/s: ' rate; tc_trial "$rate" auto ;;
+        3) read -r -p '速率 Mbit/s: ' rate; tc_enable "$rate" auto 0 3 ;;
+        4) tc_disable auto ;;
+        0) return 0 ;;
+        *) die "无效选择" ;;
+    esac
+}
+
+kernel_menu() {
+    local choice
+    printf '%s\n' '1) 内核/BBR 状态' '2) 安装 XanMod LTS' '3) 安装 XanMod Main' '4) 卸载非运行中的 XanMod' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    case "$choice" in
+        1) kernel_status ;;
+        2) if confirm '安装 XanMod LTS？'; then kernel_install lts; else log INFO "已取消"; fi ;;
+        3) if confirm '安装 XanMod Main？'; then kernel_install main; else log INFO "已取消"; fi ;;
+        4) kernel_remove ;;
+        0) return 0 ;;
+        *) die "无效选择" ;;
+    esac
+}
+
+dns_menu() {
+    local choice
+    printf '%s\n' '1) 状态' '2) 自动选择 DoT/普通 DNS' '3) 强制 DoT' '4) 普通 DNS' '5) 恢复 DNS 基线' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    case "$choice" in 1) dns_status ;; 2) dns_apply auto ;; 3) dns_apply dot ;; 4) dns_apply plain ;; 5) if confirm '恢复 DNS 基线？'; then dns_restore; else log INFO "已取消"; fi ;; 0) return 0 ;; *) die "无效选择" ;; esac
+}
+
+ipv6_menu() {
+    local choice
+    printf '%s\n' '1) 状态' '2) 临时禁用' '3) 永久禁用' '4) 恢复 IPv6 基线' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    case "$choice" in 1) ipv6_status ;; 2) ipv6_disable temporary ;; 3) ipv6_disable permanent ;; 4) if confirm '恢复 IPv6 基线？'; then ipv6_restore; else log INFO "已取消"; fi ;; 0) return 0 ;; *) die "无效选择" ;; esac
+}
+
+maintenance_menu() {
+    local choice
+    printf '%s\n' '1) 查看基线' '2) 恢复首次可信基线' '3) 检查更新' '4) 卸载（保留基线）' '5) 完全清理状态' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    case "$choice" in
+        1) baseline_info ;;
+        2) if confirm '恢复首次可信基线？'; then restore_baseline; else log INFO "已取消"; fi ;;
+        3) self_update ;;
+        4) if confirm '卸载管理组件？'; then uninstall_managed 0; else log INFO "已取消"; fi ;;
+        5) if confirm '永久删除全部状态和基线？'; then uninstall_managed 1; else log INFO "已取消"; fi ;;
+        0) return 0 ;;
+        *) die "无效选择" ;;
+    esac
+}
+
 interactive_menu() {
     local choice
     while true; do
         printf '\n%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
-        printf '%s\n' '1) 系统/网卡检测' '2) 安装 BBR + FQ' '3) 自动测量 policer 拐点' '4) TC 状态' \
-            '5) 完整状态' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复基线' '0) 退出'
+        printf '%s\n' '1) 自动调优（推荐）' '2) 安装/刷新 BBR + FQ' '3) 测量与复验' '4) TC 整形管理' \
+            '5) 完整状态与一致性验证' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复/更新/卸载' '0) 退出'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
-            1) cmd_detect ;;
-            2) cmd_install ;;
-            3) read -r -p 'iperf3 peer: ' peer; cmd_measure sweep --peer "$peer" ;;
-            4) cmd_tc status ;;
-            5) show_status ;;
-            6) kernel_status ;;
-            7) dns_status ;;
-            8) ipv6_status ;;
-            9) confirm '恢复首次可信基线？' && restore_baseline ;;
+            1) menu_run auto_tune_wizard ;;
+            2) menu_run cmd_install ;;
+            3) menu_run measurement_menu ;;
+            4) menu_run tc_menu ;;
+            5) show_status; menu_run verify_system_state ;;
+            6) menu_run kernel_menu ;;
+            7) menu_run dns_menu ;;
+            8) menu_run ipv6_menu ;;
+            9) menu_run maintenance_menu ;;
             0) return 0 ;;
             *) log WARN "无效选择" ;;
         esac
@@ -141,8 +327,12 @@ interactive_menu() {
 main() {
     trap cleanup_core EXIT
     local command="${1:-}"; [[ -n "$command" ]] && shift || true
-    if [[ -z "$command" ]]; then [[ -t 0 ]] && interactive_menu || show_help; return; fi
+    if [[ -z "$command" ]]; then
+        if [[ -t 0 ]]; then interactive_menu; else show_help; fi
+        return
+    fi
     case "$command" in
+        auto) auto_tune_wizard ;;
         detect) cmd_detect "$@" ;;
         install) cmd_install "$@" ;;
         explain) cmd_explain "$@" ;;
@@ -153,6 +343,7 @@ main() {
         dns) cmd_dns "$@" ;;
         ipv6) cmd_ipv6 "$@" ;;
         baseline) cmd_baseline "$@" ;;
+        verify) verify_system_state ;;
         restore) restore_baseline ;;
         uninstall)
             case "${1:-}" in "") uninstall_managed 0 ;; --purge-state) uninstall_managed 1 ;; *) die "uninstall 只接受 --purge-state" ;; esac

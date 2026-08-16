@@ -2,19 +2,21 @@
 
 BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-当前版本：v7.0.0
+当前版本：v7.0.1
 
-项目不追求“sysctl 越多越好”。默认配置保持克制，出口整形必须经过测试，测量结果不会自动写入生产配置。
+项目不追求“sysctl 越多越好”。默认配置保持克制。命令行 `measure` 只给出结果；交互式 `auto` 会在一次总确认后完成测量、决策、应用和复验，未发现可信拐点时保持纯 FQ。
 
 ## 核心能力
 
 - BBR + FQ 基础调优，以及可选的 BDP/RAM 自适应缓冲区。
 - `HTB root -> FQ leaf` 接口聚合出口整形，不用 FQ `maxrate` 冒充总限速。
 - `iperf3 -J` JSON 探测、粗扫、细扫、边界复测和测速流量统计。
+- 三问式自动向导：带宽、测速对端、业务用途；执行前集中展示耗时、流量和落盘位置。
+- 公共 iperf3 节点自动按 RTT 和端口可用性筛选，也支持自有 `HOST:PORT` 与 `[IPv6]:PORT`。
 - IPv4 优先、IPv6 兜底的默认出口检测；不会遍历修改 Docker/veth/bridge 接口。
 - 全局 `flock`，防止两个进程同时修改 sysctl、qdisc 或配置。
 - 严格 `KEY=VALUE` 白名单解析，配置文件从不被 shell `source`。
-- 首次可信基线不可覆盖；测试中断或应用失败时恢复操作前 qdisc。
+- 首次可信基线以完成标记原子提交，不完整快照不会被误当成可信基线；测试中断或应用失败时恢复操作前 qdisc。
 - 一个配置、一个 systemd 服务、一个发布脚本，不产生竞争 root qdisc 的服务。
 - 官方 XanMod APT 安装、Secure Boot/容器检查、CPU level 保守选择和 APT 网络组件保护。
 - DNS 和 IPv6 各自独立备份、独立恢复，不把无关系统改动塞进一次“大回滚”。
@@ -47,6 +49,13 @@ bash /tmp/install-bbrv3-lite.sh
 bbr version
 ```
 
+如果仓库已有版本 tag、但 GitHub Release 资产尚未生成，安装器会明确提示并从同一个不可变 tag 下载脚本和校验文件。它不会静默退回可变的 `main`。安装完成后若旧版 shell 函数仍遮蔽 `/usr/local/bin/bbr`，执行：
+
+```bash
+unset -f bbr 2>/dev/null
+hash -r
+```
+
 测试尚未发布的 `main` 分支时必须显式选择 channel；它同样校验仓库中的 `SHA256SUMS`：
 
 ```bash
@@ -66,6 +75,23 @@ sudo ./net-tcp-tune.sh status
 ```
 
 ## 推荐流程
+
+### 最省事：自动向导
+
+```bash
+sudo bbr auto
+# 或直接运行 sudo bbr 选择 1
+```
+
+向导只集中询问三类信息：标称带宽（可自动测量或选择仅安装 BBR+FQ）、iperf3 对端（公共节点或自有服务器）和业务用途。确认后依次执行：
+
+1. 保存首次可信基线并安装 BBR + FQ。
+2. 已知带宽时先用约 40% 速率做路径预检。
+3. 以与最终配置相同的 `HTB -> FQ` 层级粗扫/细扫 policer 边界。
+4. 只有发现可信拐点才应用退让后的速率；否则保持 FQ。
+5. 验证 sysctl、systemd、qdisc，再做单流和四流复测。
+
+中途任何关键步骤失败都会返回非零，并明确区分“运行时已生效但持久化失败”；不会继续打印“安装成功”。
 
 ### 1. 只读检测
 
@@ -117,7 +143,7 @@ iperf3 -s
 sudo bbr measure deps
 ```
 
-公共 iperf3 节点可能繁忙、限速或路径不稳定。工具不会内置不受控制的公共节点列表，也不会把“到中国大陆的线路表现”和“VPS 端口能力”混为一谈。
+自动向导可在用户明确选择后，从 Leaseweb、OVH、Clouvider 的公共测速节点中筛选 120ms 内的可用对端，并尝试其公开端口范围。公共节点可能繁忙、限速或路径不稳定；工具会披露提供商并统计实际流量。自有、同机房或低 RTT 的 iperf3 服务器仍是推荐方案。测量结果代表 VPS 到该对端路径，不代表所有业务目的地。
 
 ### 5. 探测与扫描
 
@@ -155,7 +181,7 @@ sudo bbr measure sweep \
 
 结果保存在 `/var/lib/bbrv3-lite/history/`。这里显示的 `RETRANS_RATIO_EST_PERCENT` 是“iperf3 retransmits / 按 1448 字节估算的 TCP 段数”，用于寻找相对跳变，不是抓包意义上的真实丢包率。
 
-如果不限速测试没有明显跳变，工具会建议保持纯 FQ。只有用户显式指定区间或 `--force-scan` 才会继续扫描。
+扫描同时观察相对重传跳变和吞吐增益连续停滞。扫描到上界仍无可信边界时不会错误地把上界当作推荐值，而是保持纯 FQ。不限速路径自身重传过高时，默认拒绝给出 policer 结论；只有显式 `--force-scan` 才继续。
 
 ### 6. 试跑和持久化
 
@@ -223,10 +249,10 @@ INITRWND=0
 
 - 配置、sysctl 文件和新旧 systemd unit 的存在状态及内容。
 - 本工具会修改的运行时 sysctl 值。
-- 默认出口以及 qdisc/class 文本快照。
+- 默认出口、qdisc/class 文本快照、完整 IPv4/IPv6 路由诊断快照，以及默认路由窗口参数。
 - schema、脚本版本、时间和 provenance。
 
-基线一旦存在就不会覆盖。如果检测到旧调优痕迹但没有可信备份，安装会中止。只有明确接受当前状态为恢复起点时才执行：
+`manifest` 是快照完成标记，只有全部关键文件保存成功后才出现。断电或中断留下的不完整目录会在下次操作前安全清理。基线一旦完成就不会覆盖。如果检测到旧调优痕迹但没有可信备份，安装会中止。只有明确接受当前状态为恢复起点时才执行：
 
 ```bash
 sudo bbr baseline adopt
@@ -317,7 +343,17 @@ docker run --rm --cap-add NET_ADMIN -v "$PWD:/src:ro" debian:12 \
 bash scripts/release.sh
 ```
 
-发布资产至少应包含 `net-tcp-tune.sh` 与 `SHA256SUMS`。模块边界见 [docs/MODULES.md](docs/MODULES.md)。
+tag 推送会触发 Release 工作流，验证 tag 与脚本版本一致，并发布 `net-tcp-tune.sh`、`install-alias.sh` 与 `SHA256SUMS`。安装器仍能处理“只有 tag、没有 Release 资产”的历史版本。模块边界见 [docs/MODULES.md](docs/MODULES.md)。
+
+## v7.0.1 修复重点
+
+- 修复无参数交互入口通过 `&&` 调用菜单、导致 Bash 抑制函数内部错误退出的问题。
+- 修复从进程替换运行时无法安装持久化副本、服务不存在仍打印成功的问题。
+- 修复只有 tag 没有 GitHub Release 时安装器直接 404；新增自动发布 Release 资产的工作流。
+- 将内核、DNS、IPv6、TC 入口从“仅显示状态”改为可执行的管理子菜单。
+- 新增三问自动调优、公共对端筛选、路径预检、单双流复验和实际流量记录。
+- 修复扫描到上界没有拐点却仍推荐最高档的决策错误，并加入吞吐增益停滞判据。
+- 状态页不再显示 `unknown Mbps`、`not measured ms`，并明确说明普通 `bbr` 状态不能证明 BBRv3。
 
 ## v7 与旧版的差异
 

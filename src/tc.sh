@@ -139,7 +139,7 @@ _apply_shaping_raw() {
 
 apply_shaping() {
     local iface="$1" rate="$2" snapshot
-    tc_dependencies; qdisc_guard "$iface" || return 1
+    tc_dependencies || return 1; qdisc_guard "$iface" || return 1
     snapshot=$(mktemp) || return 1
     action_qdisc_snapshot "$iface" "$snapshot"
     if ! _apply_shaping_raw "$iface" "$rate"; then
@@ -153,7 +153,7 @@ apply_shaping() {
 
 apply_fq() {
     local iface="$1" snapshot
-    tc_dependencies; qdisc_guard "$iface" || return 1
+    tc_dependencies || return 1; qdisc_guard "$iface" || return 1
     snapshot=$(mktemp) || return 1
     action_qdisc_snapshot "$iface" "$snapshot"
     if ! tc qdisc replace dev "$iface" root fq || [[ "$(root_qdisc_kind "$iface")" != fq ]]; then
@@ -166,7 +166,7 @@ apply_fq() {
 }
 
 tc_trial() {
-    require_root; acquire_lock; tc_dependencies
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     local rate="$1" requested="${2:-auto}" iface
     iface=$(detect_interface "$requested") || return 1
     capture_baseline "$iface" || return 1
@@ -175,30 +175,32 @@ tc_trial() {
 }
 
 tc_enable() {
-    require_root; acquire_lock; tc_dependencies
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     local rate="$1" requested="${2:-auto}" knee="${3:-0}" margin="${4:-3}" iface
     iface=$(detect_interface "$requested") || return 1
     capture_baseline "$iface" || return 1
-    load_config
+    load_config || return 1
     TC_ENABLED=1; TC_INTERFACE="$requested"; TC_RATE_MBIT="$rate"; TC_KNEE_MBIT="$knee"; TC_MARGIN_PERCENT="$margin"
     apply_sysctl_profile || return 1
     apply_shaping "$iface" "$rate" || return 1
-    save_config
-    install_persistence
+    save_config || { die "整形已在运行时生效，但配置保存失败"; return 1; }
+    install_persistence || { die "整形已在运行时生效，但持久化安装失败"; return 1; }
+    restart_and_verify_persistence || return 1
     log OK "整形已持久化: $iface ${rate} Mbit"
 }
 
 tc_disable() {
-    require_root; acquire_lock; tc_dependencies
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     local requested="${1:-auto}" iface
-    load_config
+    load_config || return 1
     [[ "$requested" == auto && "$TC_INTERFACE" != auto ]] && requested="$TC_INTERFACE"
     iface=$(detect_interface "$requested") || return 1
     if managed_htb "$iface"; then apply_fq "$iface" || return 1
-    elif [[ "$(root_qdisc_kind "$iface")" != fq ]]; then qdisc_guard "$iface" && apply_fq "$iface"; fi
+    elif [[ "$(root_qdisc_kind "$iface")" != fq ]]; then qdisc_guard "$iface" || return 1; apply_fq "$iface" || return 1; fi
     TC_ENABLED=0; TC_RATE_MBIT=0
-    save_config
-    install_persistence
+    save_config || return 1
+    install_persistence || return 1
+    restart_and_verify_persistence || return 1
     log OK "HTB 整形已关闭，BBR + FQ 保持启用"
 }
 

@@ -3,7 +3,7 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="7.0.0"
+SCRIPT_VERSION="7.0.1"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
@@ -258,7 +258,7 @@ save_config() {
     done
     temp=$(mktemp) || return 1
     write_config_stream > "$temp"
-    atomic_install "$temp" "$file" 0600
+    atomic_install "$temp" "$file" 0600 || { rm -f -- "$temp"; return 1; }
     rm -f -- "$temp"
 }
 
@@ -344,9 +344,13 @@ detect_profile() {
     printf '%-18s %s\n' "Interface" "$iface"
     printf '%-18s %s\n' "Driver" "$(detect_driver "$iface")"
     printf '%-18s %s\n' "MTU" "$(detect_mtu "$iface")"
-    printf '%-18s %s\n' "Link speed" "$(detect_link_speed "$iface") Mbps"
+    local link_speed
+    link_speed=$(detect_link_speed "$iface")
+    [[ "$link_speed" == unknown ]] || link_speed="${link_speed} Mbps"
+    printf '%-18s %s\n' "Link speed" "$link_speed"
     printf '%-18s %s\n' "RX queues" "$(detect_rx_queues "$iface")"
-    printf '%-18s %s\n' "Target RTT" "$rtt ms"
+    [[ "$rtt" == "not measured" || "$rtt" == unreachable ]] || rtt="${rtt} ms"
+    printf '%-18s %s\n' "Target RTT" "$rtt"
     printf '%-18s %s\n' "Congestion control" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
     printf '%-18s %s\n' "Available CC" "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)"
 }
@@ -356,7 +360,7 @@ install_measure_dependencies() {
     case "$(os_id)" in
         debian|ubuntu)
             apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 jq iproute2 procps util-linux
+            DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 jq iproute2 iputils-ping procps util-linux
             ;;
         *) die "自动安装依赖目前只支持 Debian/Ubuntu" ;;
     esac
@@ -367,13 +371,13 @@ install_measure_dependencies() {
 # -----------------------------------------------------------------------------
 
 ensure_state_layout() {
-    mkdir -p -- "$STATE_DIR" "$HISTORY_DIR"
+    mkdir -p -- "$STATE_DIR" "$HISTORY_DIR" || return 1
     chmod 0700 "$STATE_DIR" "$HISTORY_DIR" 2>/dev/null || true
     if [[ ! -f "$STATE_DIR/manifest" ]]; then
         local temp
         temp=$(mktemp) || return 1
         printf 'SCHEMA\t%s\nCREATED_AT\t%s\nCREATED_BY\t%s\n' "$STATE_SCHEMA" "$(utc_now)" "$SCRIPT_VERSION" > "$temp"
-        atomic_install "$temp" "$STATE_DIR/manifest" 0600
+        atomic_install "$temp" "$STATE_DIR/manifest" 0600 || { rm -f -- "$temp"; return 1; }
         rm -f -- "$temp"
     fi
 }
@@ -403,10 +407,10 @@ import_legacy_baseline() {
 backup_path() {
     local source="$1" name="$2"
     if [[ -e "$source" || -L "$source" ]]; then
-        cp -a -- "$source" "$BASELINE_DIR/$name"
-        printf 'present\n' > "$BASELINE_DIR/${name}.state"
+        cp -a -- "$source" "$BASELINE_DIR/$name" || return 1
+        printf 'present\n' > "$BASELINE_DIR/${name}.state" || return 1
     else
-        printf 'absent\n' > "$BASELINE_DIR/${name}.state"
+        printf 'absent\n' > "$BASELINE_DIR/${name}.state" || return 1
     fi
 }
 
@@ -420,12 +424,17 @@ capture_runtime_sysctls() {
         value=$(sysctl -n "$key" 2>/dev/null || true)
         [[ -n "$value" ]] && printf '%s\t%s\n' "$key" "$value"
     done
+    return 0
 }
 
 capture_baseline() {
     local iface="$1" provenance="${2:-native}" temp_dir
-    ensure_state_layout
+    ensure_state_layout || return 1
     [[ ! -f "$BASELINE_DIR/manifest" ]] || return 0
+    if [[ -d "$BASELINE_DIR" ]]; then
+        log WARN "清理上次中断留下的不完整基线目录"
+        remove_tree_within "$BASELINE_DIR" "$STATE_DIR" || return 1
+    fi
     if managed_artifacts_exist && [[ "$provenance" != adopt-current ]]; then
         if [[ -d "$LEGACY_BACKUP_DIR" && -n "$(find "$LEGACY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
             import_legacy_baseline "$iface"
@@ -436,24 +445,24 @@ capture_baseline() {
         fi
     fi
     temp_dir=$(mktemp -d "${STATE_DIR}/.baseline.XXXXXX") || return 1
-    mkdir -p "$temp_dir/files"
-    mv "$temp_dir" "$BASELINE_DIR"
-    if ! {
-        printf 'SCHEMA\t%s\nCREATED_AT\t%s\nCREATED_BY\t%s\nPROVENANCE\t%s\nINTERFACE\t%s\n' \
-            "$STATE_SCHEMA" "$(utc_now)" "$SCRIPT_VERSION" "$provenance" "$iface" > "$BASELINE_DIR/manifest"
-        capture_runtime_sysctls > "$BASELINE_DIR/sysctl.tsv"
-        tc qdisc show dev "$iface" > "$BASELINE_DIR/qdisc.txt" 2>/dev/null || true
-        tc class show dev "$iface" > "$BASELINE_DIR/class.txt" 2>/dev/null || true
-        backup_path "$CONFIG_FILE" config
-        backup_path "$SYSCTL_FILE" sysctl
-        backup_path "$LEGACY_SYSCTL_FILE" legacy-sysctl
-        backup_path "$SERVICE_FILE" service
-        backup_path "$LEGACY_SERVICE_FILE" legacy-service
-        chmod -R go-rwx "$BASELINE_DIR"
-    }; then
-        remove_tree_within "$BASELINE_DIR" "$STATE_DIR"
-        return 1
-    fi
+    mkdir -p "$temp_dir/files" || { remove_tree_within "$temp_dir" "$STATE_DIR"; return 1; }
+    mv "$temp_dir" "$BASELINE_DIR" || { remove_tree_within "$temp_dir" "$STATE_DIR"; return 1; }
+    printf 'SCHEMA\t%s\nCREATED_AT\t%s\nCREATED_BY\t%s\nPROVENANCE\t%s\nINTERFACE\t%s\n' \
+        "$STATE_SCHEMA" "$(utc_now)" "$SCRIPT_VERSION" "$provenance" "$iface" > "$BASELINE_DIR/manifest.pending" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    capture_runtime_sysctls > "$BASELINE_DIR/sysctl.tsv" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    tc qdisc show dev "$iface" > "$BASELINE_DIR/qdisc.txt" 2>/dev/null || true
+    tc class show dev "$iface" > "$BASELINE_DIR/class.txt" 2>/dev/null || true
+    ip -4 route show table all > "$BASELINE_DIR/routes-v4.txt" 2>/dev/null || true
+    ip -6 route show table all > "$BASELINE_DIR/routes-v6.txt" 2>/dev/null || true
+    ip -4 route show default > "$BASELINE_DIR/default-route-v4.txt" 2>/dev/null || true
+    ip -6 route show default > "$BASELINE_DIR/default-route-v6.txt" 2>/dev/null || true
+    backup_path "$CONFIG_FILE" config || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    backup_path "$SYSCTL_FILE" sysctl || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    backup_path "$LEGACY_SYSCTL_FILE" legacy-sysctl || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    backup_path "$SERVICE_FILE" service || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    backup_path "$LEGACY_SERVICE_FILE" legacy-service || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    chmod -R go-rwx "$BASELINE_DIR" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    mv "$BASELINE_DIR/manifest.pending" "$BASELINE_DIR/manifest" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
     log OK "已保存不可覆盖的初始基线: $BASELINE_DIR ($provenance)"
 }
 
@@ -470,16 +479,17 @@ restore_backed_path() {
     local target="$1" name="$2" state
     [[ -f "$BASELINE_DIR/${name}.state" ]] || return 0
     state=$(<"$BASELINE_DIR/${name}.state")
-    rm -f -- "$target"
-    if [[ "$state" == present ]]; then cp -a -- "$BASELINE_DIR/$name" "$target"; fi
+    rm -f -- "$target" || return 1
+    if [[ "$state" == present ]]; then cp -a -- "$BASELINE_DIR/$name" "$target" || return 1; fi
 }
 
 restore_runtime_sysctls() {
-    local key value
+    local key value rc=0
     [[ -f "$BASELINE_DIR/sysctl.tsv" ]] || return 0
     while IFS=$'\t' read -r key value; do
-        [[ -n "$key" ]] && sysctl -q -w "$key=$value" || true
+        if [[ -n "$key" ]] && ! sysctl -q -w "$key=$value"; then log WARN "无法恢复 sysctl: $key"; rc=1; fi
     done < "$BASELINE_DIR/sysctl.tsv"
+    return "$rc"
 }
 
 baseline_info() {
@@ -565,7 +575,7 @@ write_sysctl_profile() {
     local temp
     temp=$(mktemp) || return 1
     render_sysctl_profile > "$temp" || { rm -f -- "$temp"; return 1; }
-    atomic_install "$temp" "$SYSCTL_FILE" 0644
+    atomic_install "$temp" "$SYSCTL_FILE" 0644 || { rm -f -- "$temp"; return 1; }
     rm -f -- "$temp"
 }
 
@@ -741,7 +751,7 @@ _apply_shaping_raw() {
 
 apply_shaping() {
     local iface="$1" rate="$2" snapshot
-    tc_dependencies; qdisc_guard "$iface" || return 1
+    tc_dependencies || return 1; qdisc_guard "$iface" || return 1
     snapshot=$(mktemp) || return 1
     action_qdisc_snapshot "$iface" "$snapshot"
     if ! _apply_shaping_raw "$iface" "$rate"; then
@@ -755,7 +765,7 @@ apply_shaping() {
 
 apply_fq() {
     local iface="$1" snapshot
-    tc_dependencies; qdisc_guard "$iface" || return 1
+    tc_dependencies || return 1; qdisc_guard "$iface" || return 1
     snapshot=$(mktemp) || return 1
     action_qdisc_snapshot "$iface" "$snapshot"
     if ! tc qdisc replace dev "$iface" root fq || [[ "$(root_qdisc_kind "$iface")" != fq ]]; then
@@ -768,7 +778,7 @@ apply_fq() {
 }
 
 tc_trial() {
-    require_root; acquire_lock; tc_dependencies
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     local rate="$1" requested="${2:-auto}" iface
     iface=$(detect_interface "$requested") || return 1
     capture_baseline "$iface" || return 1
@@ -777,30 +787,32 @@ tc_trial() {
 }
 
 tc_enable() {
-    require_root; acquire_lock; tc_dependencies
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     local rate="$1" requested="${2:-auto}" knee="${3:-0}" margin="${4:-3}" iface
     iface=$(detect_interface "$requested") || return 1
     capture_baseline "$iface" || return 1
-    load_config
+    load_config || return 1
     TC_ENABLED=1; TC_INTERFACE="$requested"; TC_RATE_MBIT="$rate"; TC_KNEE_MBIT="$knee"; TC_MARGIN_PERCENT="$margin"
     apply_sysctl_profile || return 1
     apply_shaping "$iface" "$rate" || return 1
-    save_config
-    install_persistence
+    save_config || { die "整形已在运行时生效，但配置保存失败"; return 1; }
+    install_persistence || { die "整形已在运行时生效，但持久化安装失败"; return 1; }
+    restart_and_verify_persistence || return 1
     log OK "整形已持久化: $iface ${rate} Mbit"
 }
 
 tc_disable() {
-    require_root; acquire_lock; tc_dependencies
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     local requested="${1:-auto}" iface
-    load_config
+    load_config || return 1
     [[ "$requested" == auto && "$TC_INTERFACE" != auto ]] && requested="$TC_INTERFACE"
     iface=$(detect_interface "$requested") || return 1
     if managed_htb "$iface"; then apply_fq "$iface" || return 1
-    elif [[ "$(root_qdisc_kind "$iface")" != fq ]]; then qdisc_guard "$iface" && apply_fq "$iface"; fi
+    elif [[ "$(root_qdisc_kind "$iface")" != fq ]]; then qdisc_guard "$iface" || return 1; apply_fq "$iface" || return 1; fi
     TC_ENABLED=0; TC_RATE_MBIT=0
-    save_config
-    install_persistence
+    save_config || return 1
+    install_persistence || return 1
+    restart_and_verify_persistence || return 1
     log OK "HTB 整形已关闭，BBR + FQ 保持启用"
 }
 
@@ -825,6 +837,73 @@ MEASURE_TX_START=0
 MEASURE_RX_START=0
 MEASURE_RESULT_FILE=""
 MEASURE_RUN_DIR=""
+
+# Public endpoints are opt-in and used only by the interactive auto-tune wizard.
+# Providers and test traffic are disclosed before execution; a private iperf3 peer is preferred.
+PUBLIC_PEER_POOL=$(cat <<'EOF'
+speedtest.hkg12.hk.leaseweb.net|香港|Leaseweb
+speedtest.sin1.sg.leaseweb.net|新加坡|Leaseweb
+speedtest.tyo11.jp.leaseweb.net|东京|Leaseweb
+speedtest.fra1.de.leaseweb.net|法兰克福|Leaseweb
+speedtest.ams2.nl.leaseweb.net|阿姆斯特丹|Leaseweb
+speedtest.lon12.uk.leaseweb.net|伦敦|Leaseweb
+speedtest.lax12.us.leaseweb.net|洛杉矶|Leaseweb
+speedtest.sfo12.us.leaseweb.net|旧金山|Leaseweb
+speedtest.dal13.us.leaseweb.net|达拉斯|Leaseweb
+speedtest.nyc1.us.leaseweb.net|纽约|Leaseweb
+sgp.proof.ovh.net|新加坡|OVH
+ams.speedtest.clouvider.net|阿姆斯特丹|Clouvider
+lon.speedtest.clouvider.net|伦敦|Clouvider
+EOF
+)
+
+parse_peer_spec() {
+    local spec="$1" default_port="${2:-5201}"
+    PEER_HOST=""; PEER_PORT="$default_port"
+    if [[ "$spec" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+        PEER_HOST="${BASH_REMATCH[1]}"; PEER_PORT="${BASH_REMATCH[2]}"
+    elif [[ "$spec" =~ ^([^:]+):([0-9]+)$ ]]; then
+        PEER_HOST="${BASH_REMATCH[1]}"; PEER_PORT="${BASH_REMATCH[2]}"
+    else
+        PEER_HOST="$spec"
+    fi
+    validate_peer "$PEER_HOST" "$PEER_PORT"
+}
+
+public_peer_port() {
+    local host="$1" port
+    for port in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200; do
+        if peer_port_open "$host" "$port"; then printf '%s\n' "$port"; return 0; fi
+    done
+    return 1
+}
+
+auto_pick_peer() {
+    require_commands ping timeout
+    local temp host region provider rtt port line max_rtt="${BBRV3_PEER_MAX_RTT:-120}"
+    temp=$(mktemp -d) || return 1
+    log INFO "正在按 RTT 筛选公共 iperf3 节点（Leaseweb / OVH / Clouvider）"
+    while IFS='|' read -r host region provider; do
+        [[ -n "$host" ]] || continue
+        (
+            rtt=$(median_ping_ms "$host")
+            [[ -n "$rtt" ]] && printf '%s\t%s\t%s\t%s\n' "$rtt" "$host" "$region" "$provider" > "$temp/${host//[^a-zA-Z0-9]/_}"
+        ) &
+    done <<< "$PUBLIC_PEER_POOL"
+    wait || true
+    while IFS=$'\t' read -r rtt host region provider; do
+        (( rtt <= max_rtt )) || { log INFO "$host ($region/$provider) RTT ${rtt}ms，过远跳过"; continue; }
+        if port=$(public_peer_port "$host"); then
+            log OK "公共对端可达: $host:$port ($region/$provider, RTT ${rtt}ms)"
+            rm -rf -- "$temp"
+            printf '%s:%s\n' "$host" "$port"
+            return 0
+        fi
+        log INFO "$host ($region/$provider) 当前无可用测试端口"
+    done < <(cat "$temp"/* 2>/dev/null | sort -n)
+    rm -rf -- "$temp"
+    die "120ms 内没有可用公共 iperf3 节点；请使用自有对端"
+}
 
 interface_counter() { cat "/sys/class/net/$1/statistics/$2" 2>/dev/null || printf '0\n'; }
 
@@ -941,8 +1020,8 @@ new_measure_run() {
 }
 
 measure_probe() {
-    require_root; acquire_lock; tc_dependencies
-    require_commands iperf3 jq timeout
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
+    require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" duration="$4" parallel="$5" iface dir row rc=0 speed estimate
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && is_uint "$parallel" && ((duration>=3 && duration<=120 && parallel>=1 && parallel<=32)) || { die "duration/parallel 超出安全范围"; return 1; }
@@ -969,8 +1048,8 @@ measure_probe() {
 }
 
 measure_sweep() {
-    require_root; acquire_lock; tc_dependencies
-    require_commands iperf3 jq timeout
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
+    require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" nominal="$4" low="$5" high="$6" step="$7"
     local duration="$8" parallel="$9" margin="${10}" threshold="${11}" force_scan="${12}" cap="${13}"
     local iface dir baseline_row baseline_gp baseline_loss base_row base_loss rate row gp loss
@@ -1007,9 +1086,9 @@ measure_sweep() {
 
         if (( above_cap )); then
             :
-        elif (( ! force_scan )) && ! loss_spike "$baseline_loss" "$threshold" 0; then
+        elif (( ! force_scan )) && awk -v v="$baseline_loss" -v t="$threshold" 'BEGIN {limit=t*10; if(limit<1)limit=1; exit !(v>limit)}'; then
             no_knee=1
-            log WARN "不限速测试未出现明显重传跳变，不建议启用 HTB"
+            log WARN "不限速路径重传估算 ${baseline_loss}% 过高，无法可靠定位 policer；更换对端或使用 --force-scan"
         else
             apply_shaping "$iface" "$low" || rc=$?
             if (( rc == 0 )); then
@@ -1021,14 +1100,21 @@ measure_sweep() {
                 rc=2
             fi
             if (( rc == 0 )); then
+                local previous_gp previous_rate stall_count=0 stalled_rate=""
                 last_ok="$low"
+                previous_gp=$(cut -f1 <<< "$base_row"); previous_rate="$low"
                 for ((rate=low+step; rate<=high; rate+=step)); do
                     apply_shaping "$iface" "$rate" || { rc=$?; break; }
                     row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "rate-${rate}") || { rc=$?; break; }
                     gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
                     printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%%\n' "$rate" "$gp" "$loss"
                     if loss_spike "$loss" "$threshold" "$base_loss"; then broke_at="$rate"; break; fi
-                    last_ok="$rate"
+                    if awk -v g="$gp" -v p="$previous_gp" -v r="$rate" -v pr="$previous_rate" 'BEGIN {d=r-pr; gain=g-p; exit !(d>=1 && gain<d*0.25 && g<r*0.90)}'; then
+                        ((stall_count+=1)); [[ -n "$stalled_rate" ]] || stalled_rate="$rate"
+                        if (( stall_count >= 2 )); then broke_at="$stalled_rate"; break; fi
+                        continue
+                    fi
+                    stall_count=0; stalled_rate=""; last_ok="$rate"; previous_gp="$gp"; previous_rate="$rate"
                 done
             fi
             if (( rc == 0 )) && [[ -n "$broke_at" ]]; then
@@ -1042,7 +1128,7 @@ measure_sweep() {
                     last_ok="$rate"
                 done
             fi
-            if (( rc == 0 )) && [[ -n "$last_ok" ]]; then
+            if (( rc == 0 )) && [[ -n "$last_ok" && -n "$broke_at" ]]; then
                 recommend=$(( last_ok * (100-margin) / 100 )); ((recommend < 1)) && recommend=1
                 apply_shaping "$iface" "$recommend" || rc=$?
                 if (( rc == 0 )); then
@@ -1073,15 +1159,112 @@ measure_sweep() {
     return "$rc"
 }
 
+summary_value() {
+    local file="$1" key="$2"
+    awk -F'\t' -v key="$key" '$1==key {print $2; exit}' "$file" 2>/dev/null
+}
+
+measure_path_check() {
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
+    require_commands iperf3 jq timeout || return 1
+    local peer="$1" port="$2" requested="$3" rate="$4" iface row gp loss rc=0
+    validate_peer "$peer" "$port" || return 1
+    is_uint "$rate" && (( rate > 0 )) || { die "路径检查速率无效"; return 1; }
+    iface=$(detect_interface "$requested") || return 1
+    qdisc_guard "$iface" || return 1
+    measure_begin "$iface" || return 1
+    log INFO "路径预检: 临时整形 ${rate} Mbit/s，检查对端是否足以承载测量"
+    if apply_shaping "$iface" "$rate" && row=$(sample_repeated "$peer" "$port" 5 1 1 path-check); then
+        gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
+        if awk -v g="$gp" -v r="$rate" 'BEGIN {exit !(g < r*0.60)}'; then
+            log ERR "路径预检仅达到 ${gp} Mbit/s，明显低于 ${rate} Mbit/s；更换更近对端后重试"
+            rc=2
+        elif loss_spike "$loss" 0.5 0; then
+            log ERR "路径预检重传比例过高 (${loss}%)；本次对端不适合寻找 policer 拐点"
+            rc=2
+        else
+            log OK "路径预检通过: ${gp} Mbit/s，重传估算 ${loss}%"
+        fi
+    else
+        rc=1
+    fi
+    measure_restore || rc=$?
+    return "$rc"
+}
+
+measure_verify() {
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
+    require_commands iperf3 jq timeout || return 1
+    local peer="$1" port="$2" requested="$3" duration="${4:-8}" iface dir one multi rc=0
+    validate_peer "$peer" "$port" || return 1
+    is_uint "$duration" && (( duration >= 3 && duration <= 120 )) || { die "verify duration 超出安全范围"; return 1; }
+    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return 1; }
+    iface=$(detect_interface "$requested") || return 1
+    qdisc_guard "$iface" || return 1
+    new_measure_run verify; dir="$MEASURE_RUN_DIR"
+    measure_begin "$iface" || return 1
+    one=$(sample_repeated "$peer" "$port" "$duration" 1 1 verify-single) || rc=$?
+    if (( rc == 0 )); then multi=$(sample_repeated "$peer" "$port" "$duration" 4 1 verify-four) || rc=$?; fi
+    if (( rc == 0 )); then
+        printf 'TYPE\tverify\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nSINGLE_MBIT\t%s\nSINGLE_RETRANS_EST_PERCENT\t%s\nFOUR_MBIT\t%s\nFOUR_RETRANS_EST_PERCENT\t%s\n' \
+            "$peer" "$port" "$iface" "$(cut -f1 <<< "$one")" "$(cut -f4 <<< "$one")" \
+            "$(cut -f1 <<< "$multi")" "$(cut -f4 <<< "$multi")" > "$dir/summary.tsv"
+        log OK "验证完成: 单流 $(cut -f1 <<< "$one") Mbit/s，多流 $(cut -f1 <<< "$multi") Mbit/s"
+        log INFO "验证结果: $dir"
+    fi
+    traffic_report "$iface"
+    measure_restore || rc=$?
+    return "$rc"
+}
+
 # -----------------------------------------------------------------------------
 # Persistence, legacy migration, restore and uninstall.
 # -----------------------------------------------------------------------------
 
 current_script_path() {
     local source="${BASH_SOURCE[0]}"
-    case "$source" in /dev/fd/*|/proc/*/fd/*) die "不能从进程替换安装持久化副本；请先用 install-alias.sh 安装 bbr 命令"; return 1 ;; esac
+    case "$source" in /dev/fd/*|/proc/*/fd/*) return 1 ;; esac
     [[ -f "$source" ]] || return 1
     readlink -f "$source"
+}
+
+verified_download_current_script() {
+    local target="$1" base expected actual candidate
+    require_commands curl sha256sum awk
+    for base in \
+        "https://github.com/${PROJECT_REPO}/releases/download/v${SCRIPT_VERSION}" \
+        "https://raw.githubusercontent.com/${PROJECT_REPO}/v${SCRIPT_VERSION}" \
+        "https://raw.githubusercontent.com/${PROJECT_REPO}/main"; do
+        candidate="${target}.candidate"
+        rm -f -- "$candidate" "${target}.sha"
+        curl -fsSL --connect-timeout 15 --max-time 120 "$base/net-tcp-tune.sh" -o "$candidate" || continue
+        curl -fsSL --connect-timeout 15 --max-time 30 "$base/SHA256SUMS" -o "${target}.sha" || continue
+        expected=$(awk '$2=="net-tcp-tune.sh" || $2=="*net-tcp-tune.sh" {print $1; exit}' "${target}.sha")
+        actual=$(sha256sum "$candidate" | awk '{print $1}')
+        [[ -n "$expected" && "$actual" == "$expected" ]] || continue
+        grep -Fq "SCRIPT_VERSION=\"${SCRIPT_VERSION}\"" "$candidate" || continue
+        bash -n "$candidate" || continue
+        mv -f -- "$candidate" "$target"
+        rm -f -- "${target}.sha"
+        log INFO "已取得并校验同版本持久化副本: $base"
+        return 0
+    done
+    rm -f -- "${target}.candidate" "${target}.sha"
+    die "无法取得 v${SCRIPT_VERSION} 的校验副本；请先运行 install-alias.sh，或检查 GitHub Release"
+}
+
+resolve_install_source() {
+    local target="$1" source candidate
+    source=$(current_script_path 2>/dev/null || true)
+    if [[ -n "$source" ]]; then printf '%s\n' "$source"; return 0; fi
+    for candidate in "$(command -v bbr 2>/dev/null || true)" "$PERSIST_SCRIPT"; do
+        [[ -f "$candidate" ]] || continue
+        grep -Fq "SCRIPT_VERSION=\"${SCRIPT_VERSION}\"" "$candidate" || continue
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    verified_download_current_script "$target" || return 1
+    printf '%s\n' "$target"
 }
 
 migrate_legacy_config() {
@@ -1109,11 +1292,13 @@ migrate_legacy_config() {
 }
 
 install_persistence() {
-    require_root; require_commands systemctl install
-    local source temp_unit
-    source=$(current_script_path) || { die "找不到当前单文件脚本，先运行 scripts/build.sh"; return 1; }
+    require_root || return 1; require_commands systemctl install || return 1
+    local source temp_unit source_temp
+    source_temp=$(mktemp) || return 1
+    source=$(resolve_install_source "$source_temp") || { rm -f -- "$source_temp"; return 1; }
     mkdir -p -- "$PERSIST_DIR"
-    install -m 0755 "$source" "$PERSIST_SCRIPT"
+    install -m 0755 "$source" "$PERSIST_SCRIPT" || { rm -f -- "$source_temp"; die "安装持久化脚本失败"; return 1; }
+    rm -f -- "$source_temp"
     temp_unit=$(mktemp) || return 1
     cat > "$temp_unit" <<EOF
 [Unit]
@@ -1131,14 +1316,20 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-    atomic_install "$temp_unit" "$SERVICE_FILE" 0644
+    atomic_install "$temp_unit" "$SERVICE_FILE" 0644 || { rm -f -- "$temp_unit"; return 1; }
     rm -f -- "$temp_unit"
     if [[ "$LEGACY_SERVICE_FILE" != "$SERVICE_FILE" && -e "$LEGACY_SERVICE_FILE" ]]; then
         systemctl disable --now bbr-optimize-persist.service >/dev/null 2>&1 || true
         rm -f -- "$LEGACY_SERVICE_FILE"
     fi
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" >/dev/null
+    systemctl daemon-reload || return 1
+    systemctl enable "$SERVICE_NAME" >/dev/null || return 1
+}
+
+restart_and_verify_persistence() {
+    systemctl restart "$SERVICE_NAME" || { die "持久化服务启动失败"; return 1; }
+    systemctl is-enabled --quiet "$SERVICE_NAME" || { die "持久化服务未启用"; return 1; }
+    systemctl is-active --quiet "$SERVICE_NAME" || { die "持久化服务未通过运行验证"; return 1; }
 }
 
 remove_persistence() {
@@ -1151,7 +1342,7 @@ remove_persistence() {
 }
 
 apply_configured_state() {
-    require_root; acquire_lock
+    require_root || return 1; acquire_lock || return 1
     load_config || return 1
     (( BBR_ENABLED == 1 )) || return 0
     apply_sysctl_profile || return 1
@@ -1167,7 +1358,7 @@ apply_configured_state() {
 }
 
 install_base_tuning() {
-    require_root; acquire_lock; require_commands ip tc sysctl modprobe systemctl
+    require_root || return 1; acquire_lock || return 1; require_commands ip tc sysctl modprobe systemctl || return 1
     local requested="$1" profile="$2" role="$3" bandwidth="$4" rtt="$5" iface
     iface=$(detect_interface "$requested") || return 1
     capture_baseline "$iface" || return 1
@@ -1179,9 +1370,9 @@ install_base_tuning() {
     apply_sysctl_profile || return 1
     if (( TC_ENABLED == 1 && TC_RATE_MBIT > 0 )); then apply_shaping "$iface" "$TC_RATE_MBIT" || return 1; else apply_fq "$iface" || return 1; fi
     apply_initial_windows || return 1
-    save_config
-    install_persistence
-    systemctl restart "$SERVICE_NAME"
+    save_config || { die "运行时已生效，但配置保存失败；未报告安装成功"; return 1; }
+    install_persistence || { die "运行时已生效，但持久化安装失败；请修复后重试 install"; return 1; }
+    restart_and_verify_persistence || { die "运行时已生效，但开机持久化验证失败"; return 1; }
     log OK "基础调优已安装: BBR + ${SYSCTL_PROFILE} + $( ((TC_ENABLED)) && echo 'HTB/FQ' || echo 'FQ' )"
 }
 
@@ -1190,12 +1381,38 @@ restore_baseline_qdisc() {
     iface=$(awk -F'\t' '$1=="INTERFACE" {print $2}' "$BASELINE_DIR/manifest" 2>/dev/null)
     [[ -n "$iface" && -e "/sys/class/net/$iface" ]] || return 0
     kind=$(awk '$1=="qdisc" && $0~/ root / {print $2; exit}' "$BASELINE_DIR/qdisc.txt" 2>/dev/null)
-    restore_qdisc_text_snapshot "$iface" "$BASELINE_DIR/qdisc.txt" ||
+    if ! restore_qdisc_text_snapshot "$iface" "$BASELINE_DIR/qdisc.txt"; then
         log WARN "基线 root qdisc 为 '$kind'，文本快照无法无损重放；已保留快照供人工恢复"
+        return 1
+    fi
+}
+
+restore_baseline_route_windows() {
+    local family file baseline current token i rc=0
+    local -a route=() clean=()
+    for family in -4 -6; do
+        file="$BASELINE_DIR/default-route-v${family#-}.txt"
+        [[ -s "$file" ]] || continue
+        baseline=$(head -n1 "$file")
+        current=$(ip "$family" route show default 2>/dev/null | head -n1 || true)
+        [[ "$baseline$current" == *initcwnd* || "$baseline$current" == *initrwnd* ]] || continue
+        [[ -n "$current" ]] || continue
+        read -r -a route <<< "$current"; clean=()
+        for ((i=0; i<${#route[@]}; i++)); do
+            token="${route[$i]}"
+            if [[ "$token" == initcwnd || "$token" == initrwnd ]]; then ((i+=1)); continue; fi
+            clean+=("$token")
+        done
+        if [[ "$baseline" =~ (^|[[:space:]])initcwnd[[:space:]]+([0-9]+) ]]; then clean+=(initcwnd "${BASH_REMATCH[2]}"); fi
+        if [[ "$baseline" =~ (^|[[:space:]])initrwnd[[:space:]]+([0-9]+) ]]; then clean+=(initrwnd "${BASH_REMATCH[2]}"); fi
+        ip "$family" route replace "${clean[@]}" || { log WARN "未能恢复 IPv${family#-} 默认路由窗口参数"; rc=1; }
+    done
+    return "$rc"
 }
 
 restore_baseline() {
-    require_root; acquire_lock
+    require_root || return 1; acquire_lock || return 1
+    local rc=0
     [[ -f "$BASELINE_DIR/manifest" ]] || { die "没有可恢复的基线"; return 1; }
     if [[ "$(baseline_provenance)" == legacy-reference ]]; then
         [[ -x "$BASELINE_DIR/legacy-tool.sh" ]] || { die "旧版恢复工具缺失，不能自动恢复"; return 1; }
@@ -1208,19 +1425,21 @@ restore_baseline() {
     fi
     remove_persistence
     rm -f -- "$CONFIG_FILE" "$SYSCTL_FILE"
-    restore_backed_path "$CONFIG_FILE" config
-    restore_backed_path "$SYSCTL_FILE" sysctl
-    restore_backed_path "$LEGACY_SYSCTL_FILE" legacy-sysctl
-    restore_backed_path "$SERVICE_FILE" service
-    restore_backed_path "$LEGACY_SERVICE_FILE" legacy-service
-    restore_runtime_sysctls
-    restore_baseline_qdisc
+    restore_backed_path "$CONFIG_FILE" config || rc=1
+    restore_backed_path "$SYSCTL_FILE" sysctl || rc=1
+    restore_backed_path "$LEGACY_SYSCTL_FILE" legacy-sysctl || rc=1
+    restore_backed_path "$SERVICE_FILE" service || rc=1
+    restore_backed_path "$LEGACY_SERVICE_FILE" legacy-service || rc=1
+    restore_runtime_sysctls || rc=1
+    restore_baseline_route_windows || rc=1
+    restore_baseline_qdisc || rc=1
     systemctl daemon-reload 2>/dev/null || true
-    log OK "已恢复首次可信基线；基线和测量历史仍保留在 $STATE_DIR"
+    if (( rc == 0 )); then log OK "已恢复首次可信基线；基线和测量历史仍保留在 $STATE_DIR"
+    else die "基线只完成了部分恢复；快照仍保留在 $BASELINE_DIR，请查看上述警告"; fi
 }
 
 uninstall_managed() {
-    require_root; acquire_lock
+    require_root || return 1; acquire_lock || return 1
     local purge="${1:-0}" iface="" resolved_state
     load_config || true
     iface=$(detect_interface "${TC_INTERFACE:-auto}" 2>/dev/null || true)
@@ -1238,26 +1457,62 @@ uninstall_managed() {
 }
 
 show_status() {
-    local iface="" cc available profile_state service_state shaping=off
+    local iface="" cc available profile_state service_state service_active shaping=off config_state baseline_state
     load_config || return 1
     iface=$(detect_interface "$TC_INTERFACE" 2>/dev/null || true)
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
     available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)
     profile_state=$([[ -f "$SYSCTL_FILE" ]] && echo installed || echo absent)
-    service_state=$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || echo disabled)
+    if [[ ! -f "$SERVICE_FILE" ]]; then service_state=absent
+    elif systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then service_state=enabled
+    else service_state=disabled; fi
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then service_active=active; else service_active=inactive; fi
+    config_state=$([[ -f "$CONFIG_FILE" ]] && echo present || echo absent)
+    if [[ -f "$BASELINE_DIR/manifest" ]]; then baseline_state="recorded ($(baseline_provenance))"; else baseline_state=missing; fi
     printf '%-20s %s\n' "Version" "v${SCRIPT_VERSION}"
     printf '%-20s %s\n' "Kernel" "$(uname -r)"
     printf '%-20s %s\n' "Congestion control" "$cc (available: $available)"
+    printf '%-20s %s\n' "BBR generation" "$(bbr_generation_status "$cc")"
     printf '%-20s %s\n' "Sysctl profile" "$SYSCTL_PROFILE ($profile_state)"
-    printf '%-20s %s\n' "Persistence" "$service_state"
-    printf '%-20s %s\n' "Config" "$CONFIG_FILE"
-    printf '%-20s %s\n' "Baseline" "$([[ -f "$BASELINE_DIR/manifest" ]] && echo recorded || echo missing)"
+    printf '%-20s %s\n' "Persistence" "$service_state / $service_active"
+    printf '%-20s %s\n' "Config" "$config_state ($CONFIG_FILE)"
+    printf '%-20s %s\n' "Baseline" "$baseline_state"
     if [[ -n "$iface" ]]; then
         if managed_htb "$iface"; then shaping="$(managed_rate_mbit "$iface") Mbit"; fi
         printf '%-20s %s\n' "Interface" "$iface"
         printf '%-20s %s\n' "Root qdisc" "$(root_qdisc_kind "$iface")"
         printf '%-20s %s\n' "Shaping" "$shaping"
     fi
+}
+
+bbr_generation_status() {
+    local cc="${1:-}" module_version kernel
+    [[ "$cc" == bbr ]] || { printf 'inactive\n'; return 0; }
+    module_version=$(modinfo tcp_bbr 2>/dev/null | awk '/^version:/ {print $2; exit}')
+    kernel=$(uname -r)
+    if [[ "$module_version" =~ ^3([.-]|$) ]]; then
+        printf 'v3 verified (module %s)\n' "$module_version"
+    elif [[ "$kernel" == *xanmod* ]]; then
+        printf 'likely v3 (XanMod; kernel API cannot prove generation)\n'
+    else
+        printf 'unknown (BBR active; not proof of BBRv3)\n'
+    fi
+}
+
+verify_system_state() {
+    local rc=0 iface cc
+    load_config || return 1
+    iface=$(detect_interface "$TC_INTERFACE") || return 1
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    [[ "$cc" == bbr ]] || { log ERR "拥塞控制不是 bbr: ${cc:-unknown}"; rc=1; }
+    [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" == fq ]] || { log ERR "default_qdisc 不是 fq"; rc=1; }
+    [[ -f "$SYSCTL_FILE" ]] || { log ERR "sysctl 持久化文件缺失"; rc=1; }
+    systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未启用"; rc=1; }
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未运行"; rc=1; }
+    if (( TC_ENABLED )); then verify_shaping "$iface" || rc=1
+    else [[ "$(root_qdisc_kind "$iface")" == fq ]] || { log ERR "root qdisc 不是 fq"; rc=1; }
+    fi
+    if (( rc == 0 )); then log OK "运行时与持久化状态一致"; else die "验证发现不一致"; fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1311,23 +1566,26 @@ apt_network_guard() {
 }
 
 kernel_status() {
+    local cc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
     printf '%-18s %s\n' "Running kernel" "$(uname -r)"
     printf '%-18s %s\n' "Architecture" "$(uname -m)"
     printf '%-18s %s\n' "x86-64 level" "$(detect_x86_level 2>/dev/null || echo n/a)"
     printf '%-18s %s\n' "Secure Boot" "$(secure_boot_enabled && echo enabled || echo disabled/unknown)"
     printf '%-18s %s\n' "BBR module" "$(modinfo tcp_bbr 2>/dev/null | awk '/^version:/ {print $2; found=1} END{if(!found)print "available/unknown version"}')"
+    printf '%-18s %s\n' "BBR generation" "$(bbr_generation_status "$cc")"
     dpkg-query -W -f='${Package}\t${Version}\n' 'linux-*xanmod*' 2>/dev/null || true
 }
 
 kernel_install() {
-    require_root; acquire_lock
+    require_root || return 1; acquire_lock || return 1
     local track="${1:-lts}" codename level package key_tmp keyring_tmp source_tmp
     [[ "$track" == lts || "$track" == main ]] || { die "--track 只支持 lts/main"; return 1; }
     [[ "$(os_id)" == debian || "$(os_id)" == ubuntu ]] || { die "XanMod 自动安装只支持 Debian/Ubuntu"; return 1; }
     [[ "$(uname -m)" == x86_64 ]] || { die "XanMod 官方 APT 仅支持 amd64；ARM64 请使用发行版内核或审计后的社区构建"; return 1; }
     is_container && { die "容器中不能更换宿主机内核"; return 1; }
     secure_boot_enabled && { die "检测到 Secure Boot 已启用；请先准备签名/MOK 或关闭后再安装"; return 1; }
-    require_commands apt-get apt-cache curl gpg
+    require_commands apt-get apt-cache curl gpg || return 1
     codename=$(os_codename); [[ -n "$codename" ]] || { die "无法读取 VERSION_CODENAME"; return 1; }
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
@@ -1338,11 +1596,11 @@ kernel_install() {
     keyring_tmp=$(mktemp) || { rm -f "$key_tmp"; return 1; }
     gpg --dearmor --yes -o "$keyring_tmp" "$key_tmp"
     rm -f "$key_tmp"
-    atomic_install "$keyring_tmp" /etc/apt/keyrings/xanmod-archive-keyring.gpg 0644
+    atomic_install "$keyring_tmp" /etc/apt/keyrings/xanmod-archive-keyring.gpg 0644 || { rm -f "$keyring_tmp"; return 1; }
     rm -f "$keyring_tmp"
     source_tmp=$(mktemp) || return 1
     printf 'deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org %s main\n' "$codename" > "$source_tmp"
-    atomic_install "$source_tmp" /etc/apt/sources.list.d/xanmod-release.list 0644
+    atomic_install "$source_tmp" /etc/apt/sources.list.d/xanmod-release.list 0644 || { rm -f "$source_tmp"; return 1; }
     rm -f "$source_tmp"
     apt-get update
     level=$(detect_x86_level); package=$(select_xanmod_package "$level" "$track") || return 1
@@ -1354,7 +1612,7 @@ kernel_install() {
 }
 
 kernel_remove() {
-    require_root; acquire_lock
+    require_root || return 1; acquire_lock || return 1
     local -a packages=() safe=() package
     mapfile -t packages < <(dpkg-query -W -f='${Package}\n' 'linux-*xanmod*' 2>/dev/null | sort -u)
     ((${#packages[@]})) || { log INFO "没有已安装的 XanMod 包"; return 0; }
@@ -1378,11 +1636,13 @@ DNS_DROPIN="/etc/systemd/resolved.conf.d/80-bbrv3-lite.conf"
 dns_capture_baseline() {
     local base="$DNS_BACKUP_DIR/baseline"
     [[ -f "$base/manifest" ]] && return 0
-    mkdir -p "$base"
-    printf 'CREATED_AT\t%s\n' "$(utc_now)" > "$base/manifest"
-    if [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then cp -a /etc/resolv.conf "$base/resolv.conf"; printf 'present\n' > "$base/resolv.state"; else printf 'absent\n' > "$base/resolv.state"; fi
-    if [[ -e "$DNS_DROPIN" ]]; then cp -a "$DNS_DROPIN" "$base/dropin.conf"; printf 'present\n' > "$base/dropin.state"; else printf 'absent\n' > "$base/dropin.state"; fi
-    chmod -R go-rwx "$base"
+    [[ ! -d "$base" ]] || remove_tree_within "$base" "$DNS_BACKUP_DIR" || return 1
+    mkdir -p "$base" || return 1
+    if [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then cp -a /etc/resolv.conf "$base/resolv.conf" || return 1; printf 'present\n' > "$base/resolv.state" || return 1; else printf 'absent\n' > "$base/resolv.state" || return 1; fi
+    if [[ -e "$DNS_DROPIN" ]]; then cp -a "$DNS_DROPIN" "$base/dropin.conf" || return 1; printf 'present\n' > "$base/dropin.state" || return 1; else printf 'absent\n' > "$base/dropin.state" || return 1; fi
+    printf 'CREATED_AT\t%s\n' "$(utc_now)" > "$base/manifest.pending" || return 1
+    chmod -R go-rwx "$base" || return 1
+    mv "$base/manifest.pending" "$base/manifest" || return 1
 }
 
 dns_restore_files() {
@@ -1397,11 +1657,11 @@ dns_restore_files() {
 }
 
 dns_apply() {
-    require_root; acquire_lock; require_commands systemctl resolvectl timeout
+    require_root || return 1; acquire_lock || return 1; require_commands systemctl resolvectl timeout || return 1
     local mode="${1:-auto}" temp
     [[ "$mode" == auto || "$mode" == dot || "$mode" == plain ]] || { die "DNS mode 只支持 auto/dot/plain"; return 1; }
     systemctl cat systemd-resolved >/dev/null 2>&1 || { die "系统未提供 systemd-resolved"; return 1; }
-    dns_capture_baseline
+    dns_capture_baseline || return 1
     if [[ "$mode" == auto ]]; then
         if peer_port_open 1.1.1.1 853; then mode="dot"; else mode="plain"; log WARN "DoT 853 不可达，降级到普通 DNS 53"; fi
     fi
@@ -1425,10 +1685,10 @@ DNSOverTLS=no
 DNSSEC=allow-downgrade
 EOF
     fi
-    atomic_install "$temp" "$DNS_DROPIN" 0644
+    atomic_install "$temp" "$DNS_DROPIN" 0644 || { rm -f "$temp"; return 1; }
     rm -f "$temp"
-    ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-    systemctl restart systemd-resolved
+    ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || return 1
+    systemctl restart systemd-resolved || { dns_restore_files; die "systemd-resolved 重启失败，已恢复"; return 1; }
     if ! resolvectl query example.com >/dev/null; then
         dns_restore_files
         die "DNS 验证失败，已自动恢复修改前配置"
@@ -1438,10 +1698,10 @@ EOF
 }
 
 dns_restore() {
-    require_root; acquire_lock
+    require_root || return 1; acquire_lock || return 1
     local base="$DNS_BACKUP_DIR/baseline"
     [[ -f "$base/manifest" ]] || { die "没有 DNS 基线"; return 1; }
-    dns_restore_files
+    dns_restore_files || return 1
     log OK "DNS 已恢复到首次修改前状态"
 }
 
@@ -1460,11 +1720,11 @@ IPV6_SYSCTL_FILE="/etc/sysctl.d/99-bbrv3-lite-ipv6.conf"
 ipv6_capture_baseline() {
     local base="$IPV6_BACKUP_DIR/baseline" key
     [[ -f "$base/sysctl.tsv" ]] && return 0
-    mkdir -p "$base"
+    mkdir -p "$base" || return 1
     for key in all default lo; do
         printf 'net.ipv6.conf.%s.disable_ipv6\t%s\n' "$key" "$(sysctl -n "net.ipv6.conf.${key}.disable_ipv6" 2>/dev/null || echo 0)"
-    done > "$base/sysctl.tsv"
-    chmod -R go-rwx "$base"
+    done > "$base/sysctl.tsv" || return 1
+    chmod -R go-rwx "$base" || return 1
 }
 
 ipv6_set_disabled() {
@@ -1473,11 +1733,11 @@ ipv6_set_disabled() {
 }
 
 ipv6_disable() {
-    require_root; acquire_lock; require_commands sysctl
+    require_root || return 1; acquire_lock || return 1; require_commands sysctl || return 1
     local mode="${1:-temporary}" temp
     [[ "$mode" == temporary || "$mode" == permanent ]] || { die "IPv6 mode 只支持 temporary/permanent"; return 1; }
-    ipv6_capture_baseline
-    ipv6_set_disabled 1
+    ipv6_capture_baseline || return 1
+    ipv6_set_disabled 1 || return 1
     if [[ "$mode" == permanent ]]; then
         temp=$(mktemp) || return 1
         printf '%s\n' \
@@ -1485,25 +1745,26 @@ ipv6_disable() {
             'net.ipv6.conf.all.disable_ipv6 = 1' \
             'net.ipv6.conf.default.disable_ipv6 = 1' \
             'net.ipv6.conf.lo.disable_ipv6 = 1' > "$temp"
-        atomic_install "$temp" "$IPV6_SYSCTL_FILE" 0644
+        atomic_install "$temp" "$IPV6_SYSCTL_FILE" 0644 || { rm -f "$temp"; return 1; }
         rm -f "$temp"
     fi
     log OK "IPv6 已${mode/temporary/临时}${mode/permanent/永久}禁用"
 }
 
 ipv6_restore() {
-    require_root; acquire_lock
-    local base="$IPV6_BACKUP_DIR/baseline" key value
+    require_root || return 1; acquire_lock || return 1
+    local base="$IPV6_BACKUP_DIR/baseline" key value rc=0
     [[ -f "$base/sysctl.tsv" ]] || { die "没有 IPv6 基线"; return 1; }
     rm -f "$IPV6_SYSCTL_FILE"
-    while IFS=$'\t' read -r key value; do sysctl -q -w "$key=$value" || true; done < "$base/sysctl.tsv"
-    log OK "IPv6 已恢复到首次修改前状态"
+    while IFS=$'\t' read -r key value; do sysctl -q -w "$key=$value" || rc=1; done < "$base/sysctl.tsv"
+    if (( rc == 0 )); then log OK "IPv6 已恢复到首次修改前状态"; else die "IPv6 持久化文件已移除，但部分运行时值恢复失败"; fi
 }
 
 ipv6_status() {
     local key
     for key in all default lo; do printf '%-42s %s\n' "net.ipv6.conf.${key}.disable_ipv6" "$(sysctl -n "net.ipv6.conf.${key}.disable_ipv6" 2>/dev/null || echo unavailable)"; done
-    printf '%-42s %s\n' "persistent file" "$([[ -f "$IPV6_SYSCTL_FILE" ]] && echo present || echo absent)"
+    printf '%-42s %s\n' "bbrv3-lite persistent policy" "$([[ -f "$IPV6_SYSCTL_FILE" ]] && echo present || echo absent)"
+    printf '%-42s %s\n' "bbrv3-lite IPv6 baseline" "$([[ -f "$IPV6_BACKUP_DIR/baseline/sysctl.tsv" ]] && echo recorded || echo absent)"
 }
 
 # -----------------------------------------------------------------------------
@@ -1511,10 +1772,18 @@ ipv6_status() {
 # -----------------------------------------------------------------------------
 
 self_update() {
-    require_root; acquire_lock; require_commands curl awk sha256sum sort
+    require_root || return 1; acquire_lock || return 1; require_commands curl awk sha256sum sort || return 1
     local latest latest_version current target tmp base expected actual backup newest
-    current=$(current_script_path) || return 1
-    latest=$(curl -fsSL --max-time 20 "https://api.github.com/repos/${PROJECT_REPO}/releases/latest" | awk -F'"' '/"tag_name"/ {print $4; exit}')
+    current=$(current_script_path 2>/dev/null || true)
+    if [[ -z "$current" ]]; then
+        current=$(command -v bbr 2>/dev/null || true)
+        [[ -f "$current" ]] || { die "当前从临时流运行且没有已安装的 bbr 命令；请先运行 install-alias.sh"; return 1; }
+    fi
+    latest=$(curl -fsSL --max-time 20 "https://api.github.com/repos/${PROJECT_REPO}/releases/latest" 2>/dev/null | awk -F'"' '/"tag_name"/ {print $4; exit}' || true)
+    if [[ -z "$latest" ]]; then
+        latest=$(curl -fsSL --max-time 20 "https://api.github.com/repos/${PROJECT_REPO}/tags?per_page=100" |
+            awk -F'"' '/"name"[[:space:]]*:/ && $4 ~ /^v[0-9]+[.][0-9]+[.][0-9]+$/ {print $4}' | sort -V | tail -n1)
+    fi
     [[ "$latest" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || { die "无法取得合法 release 版本"; return 1; }
     [[ "$latest" != "v${SCRIPT_VERSION}" ]] || { log OK "已经是最新版本 $latest"; return 0; }
     latest_version="${latest#v}"
@@ -1522,8 +1791,13 @@ self_update() {
     if [[ "$newest" == "$SCRIPT_VERSION" ]]; then log WARN "当前 v${SCRIPT_VERSION} 比最新 release $latest 更新，不执行降级"; return 0; fi
     tmp=$(mktemp -d) || return 1
     base="https://github.com/${PROJECT_REPO}/releases/download/${latest}"
-    curl -fsSL --max-time 120 "$base/net-tcp-tune.sh" -o "$tmp/net-tcp-tune.sh" || { rm -rf "$tmp"; return 1; }
-    curl -fsSL --max-time 30 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" || { rm -rf "$tmp"; die "Release 缺少 SHA256SUMS"; return 1; }
+    if ! curl -fsSL --max-time 120 "$base/net-tcp-tune.sh" -o "$tmp/net-tcp-tune.sh" ||
+       ! curl -fsSL --max-time 30 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"; then
+        base="https://raw.githubusercontent.com/${PROJECT_REPO}/${latest}"
+        curl -fsSL --max-time 120 "$base/net-tcp-tune.sh" -o "$tmp/net-tcp-tune.sh" || { rm -rf "$tmp"; return 1; }
+        curl -fsSL --max-time 30 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" || { rm -rf "$tmp"; die "tag 缺少 SHA256SUMS"; return 1; }
+        log WARN "GitHub Release 资产缺失，已从不可变 tag 更新"
+    fi
     expected=$(awk '$2=="net-tcp-tune.sh" || $2=="*net-tcp-tune.sh" {print $1; exit}' "$tmp/SHA256SUMS")
     actual=$(sha256sum "$tmp/net-tcp-tune.sh" | awk '{print $1}')
     [[ -n "$expected" && "$actual" == "$expected" ]] || { rm -rf "$tmp"; die "SHA256 校验失败"; return 1; }
@@ -1548,6 +1822,7 @@ show_help() {
 ${SCRIPT_NAME} v${SCRIPT_VERSION} - measured BBR/HTB/FQ tuning
 
 Usage:
+  ${0##*/} auto
   ${0##*/} detect [--interface DEV] [--target HOST]
   ${0##*/} install [--profile balanced|adaptive] [--role proxy|mixed|bulk]
                      [--bandwidth MBIT --rtt MS] [--interface DEV]
@@ -1557,7 +1832,7 @@ Usage:
   ${0##*/} tc enable RATE [--interface DEV] [--knee RATE] [--margin PERCENT]
   ${0##*/} tc disable|status|stats [--interface DEV]
   ${0##*/} measure deps
-  ${0##*/} measure probe --peer HOST [--port 5201] [--duration 10] [--parallel 4]
+  ${0##*/} measure probe|verify --peer HOST [--port 5201] [--duration 10] [--parallel 4]
   ${0##*/} measure sweep --peer HOST [--nominal MBIT] [--low MBIT --high MBIT]
                          [--step MBIT] [--duration 8] [--parallel 1]
                          [--margin 3] [--loss-threshold 0.1] [--cap 5000] [--force-scan]
@@ -1565,6 +1840,7 @@ Usage:
   ${0##*/} dns status|apply [auto|dot|plain]|restore
   ${0##*/} ipv6 status|disable [temporary|permanent]|restore
   ${0##*/} baseline info|adopt [--interface DEV]
+  ${0##*/} verify
   ${0##*/} restore
   ${0##*/} uninstall [--purge-state]
   ${0##*/} update | version | help
@@ -1625,7 +1901,7 @@ cmd_measure() {
     local action="${1:-}"; shift || true
     local peer="" port=5201 iface=auto duration=10 parallel=4 nominal=0 low=0 high=0 step=0 margin=3 threshold=0.1 force=0 cap=5000
     [[ "$action" == deps ]] && { install_measure_dependencies; return; }
-    [[ "$action" == probe || "$action" == sweep ]] || { die "measure 子命令应为 deps/probe/sweep"; return 1; }
+    [[ "$action" == probe || "$action" == sweep || "$action" == verify ]] || { die "measure 子命令应为 deps/probe/sweep/verify"; return 1; }
     [[ "$action" == sweep ]] && { duration=8; parallel=1; }
     while (($#)); do
         case "$1" in
@@ -1638,6 +1914,7 @@ cmd_measure() {
     done
     [[ -n "$peer" ]] || { die "需要 --peer HOST"; return 1; }
     if [[ "$action" == probe ]]; then measure_probe "$peer" "$port" "$iface" "$duration" "$parallel"
+    elif [[ "$action" == verify ]]; then measure_verify "$peer" "$port" "$iface" "$duration"
     else measure_sweep "$peer" "$port" "$iface" "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$threshold" "$force" "$cap"; fi
 }
 
@@ -1656,23 +1933,206 @@ cmd_baseline() {
     case "$action" in info) baseline_info ;; adopt) baseline_adopt "$iface" ;; *) die "baseline 子命令应为 info/adopt" ;; esac
 }
 
+ensure_interactive_measure_dependencies() {
+    local -a missing=() command
+    for command in iperf3 jq ping; do command_exists "$command" || missing+=("$command"); done
+    ((${#missing[@]} == 0)) && return 0
+    log WARN "自动调优需要: ${missing[*]}"
+    confirm "现在安装测量依赖？" y || { die "缺少测量依赖，已取消"; return 1; }
+    install_measure_dependencies || return 1
+    require_commands iperf3 jq ping timeout
+}
+
+interactive_select_peer() {
+    local choice spec
+    printf '%s\n' '测速对端：' '  1) 自动选择公共节点（Leaseweb / OVH / Clouvider）' '  2) 自有 iperf3 服务器（推荐）'
+    read -r -p '选择 [1]: ' choice || return 1
+    case "${choice:-1}" in
+        1) spec=$(auto_pick_peer) || return 1 ;;
+        2) read -r -p '对端 HOST[:PORT]（IPv6 用 [ADDR]:PORT）: ' spec || return 1 ;;
+        *) die "无效对端选择"; return 1 ;;
+    esac
+    parse_peer_spec "$spec" || return 1
+    peer_port_open "$PEER_HOST" "$PEER_PORT" || { die "无法连接 $PEER_HOST:$PEER_PORT"; return 1; }
+    WIZARD_PEER="$PEER_HOST"; WIZARD_PORT="$PEER_PORT"
+}
+
+auto_tune_wizard() {
+    require_root
+    [[ -t 0 ]] || { die "auto 向导需要交互终端"; return 1; }
+    local bandwidth_input nominal=0 role_choice role=mixed rtt=0 profile=balanced estimate="动态估算" path_rate summary recommend knee measured no_knee
+    WIZARD_PEER=""; WIZARD_PORT=5201
+    printf '\n%s v%s 自动调优\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+    printf '首次修改前会保存不可覆盖的基线：%s\n' "$BASELINE_DIR"
+    printf '包含本工具涉及的 sysctl、配置/服务、qdisc/class，以及 IPv4/IPv6 路由快照。\n\n'
+    ensure_interactive_measure_dependencies || return 1
+
+    read -r -p '标称带宽 Mbit/s（a=自动测量，0=仅安装 BBR+FQ）[a]: ' bandwidth_input || return 1
+    bandwidth_input="${bandwidth_input:-a}"
+    if [[ "$bandwidth_input" != a && "$bandwidth_input" != auto ]]; then
+        is_uint "$bandwidth_input" && (( bandwidth_input <= 1000000 )) || { die "带宽必须是非负整数或 a"; return 1; }
+        nominal="$bandwidth_input"
+    fi
+
+    if [[ "$nominal" != 0 || "$bandwidth_input" == a || "$bandwidth_input" == auto ]]; then
+        interactive_select_peer || return 1
+        rtt=$(median_ping_ms "$WIZARD_PEER"); [[ -n "$rtt" ]] || rtt=0
+    fi
+
+    printf '%s\n' '用途：1) 混合业务  2) 代理/转发  3) 大文件吞吐'
+    read -r -p '选择 [1]: ' role_choice || return 1
+    case "${role_choice:-1}" in 1) role=mixed ;; 2) role=proxy ;; 3) role=bulk ;; *) die "无效用途"; return 1 ;; esac
+    if (( nominal > 0 && rtt > 0 )); then
+        profile=adaptive
+        estimate="约 $(human_bytes "$(estimate_sweep_bytes "$((nominal * 13 / 10))" 5 20)") 上行"
+    elif [[ -n "${WIZARD_PEER:-}" ]]; then
+        estimate="将按实测带宽动态计算，扫描上限 5000 Mbit/s"
+    else
+        estimate="不运行测速"
+    fi
+
+    printf '\n执行摘要\n'
+    printf '  网卡/用途       auto / %s\n' "$role"
+    printf '  标称带宽        %s\n' "$([[ "$bandwidth_input" == a || "$bandwidth_input" == auto ]] && echo 自动测量 || echo "${nominal} Mbit/s")"
+    [[ -n "${WIZARD_PEER:-}" ]] && printf '  iperf3 对端     %s:%s（RTT %sms）\n' "$WIZARD_PEER" "$WIZARD_PORT" "${rtt:-unknown}"
+    printf '  预计时间/流量   约 3–8 分钟 / %s\n' "$estimate"
+    printf '  持久化位置      %s + %s\n' "$CONFIG_FILE" "$SERVICE_FILE"
+    confirm "确认开始？" || { log INFO "已取消，未修改系统"; return 0; }
+
+    install_base_tuning auto "$profile" "$role" "$nominal" "$rtt" || return 1
+    if [[ -z "${WIZARD_PEER:-}" ]]; then
+        verify_system_state
+        return
+    fi
+    if (( nominal > 0 )); then
+        path_rate=$((nominal * 40 / 100)); ((path_rate < 1)) && path_rate=1
+        measure_path_check "$WIZARD_PEER" "$WIZARD_PORT" auto "$path_rate" || return 1
+    fi
+    measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto "$nominal" 0 0 0 5 1 3 0.1 1 5000 || return 1
+    summary="$MEASURE_RUN_DIR/summary.tsv"
+    recommend=$(summary_value "$summary" RECOMMEND)
+    knee=$(summary_value "$summary" BROKE_AT); knee="${knee:-0}"
+    measured=$(summary_value "$summary" UNSHAPED_MBIT)
+    no_knee=$(summary_value "$summary" NO_KNEE)
+
+    if [[ -n "$measured" && "$rtt" -gt 0 ]]; then
+        load_config || return 1
+        SYSCTL_PROFILE=adaptive; BANDWIDTH_MBIT=$(awk -v g="$measured" 'BEGIN {printf "%d", g+0.5}'); RTT_MS="$rtt"; ROLE="$role"
+        apply_sysctl_profile || return 1
+        save_config || return 1
+    fi
+    if [[ -n "$recommend" ]]; then
+        tc_enable "$recommend" auto "$knee" 3 || return 1
+    else
+        log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
+        tc_disable auto || return 1
+    fi
+    verify_system_state || return 1
+    measure_verify "$WIZARD_PEER" "$WIZARD_PORT" auto 6 || return 1
+    printf '\n'
+    log OK "自动调优和复验完成"
+    show_status
+    log INFO "扫描记录: $summary"
+}
+
+menu_run() {
+    local rc
+    set +e
+    ( set -Eeuo pipefail; "$@" )
+    rc=$?
+    set -e
+    (( rc == 0 )) || log WARN "操作失败（exit $rc）；系统不会把本次操作报告为成功"
+    return 0
+}
+
+measurement_menu() {
+    local choice spec
+    printf '%s\n' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/四流复验' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    [[ "$choice" == 0 ]] && return 0
+    interactive_select_peer || return 1
+    case "$choice" in
+        1) measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto 0 0 0 0 5 1 3 0.1 1 5000 ;;
+        2) measure_probe "$WIZARD_PEER" "$WIZARD_PORT" auto 8 4 ;;
+        3) measure_verify "$WIZARD_PEER" "$WIZARD_PORT" auto 8 ;;
+        *) die "无效选择" ;;
+    esac
+}
+
+tc_menu() {
+    local choice rate
+    printf '%s\n' '1) 状态/统计' '2) 临时试跑速率' '3) 持久启用速率' '4) 关闭整形并保留 FQ' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    case "$choice" in
+        1) tc_status auto ;;
+        2) read -r -p '速率 Mbit/s: ' rate; tc_trial "$rate" auto ;;
+        3) read -r -p '速率 Mbit/s: ' rate; tc_enable "$rate" auto 0 3 ;;
+        4) tc_disable auto ;;
+        0) return 0 ;;
+        *) die "无效选择" ;;
+    esac
+}
+
+kernel_menu() {
+    local choice
+    printf '%s\n' '1) 内核/BBR 状态' '2) 安装 XanMod LTS' '3) 安装 XanMod Main' '4) 卸载非运行中的 XanMod' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    case "$choice" in
+        1) kernel_status ;;
+        2) if confirm '安装 XanMod LTS？'; then kernel_install lts; else log INFO "已取消"; fi ;;
+        3) if confirm '安装 XanMod Main？'; then kernel_install main; else log INFO "已取消"; fi ;;
+        4) kernel_remove ;;
+        0) return 0 ;;
+        *) die "无效选择" ;;
+    esac
+}
+
+dns_menu() {
+    local choice
+    printf '%s\n' '1) 状态' '2) 自动选择 DoT/普通 DNS' '3) 强制 DoT' '4) 普通 DNS' '5) 恢复 DNS 基线' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    case "$choice" in 1) dns_status ;; 2) dns_apply auto ;; 3) dns_apply dot ;; 4) dns_apply plain ;; 5) if confirm '恢复 DNS 基线？'; then dns_restore; else log INFO "已取消"; fi ;; 0) return 0 ;; *) die "无效选择" ;; esac
+}
+
+ipv6_menu() {
+    local choice
+    printf '%s\n' '1) 状态' '2) 临时禁用' '3) 永久禁用' '4) 恢复 IPv6 基线' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    case "$choice" in 1) ipv6_status ;; 2) ipv6_disable temporary ;; 3) ipv6_disable permanent ;; 4) if confirm '恢复 IPv6 基线？'; then ipv6_restore; else log INFO "已取消"; fi ;; 0) return 0 ;; *) die "无效选择" ;; esac
+}
+
+maintenance_menu() {
+    local choice
+    printf '%s\n' '1) 查看基线' '2) 恢复首次可信基线' '3) 检查更新' '4) 卸载（保留基线）' '5) 完全清理状态' '0) 返回'
+    read -r -p '选择: ' choice || return 0
+    case "$choice" in
+        1) baseline_info ;;
+        2) if confirm '恢复首次可信基线？'; then restore_baseline; else log INFO "已取消"; fi ;;
+        3) self_update ;;
+        4) if confirm '卸载管理组件？'; then uninstall_managed 0; else log INFO "已取消"; fi ;;
+        5) if confirm '永久删除全部状态和基线？'; then uninstall_managed 1; else log INFO "已取消"; fi ;;
+        0) return 0 ;;
+        *) die "无效选择" ;;
+    esac
+}
+
 interactive_menu() {
     local choice
     while true; do
         printf '\n%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
-        printf '%s\n' '1) 系统/网卡检测' '2) 安装 BBR + FQ' '3) 自动测量 policer 拐点' '4) TC 状态' \
-            '5) 完整状态' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复基线' '0) 退出'
+        printf '%s\n' '1) 自动调优（推荐）' '2) 安装/刷新 BBR + FQ' '3) 测量与复验' '4) TC 整形管理' \
+            '5) 完整状态与一致性验证' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复/更新/卸载' '0) 退出'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
-            1) cmd_detect ;;
-            2) cmd_install ;;
-            3) read -r -p 'iperf3 peer: ' peer; cmd_measure sweep --peer "$peer" ;;
-            4) cmd_tc status ;;
-            5) show_status ;;
-            6) kernel_status ;;
-            7) dns_status ;;
-            8) ipv6_status ;;
-            9) confirm '恢复首次可信基线？' && restore_baseline ;;
+            1) menu_run auto_tune_wizard ;;
+            2) menu_run cmd_install ;;
+            3) menu_run measurement_menu ;;
+            4) menu_run tc_menu ;;
+            5) show_status; menu_run verify_system_state ;;
+            6) menu_run kernel_menu ;;
+            7) menu_run dns_menu ;;
+            8) menu_run ipv6_menu ;;
+            9) menu_run maintenance_menu ;;
             0) return 0 ;;
             *) log WARN "无效选择" ;;
         esac
@@ -1682,8 +2142,12 @@ interactive_menu() {
 main() {
     trap cleanup_core EXIT
     local command="${1:-}"; [[ -n "$command" ]] && shift || true
-    if [[ -z "$command" ]]; then [[ -t 0 ]] && interactive_menu || show_help; return; fi
+    if [[ -z "$command" ]]; then
+        if [[ -t 0 ]]; then interactive_menu; else show_help; fi
+        return
+    fi
     case "$command" in
+        auto) auto_tune_wizard ;;
         detect) cmd_detect "$@" ;;
         install) cmd_install "$@" ;;
         explain) cmd_explain "$@" ;;
@@ -1694,6 +2158,7 @@ main() {
         dns) cmd_dns "$@" ;;
         ipv6) cmd_ipv6 "$@" ;;
         baseline) cmd_baseline "$@" ;;
+        verify) verify_system_state ;;
         restore) restore_baseline ;;
         uninstall)
             case "${1:-}" in "") uninstall_managed 0 ;; --purge-state) uninstall_managed 1 ;; *) die "uninstall 只接受 --purge-state" ;; esac

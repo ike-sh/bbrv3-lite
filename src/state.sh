@@ -3,13 +3,13 @@
 # -----------------------------------------------------------------------------
 
 ensure_state_layout() {
-    mkdir -p -- "$STATE_DIR" "$HISTORY_DIR"
+    mkdir -p -- "$STATE_DIR" "$HISTORY_DIR" || return 1
     chmod 0700 "$STATE_DIR" "$HISTORY_DIR" 2>/dev/null || true
     if [[ ! -f "$STATE_DIR/manifest" ]]; then
         local temp
         temp=$(mktemp) || return 1
         printf 'SCHEMA\t%s\nCREATED_AT\t%s\nCREATED_BY\t%s\n' "$STATE_SCHEMA" "$(utc_now)" "$SCRIPT_VERSION" > "$temp"
-        atomic_install "$temp" "$STATE_DIR/manifest" 0600
+        atomic_install "$temp" "$STATE_DIR/manifest" 0600 || { rm -f -- "$temp"; return 1; }
         rm -f -- "$temp"
     fi
 }
@@ -39,10 +39,10 @@ import_legacy_baseline() {
 backup_path() {
     local source="$1" name="$2"
     if [[ -e "$source" || -L "$source" ]]; then
-        cp -a -- "$source" "$BASELINE_DIR/$name"
-        printf 'present\n' > "$BASELINE_DIR/${name}.state"
+        cp -a -- "$source" "$BASELINE_DIR/$name" || return 1
+        printf 'present\n' > "$BASELINE_DIR/${name}.state" || return 1
     else
-        printf 'absent\n' > "$BASELINE_DIR/${name}.state"
+        printf 'absent\n' > "$BASELINE_DIR/${name}.state" || return 1
     fi
 }
 
@@ -56,12 +56,17 @@ capture_runtime_sysctls() {
         value=$(sysctl -n "$key" 2>/dev/null || true)
         [[ -n "$value" ]] && printf '%s\t%s\n' "$key" "$value"
     done
+    return 0
 }
 
 capture_baseline() {
     local iface="$1" provenance="${2:-native}" temp_dir
-    ensure_state_layout
+    ensure_state_layout || return 1
     [[ ! -f "$BASELINE_DIR/manifest" ]] || return 0
+    if [[ -d "$BASELINE_DIR" ]]; then
+        log WARN "清理上次中断留下的不完整基线目录"
+        remove_tree_within "$BASELINE_DIR" "$STATE_DIR" || return 1
+    fi
     if managed_artifacts_exist && [[ "$provenance" != adopt-current ]]; then
         if [[ -d "$LEGACY_BACKUP_DIR" && -n "$(find "$LEGACY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
             import_legacy_baseline "$iface"
@@ -72,24 +77,24 @@ capture_baseline() {
         fi
     fi
     temp_dir=$(mktemp -d "${STATE_DIR}/.baseline.XXXXXX") || return 1
-    mkdir -p "$temp_dir/files"
-    mv "$temp_dir" "$BASELINE_DIR"
-    if ! {
-        printf 'SCHEMA\t%s\nCREATED_AT\t%s\nCREATED_BY\t%s\nPROVENANCE\t%s\nINTERFACE\t%s\n' \
-            "$STATE_SCHEMA" "$(utc_now)" "$SCRIPT_VERSION" "$provenance" "$iface" > "$BASELINE_DIR/manifest"
-        capture_runtime_sysctls > "$BASELINE_DIR/sysctl.tsv"
-        tc qdisc show dev "$iface" > "$BASELINE_DIR/qdisc.txt" 2>/dev/null || true
-        tc class show dev "$iface" > "$BASELINE_DIR/class.txt" 2>/dev/null || true
-        backup_path "$CONFIG_FILE" config
-        backup_path "$SYSCTL_FILE" sysctl
-        backup_path "$LEGACY_SYSCTL_FILE" legacy-sysctl
-        backup_path "$SERVICE_FILE" service
-        backup_path "$LEGACY_SERVICE_FILE" legacy-service
-        chmod -R go-rwx "$BASELINE_DIR"
-    }; then
-        remove_tree_within "$BASELINE_DIR" "$STATE_DIR"
-        return 1
-    fi
+    mkdir -p "$temp_dir/files" || { remove_tree_within "$temp_dir" "$STATE_DIR"; return 1; }
+    mv "$temp_dir" "$BASELINE_DIR" || { remove_tree_within "$temp_dir" "$STATE_DIR"; return 1; }
+    printf 'SCHEMA\t%s\nCREATED_AT\t%s\nCREATED_BY\t%s\nPROVENANCE\t%s\nINTERFACE\t%s\n' \
+        "$STATE_SCHEMA" "$(utc_now)" "$SCRIPT_VERSION" "$provenance" "$iface" > "$BASELINE_DIR/manifest.pending" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    capture_runtime_sysctls > "$BASELINE_DIR/sysctl.tsv" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    tc qdisc show dev "$iface" > "$BASELINE_DIR/qdisc.txt" 2>/dev/null || true
+    tc class show dev "$iface" > "$BASELINE_DIR/class.txt" 2>/dev/null || true
+    ip -4 route show table all > "$BASELINE_DIR/routes-v4.txt" 2>/dev/null || true
+    ip -6 route show table all > "$BASELINE_DIR/routes-v6.txt" 2>/dev/null || true
+    ip -4 route show default > "$BASELINE_DIR/default-route-v4.txt" 2>/dev/null || true
+    ip -6 route show default > "$BASELINE_DIR/default-route-v6.txt" 2>/dev/null || true
+    backup_path "$CONFIG_FILE" config || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    backup_path "$SYSCTL_FILE" sysctl || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    backup_path "$LEGACY_SYSCTL_FILE" legacy-sysctl || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    backup_path "$SERVICE_FILE" service || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    backup_path "$LEGACY_SERVICE_FILE" legacy-service || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    chmod -R go-rwx "$BASELINE_DIR" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    mv "$BASELINE_DIR/manifest.pending" "$BASELINE_DIR/manifest" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
     log OK "已保存不可覆盖的初始基线: $BASELINE_DIR ($provenance)"
 }
 
@@ -106,16 +111,17 @@ restore_backed_path() {
     local target="$1" name="$2" state
     [[ -f "$BASELINE_DIR/${name}.state" ]] || return 0
     state=$(<"$BASELINE_DIR/${name}.state")
-    rm -f -- "$target"
-    if [[ "$state" == present ]]; then cp -a -- "$BASELINE_DIR/$name" "$target"; fi
+    rm -f -- "$target" || return 1
+    if [[ "$state" == present ]]; then cp -a -- "$BASELINE_DIR/$name" "$target" || return 1; fi
 }
 
 restore_runtime_sysctls() {
-    local key value
+    local key value rc=0
     [[ -f "$BASELINE_DIR/sysctl.tsv" ]] || return 0
     while IFS=$'\t' read -r key value; do
-        [[ -n "$key" ]] && sysctl -q -w "$key=$value" || true
+        if [[ -n "$key" ]] && ! sysctl -q -w "$key=$value"; then log WARN "无法恢复 sysctl: $key"; rc=1; fi
     done < "$BASELINE_DIR/sysctl.tsv"
+    return "$rc"
 }
 
 baseline_info() {

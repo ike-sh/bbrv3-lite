@@ -49,23 +49,26 @@ apt_network_guard() {
 }
 
 kernel_status() {
+    local cc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
     printf '%-18s %s\n' "Running kernel" "$(uname -r)"
     printf '%-18s %s\n' "Architecture" "$(uname -m)"
     printf '%-18s %s\n' "x86-64 level" "$(detect_x86_level 2>/dev/null || echo n/a)"
     printf '%-18s %s\n' "Secure Boot" "$(secure_boot_enabled && echo enabled || echo disabled/unknown)"
     printf '%-18s %s\n' "BBR module" "$(modinfo tcp_bbr 2>/dev/null | awk '/^version:/ {print $2; found=1} END{if(!found)print "available/unknown version"}')"
+    printf '%-18s %s\n' "BBR generation" "$(bbr_generation_status "$cc")"
     dpkg-query -W -f='${Package}\t${Version}\n' 'linux-*xanmod*' 2>/dev/null || true
 }
 
 kernel_install() {
-    require_root; acquire_lock
+    require_root || return 1; acquire_lock || return 1
     local track="${1:-lts}" codename level package key_tmp keyring_tmp source_tmp
     [[ "$track" == lts || "$track" == main ]] || { die "--track 只支持 lts/main"; return 1; }
     [[ "$(os_id)" == debian || "$(os_id)" == ubuntu ]] || { die "XanMod 自动安装只支持 Debian/Ubuntu"; return 1; }
     [[ "$(uname -m)" == x86_64 ]] || { die "XanMod 官方 APT 仅支持 amd64；ARM64 请使用发行版内核或审计后的社区构建"; return 1; }
     is_container && { die "容器中不能更换宿主机内核"; return 1; }
     secure_boot_enabled && { die "检测到 Secure Boot 已启用；请先准备签名/MOK 或关闭后再安装"; return 1; }
-    require_commands apt-get apt-cache curl gpg
+    require_commands apt-get apt-cache curl gpg || return 1
     codename=$(os_codename); [[ -n "$codename" ]] || { die "无法读取 VERSION_CODENAME"; return 1; }
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
@@ -76,11 +79,11 @@ kernel_install() {
     keyring_tmp=$(mktemp) || { rm -f "$key_tmp"; return 1; }
     gpg --dearmor --yes -o "$keyring_tmp" "$key_tmp"
     rm -f "$key_tmp"
-    atomic_install "$keyring_tmp" /etc/apt/keyrings/xanmod-archive-keyring.gpg 0644
+    atomic_install "$keyring_tmp" /etc/apt/keyrings/xanmod-archive-keyring.gpg 0644 || { rm -f "$keyring_tmp"; return 1; }
     rm -f "$keyring_tmp"
     source_tmp=$(mktemp) || return 1
     printf 'deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org %s main\n' "$codename" > "$source_tmp"
-    atomic_install "$source_tmp" /etc/apt/sources.list.d/xanmod-release.list 0644
+    atomic_install "$source_tmp" /etc/apt/sources.list.d/xanmod-release.list 0644 || { rm -f "$source_tmp"; return 1; }
     rm -f "$source_tmp"
     apt-get update
     level=$(detect_x86_level); package=$(select_xanmod_package "$level" "$track") || return 1
@@ -92,7 +95,7 @@ kernel_install() {
 }
 
 kernel_remove() {
-    require_root; acquire_lock
+    require_root || return 1; acquire_lock || return 1
     local -a packages=() safe=() package
     mapfile -t packages < <(dpkg-query -W -f='${Package}\n' 'linux-*xanmod*' 2>/dev/null | sort -u)
     ((${#packages[@]})) || { log INFO "没有已安装的 XanMod 包"; return 0; }

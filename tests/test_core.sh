@@ -147,6 +147,54 @@ test_systemd_generation() {
     if grep -Eq 'TC_RATE_MBIT|TC_INTERFACE' "$SERVICE_FILE"; then fail "parameters hard-coded into unit"; fi
 }
 
+test_peer_parser() {
+    parse_peer_spec 'iperf.example.com:5202'
+    assert_eq iperf.example.com "$PEER_HOST" "peer host parser"
+    assert_eq 5202 "$PEER_PORT" "peer port parser"
+    parse_peer_spec '[2001:db8::1]:5203'
+    assert_eq '2001:db8::1' "$PEER_HOST" "IPv6 peer parser"
+    assert_eq 5203 "$PEER_PORT" "IPv6 peer port parser"
+    if parse_peer_spec 'bad peer:5201' >/dev/null 2>&1; then fail "unsafe peer accepted"; fi
+}
+
+test_process_substitution_source_resolution() {
+    local downloaded="$TEST_ROOT/downloaded.sh" resolved
+    rm -f -- "$PERSIST_SCRIPT"
+    current_script_path() { return 1; }
+    verified_download_current_script() { cp "$ROOT_DIR/net-tcp-tune.sh" "$1"; }
+    resolved=$(resolve_install_source "$downloaded")
+    assert_eq "$downloaded" "$resolved" "downloaded install source"
+    [[ -f "$downloaded" ]] || fail "downloaded source not materialized"
+}
+
+test_sweep_without_knee_does_not_recommend_ceiling() {
+    local summary
+    require_root() { :; }; acquire_lock() { :; }; tc_dependencies() { :; }; require_commands() { :; }
+    peer_port_open() { :; }; detect_interface() { printf 'eth0\n'; }; qdisc_guard() { :; }
+    measure_begin() { MEASURE_IFACE=eth0; }; measure_restore() { :; }; traffic_report() { :; }
+    apply_fq() { :; }; apply_shaping() { :; }
+    sample_repeated() {
+        local label="$6" rate=100
+        [[ "$label" =~ (rate|refine|confirm)-([0-9]+) ]] && rate="${BASH_REMATCH[2]}"
+        printf '%s\t0\t1000000\t0.00000\n' "$rate"
+    }
+    measure_sweep example.com 5201 auto 100 80 130 10 3 1 3 0.1 1 5000
+    summary="$MEASURE_RUN_DIR/summary.tsv"
+    assert_eq 1 "$(summary_value "$summary" NO_KNEE)" "no-knee marker"
+    assert_eq '' "$(summary_value "$summary" RECOMMEND)" "no-knee recommendation"
+}
+
+test_install_failure_is_not_success() {
+    local output="$TEST_ROOT/install-failure.log"
+    require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
+    detect_interface() { printf 'eth0\n'; }; capture_baseline() { :; }; migrate_legacy_config() { :; }
+    load_config() { reset_config; }; apply_sysctl_profile() { :; }; apply_fq() { :; }; apply_initial_windows() { :; }
+    save_config() { :; }; install_persistence() { return 9; }; systemctl() { fail "systemctl called after persistence failure"; }
+    if install_base_tuning auto balanced mixed 0 0 >"$output" 2>&1; then fail "persistence failure reported success"; fi
+    if grep -Fq '基础调优已安装' "$output"; then fail "success message printed after failure"; fi
+    grep -Fq '持久化安装失败' "$output" || fail "partial-runtime failure was not explained"
+}
+
 test_config_parser
 test_legacy_migration
 test_profile_math
@@ -154,4 +202,8 @@ test_legacy_baseline_reference
 test_tc_transaction
 test_measurement_math_and_history
 test_systemd_generation
+test_peer_parser
+test_sweep_without_knee_does_not_recommend_ceiling
+test_process_substitution_source_resolution
+test_install_failure_is_not_success
 echo "core tests: OK"

@@ -9,6 +9,73 @@ MEASURE_RX_START=0
 MEASURE_RESULT_FILE=""
 MEASURE_RUN_DIR=""
 
+# Public endpoints are opt-in and used only by the interactive auto-tune wizard.
+# Providers and test traffic are disclosed before execution; a private iperf3 peer is preferred.
+PUBLIC_PEER_POOL=$(cat <<'EOF'
+speedtest.hkg12.hk.leaseweb.net|香港|Leaseweb
+speedtest.sin1.sg.leaseweb.net|新加坡|Leaseweb
+speedtest.tyo11.jp.leaseweb.net|东京|Leaseweb
+speedtest.fra1.de.leaseweb.net|法兰克福|Leaseweb
+speedtest.ams2.nl.leaseweb.net|阿姆斯特丹|Leaseweb
+speedtest.lon12.uk.leaseweb.net|伦敦|Leaseweb
+speedtest.lax12.us.leaseweb.net|洛杉矶|Leaseweb
+speedtest.sfo12.us.leaseweb.net|旧金山|Leaseweb
+speedtest.dal13.us.leaseweb.net|达拉斯|Leaseweb
+speedtest.nyc1.us.leaseweb.net|纽约|Leaseweb
+sgp.proof.ovh.net|新加坡|OVH
+ams.speedtest.clouvider.net|阿姆斯特丹|Clouvider
+lon.speedtest.clouvider.net|伦敦|Clouvider
+EOF
+)
+
+parse_peer_spec() {
+    local spec="$1" default_port="${2:-5201}"
+    PEER_HOST=""; PEER_PORT="$default_port"
+    if [[ "$spec" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+        PEER_HOST="${BASH_REMATCH[1]}"; PEER_PORT="${BASH_REMATCH[2]}"
+    elif [[ "$spec" =~ ^([^:]+):([0-9]+)$ ]]; then
+        PEER_HOST="${BASH_REMATCH[1]}"; PEER_PORT="${BASH_REMATCH[2]}"
+    else
+        PEER_HOST="$spec"
+    fi
+    validate_peer "$PEER_HOST" "$PEER_PORT"
+}
+
+public_peer_port() {
+    local host="$1" port
+    for port in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200; do
+        if peer_port_open "$host" "$port"; then printf '%s\n' "$port"; return 0; fi
+    done
+    return 1
+}
+
+auto_pick_peer() {
+    require_commands ping timeout
+    local temp host region provider rtt port line max_rtt="${BBRV3_PEER_MAX_RTT:-120}"
+    temp=$(mktemp -d) || return 1
+    log INFO "正在按 RTT 筛选公共 iperf3 节点（Leaseweb / OVH / Clouvider）"
+    while IFS='|' read -r host region provider; do
+        [[ -n "$host" ]] || continue
+        (
+            rtt=$(median_ping_ms "$host")
+            [[ -n "$rtt" ]] && printf '%s\t%s\t%s\t%s\n' "$rtt" "$host" "$region" "$provider" > "$temp/${host//[^a-zA-Z0-9]/_}"
+        ) &
+    done <<< "$PUBLIC_PEER_POOL"
+    wait || true
+    while IFS=$'\t' read -r rtt host region provider; do
+        (( rtt <= max_rtt )) || { log INFO "$host ($region/$provider) RTT ${rtt}ms，过远跳过"; continue; }
+        if port=$(public_peer_port "$host"); then
+            log OK "公共对端可达: $host:$port ($region/$provider, RTT ${rtt}ms)"
+            rm -rf -- "$temp"
+            printf '%s:%s\n' "$host" "$port"
+            return 0
+        fi
+        log INFO "$host ($region/$provider) 当前无可用测试端口"
+    done < <(cat "$temp"/* 2>/dev/null | sort -n)
+    rm -rf -- "$temp"
+    die "120ms 内没有可用公共 iperf3 节点；请使用自有对端"
+}
+
 interface_counter() { cat "/sys/class/net/$1/statistics/$2" 2>/dev/null || printf '0\n'; }
 
 measure_begin() {
@@ -124,8 +191,8 @@ new_measure_run() {
 }
 
 measure_probe() {
-    require_root; acquire_lock; tc_dependencies
-    require_commands iperf3 jq timeout
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
+    require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" duration="$4" parallel="$5" iface dir row rc=0 speed estimate
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && is_uint "$parallel" && ((duration>=3 && duration<=120 && parallel>=1 && parallel<=32)) || { die "duration/parallel 超出安全范围"; return 1; }
@@ -152,8 +219,8 @@ measure_probe() {
 }
 
 measure_sweep() {
-    require_root; acquire_lock; tc_dependencies
-    require_commands iperf3 jq timeout
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
+    require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" nominal="$4" low="$5" high="$6" step="$7"
     local duration="$8" parallel="$9" margin="${10}" threshold="${11}" force_scan="${12}" cap="${13}"
     local iface dir baseline_row baseline_gp baseline_loss base_row base_loss rate row gp loss
@@ -190,9 +257,9 @@ measure_sweep() {
 
         if (( above_cap )); then
             :
-        elif (( ! force_scan )) && ! loss_spike "$baseline_loss" "$threshold" 0; then
+        elif (( ! force_scan )) && awk -v v="$baseline_loss" -v t="$threshold" 'BEGIN {limit=t*10; if(limit<1)limit=1; exit !(v>limit)}'; then
             no_knee=1
-            log WARN "不限速测试未出现明显重传跳变，不建议启用 HTB"
+            log WARN "不限速路径重传估算 ${baseline_loss}% 过高，无法可靠定位 policer；更换对端或使用 --force-scan"
         else
             apply_shaping "$iface" "$low" || rc=$?
             if (( rc == 0 )); then
@@ -204,14 +271,21 @@ measure_sweep() {
                 rc=2
             fi
             if (( rc == 0 )); then
+                local previous_gp previous_rate stall_count=0 stalled_rate=""
                 last_ok="$low"
+                previous_gp=$(cut -f1 <<< "$base_row"); previous_rate="$low"
                 for ((rate=low+step; rate<=high; rate+=step)); do
                     apply_shaping "$iface" "$rate" || { rc=$?; break; }
                     row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "rate-${rate}") || { rc=$?; break; }
                     gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
                     printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%%\n' "$rate" "$gp" "$loss"
                     if loss_spike "$loss" "$threshold" "$base_loss"; then broke_at="$rate"; break; fi
-                    last_ok="$rate"
+                    if awk -v g="$gp" -v p="$previous_gp" -v r="$rate" -v pr="$previous_rate" 'BEGIN {d=r-pr; gain=g-p; exit !(d>=1 && gain<d*0.25 && g<r*0.90)}'; then
+                        ((stall_count+=1)); [[ -n "$stalled_rate" ]] || stalled_rate="$rate"
+                        if (( stall_count >= 2 )); then broke_at="$stalled_rate"; break; fi
+                        continue
+                    fi
+                    stall_count=0; stalled_rate=""; last_ok="$rate"; previous_gp="$gp"; previous_rate="$rate"
                 done
             fi
             if (( rc == 0 )) && [[ -n "$broke_at" ]]; then
@@ -225,7 +299,7 @@ measure_sweep() {
                     last_ok="$rate"
                 done
             fi
-            if (( rc == 0 )) && [[ -n "$last_ok" ]]; then
+            if (( rc == 0 )) && [[ -n "$last_ok" && -n "$broke_at" ]]; then
                 recommend=$(( last_ok * (100-margin) / 100 )); ((recommend < 1)) && recommend=1
                 apply_shaping "$iface" "$recommend" || rc=$?
                 if (( rc == 0 )); then
@@ -250,6 +324,64 @@ measure_sweep() {
             log INFO "确认业务表现后执行: ${0##*/} tc enable ${recommend} --knee ${broke_at:-0} --margin ${margin} --interface ${requested}"
         fi
         log INFO "完整结果: $dir"
+    fi
+    traffic_report "$iface"
+    measure_restore || rc=$?
+    return "$rc"
+}
+
+summary_value() {
+    local file="$1" key="$2"
+    awk -F'\t' -v key="$key" '$1==key {print $2; exit}' "$file" 2>/dev/null
+}
+
+measure_path_check() {
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
+    require_commands iperf3 jq timeout || return 1
+    local peer="$1" port="$2" requested="$3" rate="$4" iface row gp loss rc=0
+    validate_peer "$peer" "$port" || return 1
+    is_uint "$rate" && (( rate > 0 )) || { die "路径检查速率无效"; return 1; }
+    iface=$(detect_interface "$requested") || return 1
+    qdisc_guard "$iface" || return 1
+    measure_begin "$iface" || return 1
+    log INFO "路径预检: 临时整形 ${rate} Mbit/s，检查对端是否足以承载测量"
+    if apply_shaping "$iface" "$rate" && row=$(sample_repeated "$peer" "$port" 5 1 1 path-check); then
+        gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
+        if awk -v g="$gp" -v r="$rate" 'BEGIN {exit !(g < r*0.60)}'; then
+            log ERR "路径预检仅达到 ${gp} Mbit/s，明显低于 ${rate} Mbit/s；更换更近对端后重试"
+            rc=2
+        elif loss_spike "$loss" 0.5 0; then
+            log ERR "路径预检重传比例过高 (${loss}%)；本次对端不适合寻找 policer 拐点"
+            rc=2
+        else
+            log OK "路径预检通过: ${gp} Mbit/s，重传估算 ${loss}%"
+        fi
+    else
+        rc=1
+    fi
+    measure_restore || rc=$?
+    return "$rc"
+}
+
+measure_verify() {
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
+    require_commands iperf3 jq timeout || return 1
+    local peer="$1" port="$2" requested="$3" duration="${4:-8}" iface dir one multi rc=0
+    validate_peer "$peer" "$port" || return 1
+    is_uint "$duration" && (( duration >= 3 && duration <= 120 )) || { die "verify duration 超出安全范围"; return 1; }
+    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return 1; }
+    iface=$(detect_interface "$requested") || return 1
+    qdisc_guard "$iface" || return 1
+    new_measure_run verify; dir="$MEASURE_RUN_DIR"
+    measure_begin "$iface" || return 1
+    one=$(sample_repeated "$peer" "$port" "$duration" 1 1 verify-single) || rc=$?
+    if (( rc == 0 )); then multi=$(sample_repeated "$peer" "$port" "$duration" 4 1 verify-four) || rc=$?; fi
+    if (( rc == 0 )); then
+        printf 'TYPE\tverify\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nSINGLE_MBIT\t%s\nSINGLE_RETRANS_EST_PERCENT\t%s\nFOUR_MBIT\t%s\nFOUR_RETRANS_EST_PERCENT\t%s\n' \
+            "$peer" "$port" "$iface" "$(cut -f1 <<< "$one")" "$(cut -f4 <<< "$one")" \
+            "$(cut -f1 <<< "$multi")" "$(cut -f4 <<< "$multi")" > "$dir/summary.tsv"
+        log OK "验证完成: 单流 $(cut -f1 <<< "$one") Mbit/s，多流 $(cut -f1 <<< "$multi") Mbit/s"
+        log INFO "验证结果: $dir"
     fi
     traffic_report "$iface"
     measure_restore || rc=$?

@@ -78,9 +78,13 @@ detect_profile() {
     printf '%-18s %s\n' "Interface" "$iface"
     printf '%-18s %s\n' "Driver" "$(detect_driver "$iface")"
     printf '%-18s %s\n' "MTU" "$(detect_mtu "$iface")"
-    printf '%-18s %s\n' "Link speed" "$(detect_link_speed "$iface") Mbps"
+    local link_speed
+    link_speed=$(detect_link_speed "$iface")
+    [[ "$link_speed" == unknown ]] || link_speed="${link_speed} Mbps"
+    printf '%-18s %s\n' "Link speed" "$link_speed"
     printf '%-18s %s\n' "RX queues" "$(detect_rx_queues "$iface")"
-    printf '%-18s %s\n' "Target RTT" "$rtt ms"
+    [[ "$rtt" == "not measured" || "$rtt" == unreachable ]] || rtt="${rtt} ms"
+    printf '%-18s %s\n' "Target RTT" "$rtt"
     printf '%-18s %s\n' "Congestion control" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
     printf '%-18s %s\n' "Available CC" "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)"
 }
@@ -90,7 +94,7 @@ install_measure_dependencies() {
     case "$(os_id)" in
         debian|ubuntu)
             apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 jq iproute2 procps util-linux
+            DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 jq iproute2 iputils-ping procps util-linux
             ;;
         *) die "自动安装依赖目前只支持 Debian/Ubuntu" ;;
     esac

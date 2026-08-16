@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate tag and release assets
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          grep -Fxq "SCRIPT_VERSION=\"$version\"" src/00-header.sh
+          SKIP_RELEASE_CHECKSUM=1 bash scripts/validate.sh
+          bash scripts/release.sh
+          git diff --exit-code -- net-tcp-tune.sh
+          sha256sum -c SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            net-tcp-tune.sh install-alias.sh SHA256SUMS \
+            --verify-tag --generate-notes --title "bbrv3-lite $GITHUB_REF_NAME"
