@@ -231,97 +231,156 @@ menu_run() {
     return 0
 }
 
-measurement_menu() {
-    local choice spec
-    printf '%s\n' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/四流复验' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    [[ "$choice" == 0 ]] && return 0
+ui_clear() {
+    [[ -t 1 && "${TERM:-dumb}" != dumb ]] || return 0
+    printf '\033[2J\033[H'
+}
+
+ui_pause() {
+    [[ -t 0 ]] || return 0
+    read -r -p '按 Enter 继续...' || true
+}
+
+submenu_run() {
+    ui_clear
+    if ! menu_run "$@"; then return 90; fi
+    ui_pause
+}
+
+invalid_menu_choice() {
+    log WARN "无效选择"
+    ui_pause
+}
+
+measurement_action() {
+    local choice="$1"
+    ensure_interactive_measure_dependencies || return 1
     interactive_select_peer || return 1
     case "$choice" in
         1) measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto 0 0 0 0 5 1 3 0.1 1 5000 ;;
         2) measure_probe "$WIZARD_PEER" "$WIZARD_PORT" auto 8 4 ;;
         3) measure_verify "$WIZARD_PEER" "$WIZARD_PORT" auto 8 ;;
-        *) die "无效选择" ;;
     esac
+}
+
+measurement_menu() {
+    local choice
+    while true; do
+        ui_clear
+        printf '%s\n' '测量与复验' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/四流复验' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1|2|3) submenu_run measurement_action "$choice" || return 90 ;;
+            0) return 0 ;;
+            *) invalid_menu_choice ;;
+        esac
+    done
 }
 
 tc_menu() {
     local choice rate
-    printf '%s\n' '1) 状态/统计' '2) 临时试跑速率' '3) 持久启用速率' '4) 关闭整形并保留 FQ' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    case "$choice" in
-        1) tc_status auto ;;
-        2) read -r -p '速率 Mbit/s: ' rate; tc_trial "$rate" auto ;;
-        3) read -r -p '速率 Mbit/s: ' rate; tc_enable "$rate" auto 0 3 ;;
-        4) tc_disable auto ;;
-        0) return 0 ;;
-        *) die "无效选择" ;;
-    esac
+    while true; do
+        ui_clear
+        printf '%s\n' 'TC 整形管理' '1) 状态/统计' '2) 临时试跑速率' '3) 持久启用速率' '4) 关闭整形并保留 FQ' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run tc_status auto || return 90 ;;
+            2) read -r -p '速率 Mbit/s: ' rate; submenu_run tc_trial "$rate" auto || return 90 ;;
+            3) read -r -p '速率 Mbit/s: ' rate; submenu_run tc_enable "$rate" auto 0 3 || return 90 ;;
+            4) submenu_run tc_disable auto || return 90 ;;
+            0) return 0 ;;
+            *) invalid_menu_choice ;;
+        esac
+    done
 }
 
 kernel_menu() {
     local choice
-    printf '%s\n' '1) 内核/BBR 状态' '2) 安装 XanMod LTS' '3) 安装 XanMod Main' '4) 卸载非运行中的 XanMod' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    case "$choice" in
-        1) kernel_status ;;
-        2) if confirm '安装 XanMod LTS？'; then kernel_install lts; else log INFO "已取消"; fi ;;
-        3) if confirm '安装 XanMod Main？'; then kernel_install main; else log INFO "已取消"; fi ;;
-        4) kernel_remove ;;
-        0) return 0 ;;
-        *) die "无效选择" ;;
-    esac
+    while true; do
+        ui_clear
+        printf '%s\n' 'XanMod 内核管理' '1) 内核/BBR 状态' '2) 安装 XanMod LTS' '3) 安装 XanMod Main' '4) 卸载非运行中的 XanMod' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run kernel_status || return 90 ;;
+            2) if confirm '安装 XanMod LTS？'; then submenu_run kernel_install lts || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            3) if confirm '安装 XanMod Main？'; then submenu_run kernel_install main || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            4) submenu_run kernel_remove || return 90 ;;
+            0) return 0 ;;
+            *) invalid_menu_choice ;;
+        esac
+    done
 }
 
 dns_menu() {
     local choice
-    printf '%s\n' '1) 状态' '2) 自动选择 DoT/普通 DNS' '3) 强制 DoT' '4) 普通 DNS' '5) 恢复 DNS 基线' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    case "$choice" in 1) dns_status ;; 2) dns_apply auto ;; 3) dns_apply dot ;; 4) dns_apply plain ;; 5) if confirm '恢复 DNS 基线？'; then dns_restore; else log INFO "已取消"; fi ;; 0) return 0 ;; *) die "无效选择" ;; esac
+    while true; do
+        ui_clear
+        printf '%s\n' 'DNS 管理' '1) 状态' '2) 自动选择 DoT/普通 DNS' '3) 强制 DoT' '4) 普通 DNS' '5) 恢复 DNS 基线' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run dns_status || return 90 ;; 2) submenu_run dns_apply auto || return 90 ;;
+            3) submenu_run dns_apply dot || return 90 ;; 4) submenu_run dns_apply plain || return 90 ;;
+            5) if confirm '恢复 DNS 基线？'; then submenu_run dns_restore || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            0) return 0 ;; *) invalid_menu_choice ;;
+        esac
+    done
 }
 
 ipv6_menu() {
     local choice
-    printf '%s\n' '1) 状态' '2) 临时禁用' '3) 永久禁用' '4) 恢复 IPv6 基线' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    case "$choice" in 1) ipv6_status ;; 2) ipv6_disable temporary ;; 3) ipv6_disable permanent ;; 4) if confirm '恢复 IPv6 基线？'; then ipv6_restore; else log INFO "已取消"; fi ;; 0) return 0 ;; *) die "无效选择" ;; esac
+    while true; do
+        ui_clear
+        printf '%s\n' 'IPv6 管理' '1) 状态' '2) 临时禁用' '3) 永久禁用' '4) 恢复 IPv6 基线' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run ipv6_status || return 90 ;; 2) submenu_run ipv6_disable temporary || return 90 ;;
+            3) submenu_run ipv6_disable permanent || return 90 ;;
+            4) if confirm '恢复 IPv6 基线？'; then submenu_run ipv6_restore || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            0) return 0 ;; *) invalid_menu_choice ;;
+        esac
+    done
 }
 
 maintenance_menu() {
     local choice
-    printf '%s\n' '1) 查看基线' '2) 只恢复首次可信基线' '3) 检查更新' \
-        '4) 完整卸载（恢复配置、删除 bbr，保留备份）' '5) 完整卸载并永久删除全部状态' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    case "$choice" in
-        1) baseline_info ;;
-        2) if confirm '恢复首次可信基线？'; then restore_baseline; else log INFO "已取消"; fi ;;
-        3) self_update ;;
-        4) if confirm '恢复可恢复配置并删除 bbr 命令？'; then uninstall_managed 0 && return 90; else log INFO "已取消"; fi ;;
-        5) if confirm '先恢复可恢复配置，再永久删除 bbr 命令、基线和历史？'; then uninstall_managed 1 && return 90; else log INFO "已取消"; fi ;;
-        0) return 0 ;;
-        *) die "无效选择" ;;
-    esac
+    while true; do
+        ui_clear
+        printf '%s\n' '恢复 / 更新 / 卸载' '1) 查看基线' '2) 只恢复首次可信基线' '3) 检查更新' \
+            '4) 完整卸载（恢复配置、删除 bbr，保留备份）' '5) 完整卸载并永久删除全部状态' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run baseline_info || return 90 ;;
+            2) if confirm '恢复首次可信基线？'; then submenu_run restore_baseline || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            3) submenu_run self_update || return 90 ;;
+            4) if confirm '恢复可恢复配置并删除 bbr 命令？'; then ui_clear; uninstall_managed 0 && return 90; else log INFO "已取消"; ui_pause; fi ;;
+            5) if confirm '先恢复可恢复配置，再永久删除 bbr 命令、基线和历史？'; then ui_clear; uninstall_managed 1 && return 90; else log INFO "已取消"; ui_pause; fi ;;
+            0) return 0 ;; *) invalid_menu_choice ;;
+        esac
+    done
 }
+
+status_and_verify_action() { show_status; verify_system_state; }
 
 interactive_menu() {
     local choice
     while true; do
+        ui_clear
         printf '\n%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
         printf '%s\n' '1) 自动调优（推荐）' '2) 安装/刷新 BBR + FQ' '3) 测量与复验' '4) TC 整形管理' \
             '5) 完整状态与一致性验证' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复/更新/卸载' '0) 退出'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
-            1) menu_run auto_tune_wizard ;;
-            2) menu_run cmd_install ;;
-            3) menu_run measurement_menu ;;
-            4) menu_run tc_menu ;;
-            5) show_status; menu_run verify_system_state ;;
-            6) menu_run kernel_menu ;;
-            7) menu_run dns_menu ;;
-            8) menu_run ipv6_menu ;;
+            1) submenu_run auto_tune_wizard ;;
+            2) submenu_run cmd_install ;;
+            3) if ! menu_run measurement_menu; then return 0; fi ;;
+            4) if ! menu_run tc_menu; then return 0; fi ;;
+            5) submenu_run status_and_verify_action ;;
+            6) if ! menu_run kernel_menu; then return 0; fi ;;
+            7) if ! menu_run dns_menu; then return 0; fi ;;
+            8) if ! menu_run ipv6_menu; then return 0; fi ;;
             9) if ! menu_run maintenance_menu; then return 0; fi ;;
             0) return 0 ;;
-            *) log WARN "无效选择" ;;
+            *) invalid_menu_choice ;;
         esac
     done
 }

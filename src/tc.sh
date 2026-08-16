@@ -9,13 +9,16 @@ root_qdisc_kind() {
     tc qdisc show dev "$1" 2>/dev/null | awk '$1=="qdisc" && $0 ~ / root / {print $2; exit}'
 }
 
-root_qdisc_replay_args() {
-    tc qdisc show dev "$1" 2>/dev/null | awk '
+qdisc_replay_args_from_stream() {
+    awk '
         $1=="qdisc" && $0~/ root / {
-            seen=0;
+            seen=0; bands=3;
             for(i=1;i<=NF;i++) {
                 if(seen) {
                     if($i=="refcnt") {i++; continue}
+                    if($i=="bands") {bands=$(i+1); i++; continue}
+                    if($i=="priomap") {i+=16; continue}
+                    if($i=="weights") {i+=bands; continue}
                     token=$i; if(token ~ /^[0-9]+p$/) sub(/p$/, "", token)
                     printf "%s%s", (out?" ":""), token; out=1
                 }
@@ -23,6 +26,10 @@ root_qdisc_replay_args() {
             }
             print ""; exit
         }'
+}
+
+root_qdisc_replay_args() {
+    tc qdisc show dev "$1" 2>/dev/null | qdisc_replay_args_from_stream
 }
 
 managed_htb() {
@@ -77,7 +84,7 @@ restore_action_qdisc() {
     [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
     case "$kind" in
         managed-htb) _apply_shaping_raw "$iface" "$rate" ;;
-        fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null || tc qdisc replace dev "$iface" root "$kind" >/dev/null ;;
+        fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null 2>&1 || tc qdisc replace dev "$iface" root "$kind" >/dev/null ;;
         ""|noqueue|mq|pfifo_fast) tc qdisc del dev "$iface" root >/dev/null 2>&1 || true ;;
         *) die "无法安全恢复 qdisc 类型: $kind" ;;
     esac
@@ -87,15 +94,10 @@ restore_qdisc_text_snapshot() {
     local iface="$1" file="$2" kind args_string
     local -a args=()
     kind=$(awk '$1=="qdisc" && $0~/ root / {print $2; exit}' "$file" 2>/dev/null)
-    args_string=$(awk '$1=="qdisc" && $0~/ root / {
-        seen=0; out=0;
-        for(i=1;i<=NF;i++) {
-            if(seen) {if($i=="refcnt"){i++;continue}; token=$i; if(token~/^[0-9]+p$/)sub(/p$/, "", token); printf "%s%s",(out?" ":""),token; out=1}
-            if($i=="root")seen=1
-        } print ""; exit}' "$file" 2>/dev/null)
+    args_string=$(qdisc_replay_args_from_stream < "$file")
     [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
     case "$kind" in
-        fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" || tc qdisc replace dev "$iface" root "$kind" ;;
+        fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null 2>&1 || tc qdisc replace dev "$iface" root "$kind" ;;
         ""|noqueue|mq|pfifo_fast) tc qdisc del dev "$iface" root 2>/dev/null || true ;;
         *) return 2 ;;
     esac

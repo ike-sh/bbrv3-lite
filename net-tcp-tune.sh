@@ -3,7 +3,7 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="7.0.3"
+SCRIPT_VERSION="7.0.4"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
@@ -640,13 +640,16 @@ root_qdisc_kind() {
     tc qdisc show dev "$1" 2>/dev/null | awk '$1=="qdisc" && $0 ~ / root / {print $2; exit}'
 }
 
-root_qdisc_replay_args() {
-    tc qdisc show dev "$1" 2>/dev/null | awk '
+qdisc_replay_args_from_stream() {
+    awk '
         $1=="qdisc" && $0~/ root / {
-            seen=0;
+            seen=0; bands=3;
             for(i=1;i<=NF;i++) {
                 if(seen) {
                     if($i=="refcnt") {i++; continue}
+                    if($i=="bands") {bands=$(i+1); i++; continue}
+                    if($i=="priomap") {i+=16; continue}
+                    if($i=="weights") {i+=bands; continue}
                     token=$i; if(token ~ /^[0-9]+p$/) sub(/p$/, "", token)
                     printf "%s%s", (out?" ":""), token; out=1
                 }
@@ -654,6 +657,10 @@ root_qdisc_replay_args() {
             }
             print ""; exit
         }'
+}
+
+root_qdisc_replay_args() {
+    tc qdisc show dev "$1" 2>/dev/null | qdisc_replay_args_from_stream
 }
 
 managed_htb() {
@@ -708,7 +715,7 @@ restore_action_qdisc() {
     [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
     case "$kind" in
         managed-htb) _apply_shaping_raw "$iface" "$rate" ;;
-        fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null || tc qdisc replace dev "$iface" root "$kind" >/dev/null ;;
+        fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null 2>&1 || tc qdisc replace dev "$iface" root "$kind" >/dev/null ;;
         ""|noqueue|mq|pfifo_fast) tc qdisc del dev "$iface" root >/dev/null 2>&1 || true ;;
         *) die "无法安全恢复 qdisc 类型: $kind" ;;
     esac
@@ -718,15 +725,10 @@ restore_qdisc_text_snapshot() {
     local iface="$1" file="$2" kind args_string
     local -a args=()
     kind=$(awk '$1=="qdisc" && $0~/ root / {print $2; exit}' "$file" 2>/dev/null)
-    args_string=$(awk '$1=="qdisc" && $0~/ root / {
-        seen=0; out=0;
-        for(i=1;i<=NF;i++) {
-            if(seen) {if($i=="refcnt"){i++;continue}; token=$i; if(token~/^[0-9]+p$/)sub(/p$/, "", token); printf "%s%s",(out?" ":""),token; out=1}
-            if($i=="root")seen=1
-        } print ""; exit}' "$file" 2>/dev/null)
+    args_string=$(qdisc_replay_args_from_stream < "$file")
     [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
     case "$kind" in
-        fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" || tc qdisc replace dev "$iface" root "$kind" ;;
+        fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null 2>&1 || tc qdisc replace dev "$iface" root "$kind" ;;
         ""|noqueue|mq|pfifo_fast) tc qdisc del dev "$iface" root 2>/dev/null || true ;;
         *) return 2 ;;
     esac
@@ -892,13 +894,16 @@ parse_peer_spec() {
 public_peer_port() {
     local host="$1" port
     for port in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200; do
-        if peer_port_open "$host" "$port"; then printf '%s\n' "$port"; return 0; fi
+        if peer_port_open "$host" "$port" && iperf_peer_usable "$host" "$port"; then
+            printf '%s\n' "$port"
+            return 0
+        fi
     done
     return 1
 }
 
 auto_pick_peer() {
-    require_commands ping timeout
+    require_commands ping timeout iperf3 jq
     local temp host region provider rtt port line max_rtt="${BBRV3_PEER_MAX_RTT:-120}"
     temp=$(mktemp -d) || return 1
     log INFO "正在按 RTT 筛选公共 iperf3 节点（Leaseweb / OVH / Clouvider）"
@@ -913,7 +918,7 @@ auto_pick_peer() {
     while IFS=$'\t' read -r rtt host region provider; do
         (( rtt <= max_rtt )) || { log INFO "$host ($region/$provider) RTT ${rtt}ms，过远跳过"; continue; }
         if port=$(public_peer_port "$host"); then
-            log OK "公共对端可达: $host:$port ($region/$provider, RTT ${rtt}ms)"
+            log OK "公共对端已通过 iperf3 预检: $host:$port ($region/$provider, RTT ${rtt}ms)"
             rm -rf -- "$temp"
             printf '%s:%s\n' "$host" "$port"
             return 0
@@ -973,10 +978,39 @@ peer_port_open() {
     timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$peer" "$port" >/dev/null 2>&1
 }
 
-iperf_sample() {
-    local peer="$1" port="$2" duration="$3" parallel="$4" json bps bytes retrans goodput ratio
+iperf_peer_usable() {
+    local peer="$1" port="$2" json rc=0 error bps
     json=$(mktemp) || return 1
-    if ! timeout "$((duration + 20))" iperf3 -c "$peer" -p "$port" -t "$duration" -P "$parallel" -J > "$json" 2>/dev/null; then
+    if timeout 8 iperf3 -c "$peer" -p "$port" -t 1 -P 1 -b 1M -J > "$json" 2>/dev/null; then
+        error=$(jq -r '.error // empty' "$json" 2>/dev/null || true)
+        bps=$(jq -r '.end.sum_sent.bits_per_second // .end.sum.bits_per_second // 0' "$json" 2>/dev/null || printf '0\n')
+        [[ -z "$error" ]] && is_decimal "$bps" && awk -v b="$bps" 'BEGIN {exit !(b>0)}' || rc=1
+    else
+        rc=$?
+    fi
+    rm -f -- "$json"
+    return "$rc"
+}
+
+iperf_sample() {
+    local peer="$1" port="$2" duration="$3" parallel="$4" json error_file rc=0 reason="" bps bytes retrans goodput ratio
+    json=$(mktemp) || return 1
+    error_file=$(mktemp) || { rm -f -- "$json"; return 1; }
+    if timeout "$((duration + 20))" iperf3 -c "$peer" -p "$port" -t "$duration" -P "$parallel" -J > "$json" 2> "$error_file"; then
+        reason=$(jq -r '.error // empty' "$json" 2>/dev/null || true)
+        [[ -z "$reason" ]] || rc=1
+    else
+        rc=$?
+        reason=$(jq -r '.error // empty' "$json" 2>/dev/null || true)
+        [[ -n "$reason" ]] || reason=$(<"$error_file")
+        [[ -n "$reason" ]] || { if (( rc == 124 )); then reason="连接或测试超时"; else reason="iperf3 退出码 $rc"; fi; }
+    fi
+    rm -f -- "$error_file"
+    if (( rc != 0 )); then
+        reason=${reason//$'\n'/ }
+        reason=${reason//$'\r'/}
+        reason=${reason:0:240}
+        log WARN "iperf3 $peer:$port 测试失败: $reason"
         rm -f -- "$json"
         return 1
     fi
@@ -984,7 +1018,10 @@ iperf_sample() {
     bytes=$(jq -r '.end.sum_sent.bytes // .end.sum.bytes // 0' "$json")
     retrans=$(jq -r '.end.sum_sent.retransmits // ([.end.streams[]?.sender.retransmits // 0] | add) // 0' "$json")
     rm -f -- "$json"
-    is_decimal "$bps" && is_uint "$bytes" && is_uint "$retrans" || return 1
+    if ! is_decimal "$bps" || ! is_uint "$bytes" || ! is_uint "$retrans" || (( bytes == 0 )) || ! awk -v b="$bps" 'BEGIN {exit !(b>0)}'; then
+        log WARN "iperf3 $peer:$port 返回的 JSON 结果不完整"
+        return 1
+    fi
     goodput=$(awk -v b="$bps" 'BEGIN {printf "%.2f", b/1000000}')
     # An estimate, not packet loss: iperf retransmits / estimated MSS-sized segments.
     ratio=$(awk -v r="$retrans" -v b="$bytes" 'BEGIN {n=b/1448; if(n<1)n=1; printf "%.5f", r*100/n}')
@@ -995,12 +1032,17 @@ median_numbers() { sort -n | awk '{a[NR]=$1} END {if(NR) {if(NR%2) print a[(NR+1
 
 sample_repeated() {
     local peer="$1" port="$2" duration="$3" parallel="$4" count="$5" label="$6"
-    local -a rows=() goodputs=() retrans=() bytes=() ratios=()
-    local row i
+    local -a goodputs=() retrans=() bytes=() ratios=()
+    local row i attempt attempts="${BBRV3_IPERF_ATTEMPTS:-3}"
+    is_uint "$attempts" && (( attempts >= 1 && attempts <= 5 )) || attempts=3
     for ((i=1; i<=count; i++)); do
         log INFO "$label: ${duration}s × ${parallel} flow(s), sample ${i}/${count}"
-        row=$(iperf_sample "$peer" "$port" "$duration" "$parallel") || { die "iperf3 测试失败或对端繁忙"; return 1; }
-        rows+=("$row")
+        row=""
+        for ((attempt=1; attempt<=attempts; attempt++)); do
+            if row=$(iperf_sample "$peer" "$port" "$duration" "$parallel"); then break; fi
+            (( attempt < attempts )) && { log WARN "2 秒后重试（${attempt}/${attempts}）"; sleep 2; }
+        done
+        [[ -n "$row" ]] || { die "iperf3 连续 ${attempts} 次失败；请稍后重试或更换对端"; return 1; }
         IFS=$'\t' read -r g r b l <<< "$row"
         goodputs+=("$g"); retrans+=("$r"); bytes+=("$b"); ratios+=("$l")
         [[ -n "$MEASURE_RESULT_FILE" ]] && printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(utc_now)" "$label" "$g" "$r" "$b" "$l" >> "$MEASURE_RESULT_FILE"
@@ -1085,7 +1127,11 @@ measure_sweep() {
     measure_begin "$iface" || return 1
 
     baseline_duration="$duration"; ((baseline_duration>5)) && baseline_duration=5
-    if ! apply_fq "$iface" || ! baseline_row=$(sample_repeated "$peer" "$port" "$baseline_duration" 1 2 unshaped); then rc=$?; else
+    if ! apply_fq "$iface"; then
+        rc=1
+    elif ! baseline_row=$(sample_repeated "$peer" "$port" "$baseline_duration" 1 2 unshaped); then
+        rc=1
+    else
         baseline_gp=$(cut -f1 <<< "$baseline_row"); baseline_loss=$(cut -f4 <<< "$baseline_row")
         if awk -v g="$baseline_gp" -v c="$cap" 'BEGIN {exit !(g>c)}'; then
             above_cap=1; no_knee=1
@@ -1096,6 +1142,11 @@ measure_sweep() {
         (( high > 0 )) || high=$(awk -v g="$baseline_gp" 'BEGIN {v=g*1.30; if(v<2)v=2; printf "%d", v}')
         (( step > 0 )) || { step=$((nominal / 20)); ((step < 5)) && step=5; }
         (( high > low )) || { die "扫描上界必须大于下界"; rc=1; }
+    fi
+
+    if (( rc == 0 && (step <= 0 || high <= low) )); then
+        die "无法根据基准样本生成有效扫描区间"
+        rc=1
     fi
 
     if (( rc == 0 )); then
@@ -2141,97 +2192,156 @@ menu_run() {
     return 0
 }
 
-measurement_menu() {
-    local choice spec
-    printf '%s\n' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/四流复验' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    [[ "$choice" == 0 ]] && return 0
+ui_clear() {
+    [[ -t 1 && "${TERM:-dumb}" != dumb ]] || return 0
+    printf '\033[2J\033[H'
+}
+
+ui_pause() {
+    [[ -t 0 ]] || return 0
+    read -r -p '按 Enter 继续...' || true
+}
+
+submenu_run() {
+    ui_clear
+    if ! menu_run "$@"; then return 90; fi
+    ui_pause
+}
+
+invalid_menu_choice() {
+    log WARN "无效选择"
+    ui_pause
+}
+
+measurement_action() {
+    local choice="$1"
+    ensure_interactive_measure_dependencies || return 1
     interactive_select_peer || return 1
     case "$choice" in
         1) measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto 0 0 0 0 5 1 3 0.1 1 5000 ;;
         2) measure_probe "$WIZARD_PEER" "$WIZARD_PORT" auto 8 4 ;;
         3) measure_verify "$WIZARD_PEER" "$WIZARD_PORT" auto 8 ;;
-        *) die "无效选择" ;;
     esac
+}
+
+measurement_menu() {
+    local choice
+    while true; do
+        ui_clear
+        printf '%s\n' '测量与复验' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/四流复验' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1|2|3) submenu_run measurement_action "$choice" || return 90 ;;
+            0) return 0 ;;
+            *) invalid_menu_choice ;;
+        esac
+    done
 }
 
 tc_menu() {
     local choice rate
-    printf '%s\n' '1) 状态/统计' '2) 临时试跑速率' '3) 持久启用速率' '4) 关闭整形并保留 FQ' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    case "$choice" in
-        1) tc_status auto ;;
-        2) read -r -p '速率 Mbit/s: ' rate; tc_trial "$rate" auto ;;
-        3) read -r -p '速率 Mbit/s: ' rate; tc_enable "$rate" auto 0 3 ;;
-        4) tc_disable auto ;;
-        0) return 0 ;;
-        *) die "无效选择" ;;
-    esac
+    while true; do
+        ui_clear
+        printf '%s\n' 'TC 整形管理' '1) 状态/统计' '2) 临时试跑速率' '3) 持久启用速率' '4) 关闭整形并保留 FQ' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run tc_status auto || return 90 ;;
+            2) read -r -p '速率 Mbit/s: ' rate; submenu_run tc_trial "$rate" auto || return 90 ;;
+            3) read -r -p '速率 Mbit/s: ' rate; submenu_run tc_enable "$rate" auto 0 3 || return 90 ;;
+            4) submenu_run tc_disable auto || return 90 ;;
+            0) return 0 ;;
+            *) invalid_menu_choice ;;
+        esac
+    done
 }
 
 kernel_menu() {
     local choice
-    printf '%s\n' '1) 内核/BBR 状态' '2) 安装 XanMod LTS' '3) 安装 XanMod Main' '4) 卸载非运行中的 XanMod' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    case "$choice" in
-        1) kernel_status ;;
-        2) if confirm '安装 XanMod LTS？'; then kernel_install lts; else log INFO "已取消"; fi ;;
-        3) if confirm '安装 XanMod Main？'; then kernel_install main; else log INFO "已取消"; fi ;;
-        4) kernel_remove ;;
-        0) return 0 ;;
-        *) die "无效选择" ;;
-    esac
+    while true; do
+        ui_clear
+        printf '%s\n' 'XanMod 内核管理' '1) 内核/BBR 状态' '2) 安装 XanMod LTS' '3) 安装 XanMod Main' '4) 卸载非运行中的 XanMod' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run kernel_status || return 90 ;;
+            2) if confirm '安装 XanMod LTS？'; then submenu_run kernel_install lts || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            3) if confirm '安装 XanMod Main？'; then submenu_run kernel_install main || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            4) submenu_run kernel_remove || return 90 ;;
+            0) return 0 ;;
+            *) invalid_menu_choice ;;
+        esac
+    done
 }
 
 dns_menu() {
     local choice
-    printf '%s\n' '1) 状态' '2) 自动选择 DoT/普通 DNS' '3) 强制 DoT' '4) 普通 DNS' '5) 恢复 DNS 基线' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    case "$choice" in 1) dns_status ;; 2) dns_apply auto ;; 3) dns_apply dot ;; 4) dns_apply plain ;; 5) if confirm '恢复 DNS 基线？'; then dns_restore; else log INFO "已取消"; fi ;; 0) return 0 ;; *) die "无效选择" ;; esac
+    while true; do
+        ui_clear
+        printf '%s\n' 'DNS 管理' '1) 状态' '2) 自动选择 DoT/普通 DNS' '3) 强制 DoT' '4) 普通 DNS' '5) 恢复 DNS 基线' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run dns_status || return 90 ;; 2) submenu_run dns_apply auto || return 90 ;;
+            3) submenu_run dns_apply dot || return 90 ;; 4) submenu_run dns_apply plain || return 90 ;;
+            5) if confirm '恢复 DNS 基线？'; then submenu_run dns_restore || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            0) return 0 ;; *) invalid_menu_choice ;;
+        esac
+    done
 }
 
 ipv6_menu() {
     local choice
-    printf '%s\n' '1) 状态' '2) 临时禁用' '3) 永久禁用' '4) 恢复 IPv6 基线' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    case "$choice" in 1) ipv6_status ;; 2) ipv6_disable temporary ;; 3) ipv6_disable permanent ;; 4) if confirm '恢复 IPv6 基线？'; then ipv6_restore; else log INFO "已取消"; fi ;; 0) return 0 ;; *) die "无效选择" ;; esac
+    while true; do
+        ui_clear
+        printf '%s\n' 'IPv6 管理' '1) 状态' '2) 临时禁用' '3) 永久禁用' '4) 恢复 IPv6 基线' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run ipv6_status || return 90 ;; 2) submenu_run ipv6_disable temporary || return 90 ;;
+            3) submenu_run ipv6_disable permanent || return 90 ;;
+            4) if confirm '恢复 IPv6 基线？'; then submenu_run ipv6_restore || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            0) return 0 ;; *) invalid_menu_choice ;;
+        esac
+    done
 }
 
 maintenance_menu() {
     local choice
-    printf '%s\n' '1) 查看基线' '2) 只恢复首次可信基线' '3) 检查更新' \
-        '4) 完整卸载（恢复配置、删除 bbr，保留备份）' '5) 完整卸载并永久删除全部状态' '0) 返回'
-    read -r -p '选择: ' choice || return 0
-    case "$choice" in
-        1) baseline_info ;;
-        2) if confirm '恢复首次可信基线？'; then restore_baseline; else log INFO "已取消"; fi ;;
-        3) self_update ;;
-        4) if confirm '恢复可恢复配置并删除 bbr 命令？'; then uninstall_managed 0 && return 90; else log INFO "已取消"; fi ;;
-        5) if confirm '先恢复可恢复配置，再永久删除 bbr 命令、基线和历史？'; then uninstall_managed 1 && return 90; else log INFO "已取消"; fi ;;
-        0) return 0 ;;
-        *) die "无效选择" ;;
-    esac
+    while true; do
+        ui_clear
+        printf '%s\n' '恢复 / 更新 / 卸载' '1) 查看基线' '2) 只恢复首次可信基线' '3) 检查更新' \
+            '4) 完整卸载（恢复配置、删除 bbr，保留备份）' '5) 完整卸载并永久删除全部状态' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run baseline_info || return 90 ;;
+            2) if confirm '恢复首次可信基线？'; then submenu_run restore_baseline || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            3) submenu_run self_update || return 90 ;;
+            4) if confirm '恢复可恢复配置并删除 bbr 命令？'; then ui_clear; uninstall_managed 0 && return 90; else log INFO "已取消"; ui_pause; fi ;;
+            5) if confirm '先恢复可恢复配置，再永久删除 bbr 命令、基线和历史？'; then ui_clear; uninstall_managed 1 && return 90; else log INFO "已取消"; ui_pause; fi ;;
+            0) return 0 ;; *) invalid_menu_choice ;;
+        esac
+    done
 }
+
+status_and_verify_action() { show_status; verify_system_state; }
 
 interactive_menu() {
     local choice
     while true; do
+        ui_clear
         printf '\n%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
         printf '%s\n' '1) 自动调优（推荐）' '2) 安装/刷新 BBR + FQ' '3) 测量与复验' '4) TC 整形管理' \
             '5) 完整状态与一致性验证' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复/更新/卸载' '0) 退出'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
-            1) menu_run auto_tune_wizard ;;
-            2) menu_run cmd_install ;;
-            3) menu_run measurement_menu ;;
-            4) menu_run tc_menu ;;
-            5) show_status; menu_run verify_system_state ;;
-            6) menu_run kernel_menu ;;
-            7) menu_run dns_menu ;;
-            8) menu_run ipv6_menu ;;
+            1) submenu_run auto_tune_wizard ;;
+            2) submenu_run cmd_install ;;
+            3) if ! menu_run measurement_menu; then return 0; fi ;;
+            4) if ! menu_run tc_menu; then return 0; fi ;;
+            5) submenu_run status_and_verify_action ;;
+            6) if ! menu_run kernel_menu; then return 0; fi ;;
+            7) if ! menu_run dns_menu; then return 0; fi ;;
+            8) if ! menu_run ipv6_menu; then return 0; fi ;;
             9) if ! menu_run maintenance_menu; then return 0; fi ;;
             0) return 0 ;;
-            *) log WARN "无效选择" ;;
+            *) invalid_menu_choice ;;
         esac
     done
 }

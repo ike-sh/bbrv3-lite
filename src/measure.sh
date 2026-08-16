@@ -44,13 +44,16 @@ parse_peer_spec() {
 public_peer_port() {
     local host="$1" port
     for port in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200; do
-        if peer_port_open "$host" "$port"; then printf '%s\n' "$port"; return 0; fi
+        if peer_port_open "$host" "$port" && iperf_peer_usable "$host" "$port"; then
+            printf '%s\n' "$port"
+            return 0
+        fi
     done
     return 1
 }
 
 auto_pick_peer() {
-    require_commands ping timeout
+    require_commands ping timeout iperf3 jq
     local temp host region provider rtt port line max_rtt="${BBRV3_PEER_MAX_RTT:-120}"
     temp=$(mktemp -d) || return 1
     log INFO "正在按 RTT 筛选公共 iperf3 节点（Leaseweb / OVH / Clouvider）"
@@ -65,7 +68,7 @@ auto_pick_peer() {
     while IFS=$'\t' read -r rtt host region provider; do
         (( rtt <= max_rtt )) || { log INFO "$host ($region/$provider) RTT ${rtt}ms，过远跳过"; continue; }
         if port=$(public_peer_port "$host"); then
-            log OK "公共对端可达: $host:$port ($region/$provider, RTT ${rtt}ms)"
+            log OK "公共对端已通过 iperf3 预检: $host:$port ($region/$provider, RTT ${rtt}ms)"
             rm -rf -- "$temp"
             printf '%s:%s\n' "$host" "$port"
             return 0
@@ -125,10 +128,39 @@ peer_port_open() {
     timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$peer" "$port" >/dev/null 2>&1
 }
 
-iperf_sample() {
-    local peer="$1" port="$2" duration="$3" parallel="$4" json bps bytes retrans goodput ratio
+iperf_peer_usable() {
+    local peer="$1" port="$2" json rc=0 error bps
     json=$(mktemp) || return 1
-    if ! timeout "$((duration + 20))" iperf3 -c "$peer" -p "$port" -t "$duration" -P "$parallel" -J > "$json" 2>/dev/null; then
+    if timeout 8 iperf3 -c "$peer" -p "$port" -t 1 -P 1 -b 1M -J > "$json" 2>/dev/null; then
+        error=$(jq -r '.error // empty' "$json" 2>/dev/null || true)
+        bps=$(jq -r '.end.sum_sent.bits_per_second // .end.sum.bits_per_second // 0' "$json" 2>/dev/null || printf '0\n')
+        [[ -z "$error" ]] && is_decimal "$bps" && awk -v b="$bps" 'BEGIN {exit !(b>0)}' || rc=1
+    else
+        rc=$?
+    fi
+    rm -f -- "$json"
+    return "$rc"
+}
+
+iperf_sample() {
+    local peer="$1" port="$2" duration="$3" parallel="$4" json error_file rc=0 reason="" bps bytes retrans goodput ratio
+    json=$(mktemp) || return 1
+    error_file=$(mktemp) || { rm -f -- "$json"; return 1; }
+    if timeout "$((duration + 20))" iperf3 -c "$peer" -p "$port" -t "$duration" -P "$parallel" -J > "$json" 2> "$error_file"; then
+        reason=$(jq -r '.error // empty' "$json" 2>/dev/null || true)
+        [[ -z "$reason" ]] || rc=1
+    else
+        rc=$?
+        reason=$(jq -r '.error // empty' "$json" 2>/dev/null || true)
+        [[ -n "$reason" ]] || reason=$(<"$error_file")
+        [[ -n "$reason" ]] || { if (( rc == 124 )); then reason="连接或测试超时"; else reason="iperf3 退出码 $rc"; fi; }
+    fi
+    rm -f -- "$error_file"
+    if (( rc != 0 )); then
+        reason=${reason//$'\n'/ }
+        reason=${reason//$'\r'/}
+        reason=${reason:0:240}
+        log WARN "iperf3 $peer:$port 测试失败: $reason"
         rm -f -- "$json"
         return 1
     fi
@@ -136,7 +168,10 @@ iperf_sample() {
     bytes=$(jq -r '.end.sum_sent.bytes // .end.sum.bytes // 0' "$json")
     retrans=$(jq -r '.end.sum_sent.retransmits // ([.end.streams[]?.sender.retransmits // 0] | add) // 0' "$json")
     rm -f -- "$json"
-    is_decimal "$bps" && is_uint "$bytes" && is_uint "$retrans" || return 1
+    if ! is_decimal "$bps" || ! is_uint "$bytes" || ! is_uint "$retrans" || (( bytes == 0 )) || ! awk -v b="$bps" 'BEGIN {exit !(b>0)}'; then
+        log WARN "iperf3 $peer:$port 返回的 JSON 结果不完整"
+        return 1
+    fi
     goodput=$(awk -v b="$bps" 'BEGIN {printf "%.2f", b/1000000}')
     # An estimate, not packet loss: iperf retransmits / estimated MSS-sized segments.
     ratio=$(awk -v r="$retrans" -v b="$bytes" 'BEGIN {n=b/1448; if(n<1)n=1; printf "%.5f", r*100/n}')
@@ -147,12 +182,17 @@ median_numbers() { sort -n | awk '{a[NR]=$1} END {if(NR) {if(NR%2) print a[(NR+1
 
 sample_repeated() {
     local peer="$1" port="$2" duration="$3" parallel="$4" count="$5" label="$6"
-    local -a rows=() goodputs=() retrans=() bytes=() ratios=()
-    local row i
+    local -a goodputs=() retrans=() bytes=() ratios=()
+    local row i attempt attempts="${BBRV3_IPERF_ATTEMPTS:-3}"
+    is_uint "$attempts" && (( attempts >= 1 && attempts <= 5 )) || attempts=3
     for ((i=1; i<=count; i++)); do
         log INFO "$label: ${duration}s × ${parallel} flow(s), sample ${i}/${count}"
-        row=$(iperf_sample "$peer" "$port" "$duration" "$parallel") || { die "iperf3 测试失败或对端繁忙"; return 1; }
-        rows+=("$row")
+        row=""
+        for ((attempt=1; attempt<=attempts; attempt++)); do
+            if row=$(iperf_sample "$peer" "$port" "$duration" "$parallel"); then break; fi
+            (( attempt < attempts )) && { log WARN "2 秒后重试（${attempt}/${attempts}）"; sleep 2; }
+        done
+        [[ -n "$row" ]] || { die "iperf3 连续 ${attempts} 次失败；请稍后重试或更换对端"; return 1; }
         IFS=$'\t' read -r g r b l <<< "$row"
         goodputs+=("$g"); retrans+=("$r"); bytes+=("$b"); ratios+=("$l")
         [[ -n "$MEASURE_RESULT_FILE" ]] && printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(utc_now)" "$label" "$g" "$r" "$b" "$l" >> "$MEASURE_RESULT_FILE"
@@ -237,7 +277,11 @@ measure_sweep() {
     measure_begin "$iface" || return 1
 
     baseline_duration="$duration"; ((baseline_duration>5)) && baseline_duration=5
-    if ! apply_fq "$iface" || ! baseline_row=$(sample_repeated "$peer" "$port" "$baseline_duration" 1 2 unshaped); then rc=$?; else
+    if ! apply_fq "$iface"; then
+        rc=1
+    elif ! baseline_row=$(sample_repeated "$peer" "$port" "$baseline_duration" 1 2 unshaped); then
+        rc=1
+    else
         baseline_gp=$(cut -f1 <<< "$baseline_row"); baseline_loss=$(cut -f4 <<< "$baseline_row")
         if awk -v g="$baseline_gp" -v c="$cap" 'BEGIN {exit !(g>c)}'; then
             above_cap=1; no_knee=1
@@ -248,6 +292,11 @@ measure_sweep() {
         (( high > 0 )) || high=$(awk -v g="$baseline_gp" 'BEGIN {v=g*1.30; if(v<2)v=2; printf "%d", v}')
         (( step > 0 )) || { step=$((nominal / 20)); ((step < 5)) && step=5; }
         (( high > low )) || { die "扫描上界必须大于下界"; rc=1; }
+    fi
+
+    if (( rc == 0 && (step <= 0 || high <= low) )); then
+        die "无法根据基准样本生成有效扫描区间"
+        rc=1
     fi
 
     if (( rc == 0 )); then

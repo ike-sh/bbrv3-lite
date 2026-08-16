@@ -91,6 +91,17 @@ test_legacy_baseline_reference() {
     rm -rf "$BASELINE_DIR" "$LEGACY_BACKUP_DIR" "$PERSIST_DIR"
 }
 
+test_qdisc_replay_filters_kernel_runtime_fields() {
+    local args
+    tc() {
+        [[ "$*" == 'qdisc show dev eth0' ]] || return 0
+        echo 'qdisc fq 8001: root refcnt 2 limit 10000p flow_limit 100p bands 3 priomap 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 weights 589824 196608 65536 quantum 3028b horizon 10s horizon_drop'
+    }
+    args=$(root_qdisc_replay_args eth0)
+    [[ "$args" == *'limit 10000'* && "$args" == *'flow_limit 100'* && "$args" == *'quantum 3028b'* ]] || fail "stable FQ arguments were not retained: $args"
+    [[ "$args" != *bands* && "$args" != *priomap* && "$args" != *weights* ]] || fail "kernel runtime FQ fields were replayed: $args"
+}
+
 test_tc_transaction() {
     local MOCK_ROOT=fq MOCK_CLASS=0 MOCK_LEAF=0 MOCK_RATE=0 MOCK_FAIL_LEAF=0
     tc_dependencies() { :; }
@@ -185,6 +196,15 @@ test_uninstall_restores_before_removal() {
     assert_eq ' tcp dns ipv6 cli' "$events" "uninstall restore/delete order"
 }
 
+test_submenu_stays_until_explicit_return() {
+    local output count
+    dns_status() { printf 'dns-ok\n'; }
+    output=$(dns_menu <<< $'1\n0\n')
+    count=$(grep -c '^DNS 管理$' <<< "$output")
+    assert_eq 2 "$count" "submenu render count"
+    grep -Fq dns-ok <<< "$output" || fail "submenu action did not run"
+}
+
 test_menu_exits_after_uninstall_signal() {
     maintenance_menu() { return 90; }
     if menu_run maintenance_menu; then fail "menu ignored uninstall exit signal"; fi
@@ -198,6 +218,12 @@ test_peer_parser() {
     assert_eq '2001:db8::1' "$PEER_HOST" "IPv6 peer parser"
     assert_eq 5203 "$PEER_PORT" "IPv6 peer port parser"
     if parse_peer_spec 'bad peer:5201' >/dev/null 2>&1; then fail "unsafe peer accepted"; fi
+}
+
+test_public_peer_requires_real_iperf_preflight() {
+    peer_port_open() { :; }
+    iperf_peer_usable() { [[ "$2" == 5203 ]]; }
+    assert_eq 5203 "$(public_peer_port example.com)" "public iperf preflight"
 }
 
 test_process_substitution_source_resolution() {
@@ -225,6 +251,17 @@ test_sweep_without_knee_does_not_recommend_ceiling() {
     summary="$MEASURE_RUN_DIR/summary.tsv"
     assert_eq 1 "$(summary_value "$summary" NO_KNEE)" "no-knee marker"
     assert_eq '' "$(summary_value "$summary" RECOMMEND)" "no-knee recommendation"
+}
+
+test_sweep_baseline_failure_stops_and_restores() {
+    local output="$TEST_ROOT/sweep-baseline-failure.log" restore_count=0
+    sample_repeated() { return 7; }
+    measure_restore() { ((restore_count+=1)); }
+    if measure_sweep example.com 5201 auto 0 0 0 0 3 1 3 0.1 1 5000 >"$output" 2>&1; then
+        fail "failed baseline sample reported sweep success"
+    fi
+    assert_eq 1 "$restore_count" "qdisc restore after baseline failure"
+    if grep -Fqi 'division by 0' "$output"; then fail "baseline failure reached invalid sweep arithmetic"; fi
 }
 
 test_persistence_restart_hands_off_lock() {
@@ -271,14 +308,18 @@ test_config_parser
 test_legacy_migration
 test_profile_math
 test_legacy_baseline_reference
+test_qdisc_replay_filters_kernel_runtime_fields
 test_tc_transaction
 test_measurement_math_and_history
 test_systemd_generation
 test_cli_command_removal_is_scoped
 test_uninstall_restores_before_removal
+test_submenu_stays_until_explicit_return
 test_menu_exits_after_uninstall_signal
 test_peer_parser
+test_public_peer_requires_real_iperf_preflight
 test_sweep_without_knee_does_not_recommend_ceiling
+test_sweep_baseline_failure_stops_and_restores
 test_persistence_restart_hands_off_lock
 test_dependency_install_is_minimal
 test_process_substitution_source_resolution

@@ -30,6 +30,16 @@ restore_action_qdisc "$iface" "$snapshot"
 rm -f "$snapshot"
 tc -d qdisc show dev "$iface" | grep -q 'fq_codel.*limit 2048p.*target 7ms'
 
+# Newer kernels expose read-only FQ band maps. A snapshot must ignore those
+# presentation fields and still restore the original FQ root successfully.
+tc qdisc replace dev "$iface" root fq
+snapshot=$(mktemp)
+action_qdisc_snapshot "$iface" "$snapshot"
+apply_shaping "$iface" 100
+restore_action_qdisc "$iface" "$snapshot"
+rm -f "$snapshot"
+[[ "$(root_qdisc_kind "$iface")" == fq ]]
+
 apply_shaping "$iface" 100
 apply_fq "$iface"
 [[ "$(root_qdisc_kind "$iface")" == fq ]]
