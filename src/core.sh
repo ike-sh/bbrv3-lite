@@ -69,11 +69,20 @@ confirm() {
 
 LOCK_HELD=0
 acquire_lock() {
+    local wait_seconds="${1:-0}"
     (( LOCK_HELD == 0 )) || return 0
-    require_commands flock
-    mkdir -p -- "$(dirname "$LOCK_FILE")"
-    exec {BBRV3_LOCK_FD}>"$LOCK_FILE"
-    if ! flock -n "$BBRV3_LOCK_FD"; then
+    require_commands flock || return 1
+    is_uint "$wait_seconds" || { die "锁等待时间无效: $wait_seconds"; return 1; }
+    mkdir -p -- "$(dirname "$LOCK_FILE")" || return 1
+    exec {BBRV3_LOCK_FD}>"$LOCK_FILE" || return 1
+    if (( wait_seconds > 0 )); then
+        if ! flock -w "$wait_seconds" "$BBRV3_LOCK_FD"; then
+            exec {BBRV3_LOCK_FD}>&-
+            die "等待 ${wait_seconds}s 后仍有另一个 ${SCRIPT_NAME} 进程占用配置锁"
+            return 1
+        fi
+    elif ! flock -n "$BBRV3_LOCK_FD"; then
+        exec {BBRV3_LOCK_FD}>&-
         die "已有另一个 ${SCRIPT_NAME} 进程正在修改网络配置"
         return 1
     fi

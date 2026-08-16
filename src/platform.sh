@@ -91,10 +91,20 @@ detect_profile() {
 
 install_measure_dependencies() {
     require_root
+    local -a packages=()
+    command_exists iperf3 || packages+=(iperf3)
+    command_exists jq || packages+=(jq)
+    command_exists ping || packages+=(iputils-ping)
+    if ! command_exists ip || ! command_exists tc; then packages+=(iproute2); fi
+    command_exists sysctl || packages+=(procps)
+    command_exists flock || packages+=(util-linux)
+    command_exists timeout || packages+=(coreutils)
+    ((${#packages[@]} > 0)) || { log OK "测量依赖已经齐全"; return 0; }
     case "$(os_id)" in
         debian|ubuntu)
+            log INFO "仅安装缺少的依赖包: ${packages[*]}"
             apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 jq iproute2 iputils-ping procps util-linux
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
             ;;
         *) die "自动安装依赖目前只支持 Debian/Ubuntu" ;;
     esac

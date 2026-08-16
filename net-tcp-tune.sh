@@ -3,7 +3,7 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="7.0.1"
+SCRIPT_VERSION="7.0.2"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
@@ -84,11 +84,20 @@ confirm() {
 
 LOCK_HELD=0
 acquire_lock() {
+    local wait_seconds="${1:-0}"
     (( LOCK_HELD == 0 )) || return 0
-    require_commands flock
-    mkdir -p -- "$(dirname "$LOCK_FILE")"
-    exec {BBRV3_LOCK_FD}>"$LOCK_FILE"
-    if ! flock -n "$BBRV3_LOCK_FD"; then
+    require_commands flock || return 1
+    is_uint "$wait_seconds" || { die "锁等待时间无效: $wait_seconds"; return 1; }
+    mkdir -p -- "$(dirname "$LOCK_FILE")" || return 1
+    exec {BBRV3_LOCK_FD}>"$LOCK_FILE" || return 1
+    if (( wait_seconds > 0 )); then
+        if ! flock -w "$wait_seconds" "$BBRV3_LOCK_FD"; then
+            exec {BBRV3_LOCK_FD}>&-
+            die "等待 ${wait_seconds}s 后仍有另一个 ${SCRIPT_NAME} 进程占用配置锁"
+            return 1
+        fi
+    elif ! flock -n "$BBRV3_LOCK_FD"; then
+        exec {BBRV3_LOCK_FD}>&-
         die "已有另一个 ${SCRIPT_NAME} 进程正在修改网络配置"
         return 1
     fi
@@ -357,10 +366,20 @@ detect_profile() {
 
 install_measure_dependencies() {
     require_root
+    local -a packages=()
+    command_exists iperf3 || packages+=(iperf3)
+    command_exists jq || packages+=(jq)
+    command_exists ping || packages+=(iputils-ping)
+    if ! command_exists ip || ! command_exists tc; then packages+=(iproute2); fi
+    command_exists sysctl || packages+=(procps)
+    command_exists flock || packages+=(util-linux)
+    command_exists timeout || packages+=(coreutils)
+    ((${#packages[@]} > 0)) || { log OK "测量依赖已经齐全"; return 0; }
     case "$(os_id)" in
         debian|ubuntu)
+            log INFO "仅安装缺少的依赖包: ${packages[*]}"
             apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 jq iproute2 iputils-ping procps util-linux
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
             ;;
         *) die "自动安装依赖目前只支持 Debian/Ubuntu" ;;
     esac
@@ -1327,9 +1346,24 @@ EOF
 }
 
 restart_and_verify_persistence() {
-    systemctl restart "$SERVICE_NAME" || { die "持久化服务启动失败"; return 1; }
-    systemctl is-enabled --quiet "$SERVICE_NAME" || { die "持久化服务未启用"; return 1; }
-    systemctl is-active --quiet "$SERVICE_NAME" || { die "持久化服务未通过运行验证"; return 1; }
+    local had_lock="$LOCK_HELD" rc=0 reason=""
+    # The service runs this script's `apply`, which takes the same global lock.
+    # Hand the lock over before systemctl starts it, then reacquire for a caller
+    # (notably the auto wizard) that still has more transactional work to do.
+    (( had_lock == 0 )) || release_lock
+    if ! systemctl restart "$SERVICE_NAME"; then rc=1; reason="持久化服务启动失败"
+    elif ! systemctl is-enabled --quiet "$SERVICE_NAME"; then rc=1; reason="持久化服务未启用"
+    elif ! systemctl is-active --quiet "$SERVICE_NAME"; then rc=1; reason="持久化服务未通过运行验证"
+    fi
+    if (( had_lock )) && ! acquire_lock 30; then
+        die "服务运行后无法重新取得配置锁；请稍后重试"
+        return 1
+    fi
+    if (( rc != 0 )); then
+        systemctl status "$SERVICE_NAME" --no-pager -l >&2 || true
+        die "$reason"
+        return 1
+    fi
 }
 
 remove_persistence() {
@@ -1342,7 +1376,7 @@ remove_persistence() {
 }
 
 apply_configured_state() {
-    require_root || return 1; acquire_lock || return 1
+    require_root || return 1; acquire_lock 30 || return 1
     load_config || return 1
     (( BBR_ENABLED == 1 )) || return 0
     apply_sysctl_profile || return 1

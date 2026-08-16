@@ -184,6 +184,35 @@ test_sweep_without_knee_does_not_recommend_ceiling() {
     assert_eq '' "$(summary_value "$summary" RECOMMEND)" "no-knee recommendation"
 }
 
+test_persistence_restart_hands_off_lock() {
+    local events=""
+    LOCK_HELD=1
+    release_lock() { events+=" release"; LOCK_HELD=0; }
+    acquire_lock() { events+=" acquire:${1:-0}"; LOCK_HELD=1; }
+    systemctl() {
+        case "$1" in
+            restart) assert_eq 0 "$LOCK_HELD" "service restart while parent lock released"; events+=" restart" ;;
+            is-enabled) events+=" enabled" ;;
+            is-active) events+=" active" ;;
+            *) fail "unexpected systemctl call: $*" ;;
+        esac
+    }
+    restart_and_verify_persistence
+    assert_eq ' release restart enabled active acquire:30' "$events" "persistence lock handoff order"
+    assert_eq 1 "$LOCK_HELD" "parent lock reacquired"
+}
+
+test_dependency_install_is_minimal() {
+    local apt_calls=""
+    command_exists() { [[ "$1" != iperf3 && "$1" != jq ]]; }
+    os_id() { printf 'debian\n'; }
+    apt-get() { apt_calls+=" [$*]"; }
+    install_measure_dependencies
+    [[ "$apt_calls" == *'[update -qq]'* ]] || fail "apt update not called"
+    [[ "$apt_calls" == *'[install -y --no-install-recommends iperf3 jq]'* ]] || fail "missing packages were not installed"
+    [[ "$apt_calls" != *util-linux* && "$apt_calls" != *iproute2* ]] || fail "already-present packages were unnecessarily requested"
+}
+
 test_install_failure_is_not_success() {
     local output="$TEST_ROOT/install-failure.log"
     require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
@@ -204,6 +233,8 @@ test_measurement_math_and_history
 test_systemd_generation
 test_peer_parser
 test_sweep_without_knee_does_not_recommend_ceiling
+test_persistence_restart_hands_off_lock
+test_dependency_install_is_minimal
 test_process_substitution_source_resolution
 test_install_failure_is_not_success
 echo "core tests: OK"

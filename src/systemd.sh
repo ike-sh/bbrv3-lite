@@ -108,9 +108,24 @@ EOF
 }
 
 restart_and_verify_persistence() {
-    systemctl restart "$SERVICE_NAME" || { die "持久化服务启动失败"; return 1; }
-    systemctl is-enabled --quiet "$SERVICE_NAME" || { die "持久化服务未启用"; return 1; }
-    systemctl is-active --quiet "$SERVICE_NAME" || { die "持久化服务未通过运行验证"; return 1; }
+    local had_lock="$LOCK_HELD" rc=0 reason=""
+    # The service runs this script's `apply`, which takes the same global lock.
+    # Hand the lock over before systemctl starts it, then reacquire for a caller
+    # (notably the auto wizard) that still has more transactional work to do.
+    (( had_lock == 0 )) || release_lock
+    if ! systemctl restart "$SERVICE_NAME"; then rc=1; reason="持久化服务启动失败"
+    elif ! systemctl is-enabled --quiet "$SERVICE_NAME"; then rc=1; reason="持久化服务未启用"
+    elif ! systemctl is-active --quiet "$SERVICE_NAME"; then rc=1; reason="持久化服务未通过运行验证"
+    fi
+    if (( had_lock )) && ! acquire_lock 30; then
+        die "服务运行后无法重新取得配置锁；请稍后重试"
+        return 1
+    fi
+    if (( rc != 0 )); then
+        systemctl status "$SERVICE_NAME" --no-pager -l >&2 || true
+        die "$reason"
+        return 1
+    fi
 }
 
 remove_persistence() {
@@ -123,7 +138,7 @@ remove_persistence() {
 }
 
 apply_configured_state() {
-    require_root || return 1; acquire_lock || return 1
+    require_root || return 1; acquire_lock 30 || return 1
     load_config || return 1
     (( BBR_ENABLED == 1 )) || return 0
     apply_sysctl_profile || return 1

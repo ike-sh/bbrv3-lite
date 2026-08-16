@@ -7,10 +7,11 @@ MODE="install"
 CHANNEL="release"
 VERSION=""
 PREFIX=""
+RUN_AFTER_INSTALL=0
 
 usage() {
     cat <<EOF
-Usage: $0 [install|uninstall] [--channel release|main] [--version vX.Y.Z] [--prefix DIR]
+Usage: $0 [install|uninstall] [--channel release|main] [--version vX.Y.Z] [--prefix DIR] [--run]
 
 Default: install the latest GitHub release after SHA256 verification.
 If a tag exists but its Release assets are missing, the installer securely falls back to that immutable tag.
@@ -24,6 +25,7 @@ while (($#)); do
         --channel) CHANNEL="${2:?missing channel}"; shift 2 ;;
         --version) VERSION="${2:?missing version}"; shift 2 ;;
         --prefix) PREFIX="${2:?missing prefix}"; shift 2 ;;
+        --run) RUN_AFTER_INSTALL=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -97,3 +99,7 @@ echo "installed: $TARGET"
 echo "source: $BASE"
 if [[ ":$PATH:" != *":$PREFIX:"* ]]; then echo "add $PREFIX to PATH before running: bbr"; fi
 echo "If an old shell function shadows the command, run: unset -f bbr 2>/dev/null; hash -r"
+if (( RUN_AFTER_INSTALL )); then
+    if { exec 3</dev/tty; } 2>/dev/null; then exec "$TARGET" <&3
+    else exec "$TARGET"; fi
+fi

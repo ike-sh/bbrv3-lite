@@ -12,7 +12,7 @@ for file in src/*.sh scripts/*.sh tests/*.sh install-alias.sh; do bash -n "$file
 bash -n net-tcp-tune.sh
 
 echo "==> Generated artifact markers"
-grep -Fq 'SCRIPT_VERSION="7.0.1"' net-tcp-tune.sh
+grep -Fq 'SCRIPT_VERSION="7.0.2"' net-tcp-tune.sh
 grep -Fq 'Configuration is data and is never sourced' net-tcp-tune.sh
 grep -Fq 'tc qdisc replace dev "$iface" root handle 1: htb default 10' net-tcp-tune.sh
 grep -Fq 'tc qdisc replace dev "$iface" parent 1:10 handle 10: fq' net-tcp-tune.sh
