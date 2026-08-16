@@ -126,16 +126,21 @@ verify_shaping() {
 }
 
 _apply_shaping_raw() {
-    local iface="$1" rate="$2" mtu burst quantum cburst
+    local iface="$1" rate="$2" mtu burst quantum cburst hierarchy_exists=0
     is_uint "$rate" && (( rate > 0 && rate <= 1000000 )) || { die "非法整形速率: $rate"; return 1; }
     mtu=$(detect_mtu "$iface"); is_uint "$mtu" || mtu=1500
     burst=$(calc_htb_burst "$rate" "$mtu")
     quantum=$(calc_htb_quantum "$mtu")
     cburst=$((mtu * 2))
-    tc qdisc replace dev "$iface" root handle 1: htb default 10 || return 1
+    managed_htb "$iface" && hierarchy_exists=1
+    if (( ! hierarchy_exists )); then
+        tc qdisc replace dev "$iface" root handle 1: htb default 10 || return 1
+    fi
     tc class replace dev "$iface" parent 1: classid 1:10 htb \
         rate "${rate}mbit" ceil "${rate}mbit" burst "$burst" cburst "$cburst" quantum "$quantum" || return 1
-    tc qdisc replace dev "$iface" parent 1:10 handle 10: fq || return 1
+    if (( ! hierarchy_exists )); then
+        tc qdisc replace dev "$iface" parent 1:10 handle 10: fq || return 1
+    fi
     verify_shaping "$iface"
 }
 

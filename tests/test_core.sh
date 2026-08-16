@@ -116,8 +116,18 @@ test_tc_transaction() {
                     htb) echo 'qdisc htb 1: root refcnt 2 default 0x10'; ((MOCK_LEAF)) && echo 'qdisc fq 10: parent 1:10 limit 10000p' ;;
                 esac ;;
             'class show dev eth0') ((MOCK_CLASS)) && echo "class htb 1:10 root rate ${MOCK_RATE}Mbit ceil ${MOCK_RATE}Mbit" || true ;;
-            'qdisc replace dev eth0 root handle 1: htb default 10') MOCK_ROOT=htb; MOCK_CLASS=0; MOCK_LEAF=0 ;;
-            class\ replace\ dev\ eth0\ parent\ 1:\ classid\ 1:10\ htb*) MOCK_CLASS=1; MOCK_RATE=300 ;;
+            'qdisc replace dev eth0 root handle 1: htb default 10')
+                [[ "$MOCK_ROOT" != htb ]] || return 95
+                MOCK_ROOT=htb; MOCK_CLASS=0; MOCK_LEAF=0
+                ;;
+            class\ replace\ dev\ eth0\ parent\ 1:\ classid\ 1:10\ htb*)
+                local arg next_is_rate=0
+                MOCK_CLASS=1
+                for arg in "$@"; do
+                    if (( next_is_rate )); then MOCK_RATE="${arg%mbit}"; break; fi
+                    [[ "$arg" == rate ]] && next_is_rate=1
+                done
+                ;;
             'qdisc replace dev eth0 parent 1:10 handle 10: fq') ((MOCK_FAIL_LEAF==0)) || return 1; MOCK_LEAF=1 ;;
             'qdisc replace dev eth0 root fq') MOCK_ROOT=fq; MOCK_CLASS=0; MOCK_LEAF=0 ;;
             'qdisc del dev eth0 root') MOCK_ROOT=fq; MOCK_CLASS=0; MOCK_LEAF=0 ;;
@@ -128,6 +138,11 @@ test_tc_transaction() {
     assert_eq htb "$MOCK_ROOT" "HTB root"
     assert_eq 1 "$MOCK_CLASS" "HTB class"
     assert_eq 1 "$MOCK_LEAF" "FQ leaf"
+
+    apply_shaping eth0 320
+    assert_eq htb "$MOCK_ROOT" "HTB root after in-place rate update"
+    assert_eq 320 "$MOCK_RATE" "in-place HTB class rate update"
+    assert_eq 1 "$MOCK_LEAF" "FQ leaf after in-place rate update"
 
     MOCK_ROOT=fq; MOCK_CLASS=0; MOCK_LEAF=0; MOCK_FAIL_LEAF=1
     if apply_shaping eth0 300; then fail "failed leaf reported success"; fi

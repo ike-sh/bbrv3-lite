@@ -41,6 +41,8 @@ rm -f "$snapshot"
 [[ "$(root_qdisc_kind "$iface")" == fq ]]
 
 apply_shaping "$iface" 100
+apply_shaping "$iface" 120
+[[ "$(managed_rate_mbit "$iface")" == 120 ]]
 apply_fq "$iface"
 [[ "$(root_qdisc_kind "$iface")" == fq ]]
 echo "tc integration test: OK ($iface)"
