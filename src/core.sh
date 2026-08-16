@@ -41,7 +41,7 @@ log() {
 
 die() { log ERR "$*"; return 1; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
-is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+is_uint() { [[ "$1" =~ ^(0|[1-9][0-9]{0,17})$ ]]; }
 is_decimal() { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
 
 require_root() {
@@ -138,4 +138,24 @@ human_bytes() {
     }'
 }
 
-cleanup_core() { release_lock; }
+cleanup_core() {
+    local rc=$?
+    if [[ -n "${MEASURE_IFACE:-}" && -n "${MEASURE_SNAPSHOT:-}" ]] && declare -F measure_restore >/dev/null; then
+        log WARN "进程退出时仍有测量快照，正在恢复操作前 qdisc"
+        measure_restore || true
+    fi
+    if [[ -n "${DNS_TRANSACTION_DIR:-}" ]] && declare -F dns_transaction_rollback >/dev/null; then
+        log WARN "进程退出时仍有未提交 DNS 事务，正在恢复操作前状态"
+        dns_transaction_rollback || true
+    fi
+    if [[ -n "${IPV6_TRANSACTION_DIR:-}" ]] && declare -F ipv6_transaction_rollback >/dev/null; then
+        log WARN "进程退出时仍有未提交 IPv6 事务，正在恢复操作前状态"
+        ipv6_transaction_rollback || true
+    fi
+    if [[ -n "${ACTION_TRANSACTION_DIR:-}" ]] && declare -F action_transaction_rollback >/dev/null; then
+        log WARN "进程退出时仍有未提交事务，正在恢复操作前状态"
+        action_transaction_rollback || true
+    fi
+    release_lock
+    return "$rc"
+}

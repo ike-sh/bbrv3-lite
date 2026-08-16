@@ -3,8 +3,8 @@
 # -----------------------------------------------------------------------------
 
 self_update() {
-    require_root || return 1; acquire_lock || return 1; require_commands curl awk sha256sum sort || return 1
-    local latest latest_version current target tmp base expected actual backup newest
+    require_root || return 1; acquire_lock || return 1; require_commands curl awk sha256sum sort install grep || return 1
+    local latest latest_version current target tmp base expected actual backup newest persist_distinct=0
     current=$(current_script_path 2>/dev/null || true)
     if [[ -z "$current" ]]; then
         current=$(command -v bbr 2>/dev/null || true)
@@ -33,12 +33,28 @@ self_update() {
     actual=$(sha256sum "$tmp/net-tcp-tune.sh" | awk '{print $1}')
     [[ -n "$expected" && "$actual" == "$expected" ]] || { rm -rf "$tmp"; die "SHA256 校验失败"; return 1; }
     bash -n "$tmp/net-tcp-tune.sh" || { rm -rf "$tmp"; die "新脚本语法检查失败"; return 1; }
+    grep -Fq 'SCRIPT_NAME="bbrv3-lite"' "$tmp/net-tcp-tune.sh" || { rm -rf "$tmp"; die "新脚本缺少项目标记"; return 1; }
     grep -q "SCRIPT_VERSION=\"${latest#v}\"" "$tmp/net-tcp-tune.sh" || { rm -rf "$tmp"; die "新脚本版本标记不匹配"; return 1; }
     target="$current"; backup="${current}.previous"
-    cp -a -- "$current" "$backup"
-    install -m 0755 "$tmp/net-tcp-tune.sh" "$target"
+    cp -a -- "$current" "$tmp/current.before" || { rm -rf "$tmp"; die "无法备份当前脚本"; return 1; }
+    atomic_install "$tmp/current.before" "$backup" 0755 || { rm -rf "$tmp"; die "无法写入上一版本备份: $backup"; return 1; }
     if [[ -e "$PERSIST_SCRIPT" && "$(readlink -f "$PERSIST_SCRIPT")" != "$(readlink -f "$target")" ]]; then
-        install -m 0755 "$tmp/net-tcp-tune.sh" "$PERSIST_SCRIPT"
+        persist_distinct=1
+    fi
+    if ! atomic_install "$tmp/net-tcp-tune.sh" "$target" 0755; then
+        rm -rf "$tmp"
+        die "更新当前 bbr 命令失败；原文件未替换"
+        return 1
+    fi
+    if (( persist_distinct )) && ! atomic_install "$tmp/net-tcp-tune.sh" "$PERSIST_SCRIPT" 0755; then
+        if ! atomic_install "$tmp/current.before" "$target" 0755; then
+            rm -rf "$tmp"
+            die "持久化副本更新失败，且当前命令自动回滚失败；上一版本仍保存在 $backup"
+            return 1
+        fi
+        rm -rf "$tmp"
+        die "持久化副本更新失败；当前 bbr 命令已回滚到更新前版本"
+        return 1
     fi
     rm -rf "$tmp"
     log OK "已更新到 $latest；上一版本保存在 $backup"

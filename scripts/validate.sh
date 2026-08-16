@@ -12,11 +12,17 @@ for file in src/*.sh scripts/*.sh tests/*.sh install-alias.sh; do bash -n "$file
 bash -n net-tcp-tune.sh
 
 echo "==> Generated artifact markers"
-grep -Fq 'SCRIPT_VERSION="7.0.6"' net-tcp-tune.sh
+grep -Fq 'SCRIPT_VERSION="7.0.7"' net-tcp-tune.sh
 grep -Fq 'Configuration is data and is never sourced' net-tcp-tune.sh
 grep -Fq 'tc qdisc replace dev "$iface" root handle 1: htb default 10' net-tcp-tune.sh
 grep -Fq 'tc qdisc replace dev "$iface" parent 1:10 handle 10: fq' net-tcp-tune.sh
 grep -Fq 'iperf3 -c "$peer" -p "$port" -t "$duration" -P "$parallel" -J' net-tcp-tune.sh
+grep -Fq 'TUNING_RTT_MS' net-tcp-tune.sh
+grep -Fq 'verify_sysctl_profile_runtime' net-tcp-tune.sh
+grep -Fq 'CONFIG_HZ' net-tcp-tune.sh
+grep -Fq 'verify_persistence_artifacts' net-tcp-tune.sh
+grep -Fq 'capture_unit_state' net-tcp-tune.sh
+grep -Fq 'refusing to overwrite an unmanaged file' install-alias.sh
 if grep -Eq 'source[[:space:]]+.*bbrv3-lite\.conf' net-tcp-tune.sh; then echo "unsafe config source detected" >&2; exit 1; fi
 
 echo "==> Core tests"

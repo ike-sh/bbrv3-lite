@@ -3,6 +3,7 @@
 # -----------------------------------------------------------------------------
 
 TC_SESSION_HTB_IFACE=""
+HTB_BURST_CAP=8388608
 
 tc_dependencies() { require_commands ip tc awk; }
 has_net_admin() { tc qdisc show >/dev/null 2>&1; }
@@ -158,13 +159,29 @@ restore_qdisc_text_snapshot() {
     esac
 }
 
+detect_kernel_hz() {
+    local file value
+    for file in "/boot/config-$(uname -r)" /proc/config; do
+        [[ -r "$file" ]] || continue
+        value=$(awk -F= '$1=="CONFIG_HZ" {print $2; exit}' "$file" 2>/dev/null || true)
+        if is_uint "${value:-}" && (( value >= 100 && value <= 2000 )); then printf '%s\n' "$value"; return 0; fi
+    done
+    if [[ -r /proc/config.gz ]] && command_exists zcat; then
+        value=$(zcat /proc/config.gz 2>/dev/null | awk -F= '$1=="CONFIG_HZ" {print $2; exit}' || true)
+        if is_uint "${value:-}" && (( value >= 100 && value <= 2000 )); then printf '%s\n' "$value"; return 0; fi
+    fi
+    # Debian/Ubuntu generic cloud kernels commonly use 250 Hz. USER_HZ from
+    # getconf CLK_TCK is deliberately not used because it is a different clock.
+    printf '250\n'
+}
+
 calc_htb_burst() {
     local rate="$1" hz mtu="$2" bytes
-    hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
-    is_uint "$hz" || hz=100
+    hz=$(detect_kernel_hz)
     bytes=$(( (rate * 1000000 + 8 * hz - 1) / (8 * hz) ))
     (( bytes < 32768 )) && bytes=32768
     (( bytes < mtu * 10 )) && bytes=$((mtu * 10))
+    (( bytes > HTB_BURST_CAP )) && bytes=$HTB_BURST_CAP
     printf '%s\n' "$bytes"
 }
 
@@ -235,18 +252,17 @@ apply_fq() {
 }
 
 tc_trial() {
-    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
+    require_root || return 1; require_host_network_control || return 1; acquire_lock || return 1; tc_dependencies || return 1
     local rate="$1" requested="${2:-auto}" iface
+    is_uint "$rate" && (( rate > 0 && rate <= 1000000 )) || { die "非法整形速率: $rate"; return 1; }
     iface=$(detect_interface "$requested") || return 1
     capture_baseline "$iface" || return 1
     apply_shaping "$iface" "$rate" || return 1
     log OK "临时整形已生效: $iface ${rate} Mbit（未写配置，重启后失效）"
 }
 
-tc_enable() {
-    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
-    local rate="$1" requested="${2:-auto}" knee="${3:-0}" margin="${4:-3}" iface
-    iface=$(detect_interface "$requested") || return 1
+tc_enable_steps() {
+    local iface="$1" rate="$2" requested="$3" knee="$4" margin="$5"
     capture_baseline "$iface" || return 1
     load_config || return 1
     TC_ENABLED=1; TC_INTERFACE="$requested"; TC_RATE_MBIT="$rate"; TC_KNEE_MBIT="$knee"; TC_MARGIN_PERCENT="$margin"
@@ -258,12 +274,21 @@ tc_enable() {
     log OK "整形已持久化: $iface ${rate} Mbit"
 }
 
-tc_disable() {
-    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
-    local requested="${1:-auto}" iface
-    load_config || return 1
-    [[ "$requested" == auto && "$TC_INTERFACE" != auto ]] && requested="$TC_INTERFACE"
+tc_enable() {
+    require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
+    acquire_lock || return 1; tc_dependencies || return 1
+    local rate="$1" requested="${2:-auto}" knee="${3:-0}" margin="${4:-3}" iface
+    is_uint "$rate" && (( rate > 0 && rate <= 1000000 )) || { die "非法整形速率: $rate"; return 1; }
+    is_uint "$knee" && (( knee <= 1000000 )) || { die "非法拐点速率: $knee"; return 1; }
+    is_uint "$margin" && (( margin <= 25 )) || { die "非法退让比例: $margin"; return 1; }
+    (( knee == 0 || knee >= rate )) || { die "拐点速率不能低于最终整形速率"; return 1; }
     iface=$(detect_interface "$requested") || return 1
+    qdisc_guard "$iface" || return 1
+    run_action_transaction "$iface" tc_enable_steps "$iface" "$rate" "$requested" "$knee" "$margin"
+}
+
+tc_disable_steps() {
+    local iface="$1"
     if managed_htb "$iface"; then apply_fq "$iface" || return 1
     elif [[ "$(root_qdisc_kind "$iface")" != fq ]]; then qdisc_guard "$iface" || return 1; apply_fq "$iface" || return 1; fi
     TC_ENABLED=0; TC_RATE_MBIT=0
@@ -271,6 +296,17 @@ tc_disable() {
     install_persistence || return 1
     restart_and_verify_persistence || return 1
     log OK "HTB 整形已关闭，BBR + FQ 保持启用"
+}
+
+tc_disable() {
+    require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
+    acquire_lock || return 1; tc_dependencies || return 1
+    local requested="${1:-auto}" iface
+    load_config || return 1
+    [[ "$requested" == auto && "$TC_INTERFACE" != auto ]] && requested="$TC_INTERFACE"
+    iface=$(detect_interface "$requested") || return 1
+    qdisc_guard "$iface" || return 1
+    run_action_transaction "$iface" tc_disable_steps "$iface"
 }
 
 tc_status() {

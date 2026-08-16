@@ -2,6 +2,25 @@
 # Sysctl: auditable balanced/adaptive profiles, BBR verification and route IW.
 # -----------------------------------------------------------------------------
 
+BALANCED_BUFFER_MAX=16777216
+ADAPTIVE_BUFFER_FLOOR=16777216
+BUFFER_ABSOLUTE_CAP=268435456
+
+role_tuning_rtt_floor() {
+    case "$1" in
+        proxy) printf '150\n' ;;
+        mixed|bulk) printf '100\n' ;;
+        *) die "未知业务用途: $1"; return 1 ;;
+    esac
+}
+
+recommended_tuning_rtt() {
+    local role="$1" observed="${2:-0}" floor
+    is_uint "$observed" && (( observed <= 60000 )) || { die "观测 RTT 无效: $observed"; return 1; }
+    floor=$(role_tuning_rtt_floor "$role") || return 1
+    if (( observed > floor )); then printf '%s\n' "$observed"; else printf '%s\n' "$floor"; fi
+}
+
 ensure_bbr_available() {
     modprobe tcp_bbr 2>/dev/null || true
     local available
@@ -14,10 +33,10 @@ ensure_bbr_available() {
 
 buffer_profile_values() {
     local profile="$1" role="$2" bandwidth="$3" rtt="$4"
-    local ram bdp max cap floor=4194304 absolute_cap=268435456 default_r=131072 default_w=65536
+    local ram bdp max cap floor="$ADAPTIVE_BUFFER_FLOOR" absolute_cap="$BUFFER_ABSOLUTE_CAP" default_r=131072 default_w=65536
     ram=$(memory_mb)
     if [[ "$profile" == balanced ]]; then
-        BUFFER_MAX=16777216
+        BUFFER_MAX="$BALANCED_BUFFER_MAX"
         BUFFER_R_DEFAULT=$default_r
         BUFFER_W_DEFAULT=$default_w
         BUFFER_REASON="balanced fixed 16 MiB ceiling"
@@ -42,14 +61,14 @@ buffer_profile_values() {
     BUFFER_MAX=$max
     BUFFER_R_DEFAULT=$default_r
     BUFFER_W_DEFAULT=$default_w
-    BUFFER_REASON="2xBDP bounded by RAM/32 and 256 MiB"
+    BUFFER_REASON="2xBDP with 16 MiB floor, bounded by RAM/32 and 256 MiB"
 }
 
 render_sysctl_profile() {
     buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" || return 1
     cat <<EOF
 # Managed by ${SCRIPT_NAME} v${SCRIPT_VERSION}
-# profile=${SYSCTL_PROFILE} role=${ROLE} bandwidth=${BANDWIDTH_MBIT}Mbps rtt=${RTT_MS}ms
+# profile=${SYSCTL_PROFILE} role=${ROLE} bandwidth=${BANDWIDTH_MBIT}Mbps tuning_rtt=${RTT_MS}ms
 # buffer_max=${BUFFER_MAX} (${BUFFER_REASON})
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -69,6 +88,46 @@ explain_sysctl_profile() {
     printf '\n# Deliberately untouched: tcp_mem, tcp_adv_win_scale, TIME_WAIT, VM, file limits, RPS/RFS.\n'
 }
 
+normalize_sysctl_words() { awk '{$1=$1; print}'; }
+
+verify_sysctl_profile_runtime() {
+    local key expected actual rc=0
+    buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" || return 1
+    while IFS=$'\t' read -r key expected; do
+        actual=$(sysctl -n "$key" 2>/dev/null | normalize_sysctl_words || true)
+        expected=$(normalize_sysctl_words <<< "$expected")
+        if [[ "$actual" != "$expected" ]]; then
+            log ERR "sysctl 不一致: $key=${actual:-unavailable}（期望 $expected）"
+            rc=1
+        fi
+    done < <(printf '%s\t%s\n' \
+        net.core.default_qdisc fq \
+        net.ipv4.tcp_congestion_control bbr \
+        net.core.rmem_max "$BUFFER_MAX" \
+        net.core.wmem_max "$BUFFER_MAX" \
+        net.ipv4.tcp_rmem "4096 $BUFFER_R_DEFAULT $BUFFER_MAX" \
+        net.ipv4.tcp_wmem "4096 $BUFFER_W_DEFAULT $BUFFER_MAX" \
+        net.ipv4.tcp_mtu_probing 1 \
+        net.ipv4.tcp_fastopen 3 \
+        net.core.somaxconn 4096 \
+        net.core.netdev_max_backlog 4096)
+    return "$rc"
+}
+
+verify_sysctl_profile_file() {
+    local expected
+    [[ -f "$SYSCTL_FILE" ]] || { log ERR "sysctl 持久化文件缺失: $SYSCTL_FILE"; return 1; }
+    command_exists cmp || { die "缺少命令: cmp"; return 1; }
+    expected=$(mktemp) || return 1
+    if ! render_sysctl_profile > "$expected"; then rm -f -- "$expected"; return 1; fi
+    if ! cmp -s "$expected" "$SYSCTL_FILE"; then
+        rm -f -- "$expected"
+        log ERR "sysctl 持久化文件与当前配置不一致: $SYSCTL_FILE"
+        return 1
+    fi
+    rm -f -- "$expected"
+}
+
 write_sysctl_profile() {
     local temp
     temp=$(mktemp) || return 1
@@ -78,13 +137,25 @@ write_sysctl_profile() {
 }
 
 apply_sysctl_profile() {
-    require_commands sysctl modprobe
+    local mode="${1:-persistent}" temp=""
+    [[ "$mode" == persistent || "$mode" == runtime ]] || { die "sysctl 应用模式只支持 persistent/runtime"; return 1; }
+    require_commands sysctl modprobe || return 1
     ensure_bbr_available || return 1
-    write_sysctl_profile || return 1
-    sysctl -q -p "$SYSCTL_FILE" || { die "sysctl 应用失败"; return 1; }
-    [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == bbr ]] || { die "BBR 验证失败"; return 1; }
-    [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == fq ]] || { die "default_qdisc 验证失败"; return 1; }
-    log OK "BBR 与 ${SYSCTL_PROFILE} sysctl 已生效"
+    if [[ "$mode" == runtime ]]; then
+        temp=$(mktemp) || return 1
+        render_sysctl_profile > "$temp" || { rm -f -- "$temp"; return 1; }
+        sysctl -q -p "$temp" || { rm -f -- "$temp"; die "sysctl 应用失败"; return 1; }
+        rm -f -- "$temp"
+    else
+        write_sysctl_profile || return 1
+        sysctl -q -p "$SYSCTL_FILE" || { die "sysctl 应用失败"; return 1; }
+    fi
+    verify_sysctl_profile_runtime || { die "受管 sysctl 运行时验证失败"; return 1; }
+    if [[ "$mode" == runtime ]]; then
+        log OK "BBR 与 ${SYSCTL_PROFILE} sysctl 已生效（临时）"
+    else
+        log OK "BBR 与 ${SYSCTL_PROFILE} sysctl 已生效"
+    fi
 }
 
 apply_initial_windows() {

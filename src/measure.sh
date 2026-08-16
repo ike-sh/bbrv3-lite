@@ -53,7 +53,7 @@ public_peer_port() {
 }
 
 auto_pick_peer() {
-    require_commands ping timeout iperf3 jq
+    require_commands ping timeout iperf3 jq || return 1
     local temp host region provider rtt port line max_rtt="${BBRV3_PEER_MAX_RTT:-120}"
     temp=$(mktemp -d) || return 1
     log INFO "正在按 RTT 筛选公共 iperf3 节点（Leaseweb / OVH / Clouvider）"
@@ -123,7 +123,7 @@ traffic_report() {
 }
 
 validate_peer() {
-    [[ "$1" =~ ^[a-zA-Z0-9._:-]{1,253}$ ]] || { die "非法 peer: $1"; return 1; }
+    [[ "$1" != -* && "$1" =~ ^[a-zA-Z0-9._:-]{1,253}$ ]] || { die "非法 peer: $1"; return 1; }
     is_uint "$2" && (( $2 >= 1 && $2 <= 65535 )) || { die "非法端口: $2"; return 1; }
 }
 
@@ -218,16 +218,46 @@ loss_spike() {
     }'
 }
 
+minimum_efficiency_ratio() {
+    local goodput="$1" rate="$2"
+    awk -v g="$goodput" -v r="$rate" 'BEGIN {
+        if (r <= 0) {print "0.90"; exit}
+        e=(g/r)*0.98;
+        if (e < 0.75) e=0.75;
+        if (e > 0.98) e=0.98;
+        printf "%.5f\n", e
+    }'
+}
+
+throughput_stalled() {
+    local goodput="$1" previous_goodput="$2" rate="$3" previous_rate="$4" min_efficiency="$5"
+    awk -v g="$goodput" -v p="$previous_goodput" -v r="$rate" -v pr="$previous_rate" -v e="$min_efficiency" 'BEGIN {
+        delta=r-pr; gain=g-p;
+        exit !(delta>=1 && gain<delta*0.25 && g<r*e)
+    }'
+}
+
+measurement_sample_acceptable() {
+    local goodput="$1" loss="$2" rate="$3" min_efficiency="$4" threshold="$5" baseline_loss="$6"
+    loss_spike "$loss" "$threshold" "$baseline_loss" && return 1
+    awk -v g="$goodput" -v r="$rate" -v e="$min_efficiency" 'BEGIN {exit !(r<=0 || g>=r*e)}'
+}
+
 estimate_sweep_bytes() {
     local high="$1" duration="$2" tests="$3"
     awk -v r="$high" -v d="$duration" -v n="$tests" 'BEGIN {printf "%.0f", r*1000000/8*d*n*1.08}'
 }
 
 new_measure_run() {
-    local kind="$1" dir
-    ensure_state_layout
-    dir="$HISTORY_DIR/$(history_stamp)-${kind}"
-    mkdir -p "$dir"
+    local kind="$1" dir base suffix=0
+    ensure_state_layout || return 1
+    base="$HISTORY_DIR/$(history_stamp)-${kind}"
+    dir="$base"
+    while [[ -e "$dir" ]]; do
+        ((suffix+=1))
+        dir="${base}-${suffix}"
+    done
+    mkdir "$dir" || return 1
     chmod 0700 "$dir"
     MEASURE_RESULT_FILE="$dir/samples.tsv"
     MEASURE_RUN_DIR="$dir"
@@ -248,7 +278,7 @@ measure_probe() {
         estimate=$(estimate_sweep_bytes "$speed" "$duration" 3)
         log INFO "按接口速率估算，probe 最多可能产生约 $(human_bytes "$estimate") 出站流量"
     fi
-    new_measure_run probe
+    new_measure_run probe || return 1
     dir="$MEASURE_RUN_DIR"
     measure_begin "$iface" || return 1
     if apply_fq "$iface" && row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 3 unshaped); then
@@ -267,16 +297,19 @@ measure_sweep() {
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" nominal="$4" low="$5" high="$6" step="$7"
     local duration="$8" parallel="$9" margin="${10}" threshold="${11}" force_scan="${12}" cap="${13}"
-    local iface dir baseline_row baseline_gp baseline_loss base_row base_loss rate row gp loss
-    local last_ok="" broke_at="" fine_start fine_step recommend confirm_row estimated tests rc=0 no_knee=0 above_cap=0 baseline_duration
+    local result_mode="${14:-manual}"
+    local iface dir baseline_row baseline_gp baseline_loss base_row base_gp base_loss rate row gp loss
+    local last_ok="" last_ok_gp="" broke_at="" fine_start fine_step recommend="" candidate="" confirm_row confirm_gp="" confirm_loss=""
+    local min_efficiency="0.90" confirmed=0 reject_reason="" estimated tests rc=0 no_knee=0 above_cap=0 baseline_duration
     validate_peer "$peer" "$port" || return 1
-    for value in "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$cap"; do is_uint "$value" || { die "扫描参数必须为非负整数"; return 1; }; done
+    [[ "$result_mode" == manual || "$result_mode" == auto ]] || { die "扫描结果模式只支持 manual/auto"; return 1; }
+    for value in "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$force_scan" "$cap"; do is_uint "$value" || { die "扫描参数必须为非负整数"; return 1; }; done
     is_decimal "$threshold" || { die "loss threshold 必须是数字"; return 1; }
-    (( duration >= 3 && duration <= 120 && parallel >= 1 && parallel <= 32 && margin <= 25 && cap >= 100 && cap <= 1000000 )) || { die "扫描参数超出安全范围"; return 1; }
+    (( duration >= 3 && duration <= 120 && parallel >= 1 && parallel <= 32 && margin <= 25 && force_scan <= 1 && cap >= 100 && cap <= 1000000 )) || { die "扫描参数超出安全范围"; return 1; }
     peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return 1; }
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
-    new_measure_run sweep
+    new_measure_run sweep || return 1
     dir="$MEASURE_RUN_DIR"
     measure_begin "$iface" || return 1
 
@@ -304,9 +337,9 @@ measure_sweep() {
     fi
 
     if (( rc == 0 )); then
-        tests=$((2 + (high-low)/step + 6))
+        tests=$((2 + 2 + (high-low)/step + 4 + 2))
         estimated=$(estimate_sweep_bytes "$high" "$duration" "$tests")
-        log INFO "预计最多测试 $tests 次、产生约 $(human_bytes "$estimated") 出站流量"
+        log INFO "计划最多采集 $tests 个样本、产生约 $(human_bytes "$estimated") 出站流量（不含失败重试）"
 
         if (( above_cap )); then
             :
@@ -317,7 +350,10 @@ measure_sweep() {
             apply_shaping "$iface" "$low" || rc=$?
             if (( rc == 0 )); then
                 base_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "rate-${low}") || rc=$?
+                base_gp=$(cut -f1 <<< "${base_row:-$'0\t0\t0\t0'}")
                 base_loss=$(cut -f4 <<< "${base_row:-$'0\t0\t0\t0'}")
+                min_efficiency=$(minimum_efficiency_ratio "$base_gp" "$low")
+                log INFO "低速档效率基准: ${base_gp}/${low}，后续最低可接受效率比 ${min_efficiency}"
             fi
             if (( rc == 0 )) && loss_spike "$base_loss" "$threshold" 0; then
                 die "扫描下界 ${low} Mbit 已有明显重传，无法建立干净本底；请降低 --low 或更换 peer"
@@ -326,40 +362,51 @@ measure_sweep() {
             if (( rc == 0 )); then
                 local previous_gp previous_rate stall_count=0 stalled_rate=""
                 last_ok="$low"
-                previous_gp=$(cut -f1 <<< "$base_row"); previous_rate="$low"
+                last_ok_gp="$base_gp"; previous_gp="$base_gp"; previous_rate="$low"
                 for ((rate=low+step; rate<=high; rate+=step)); do
                     apply_shaping "$iface" "$rate" || { rc=$?; break; }
                     row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "rate-${rate}") || { rc=$?; break; }
                     gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
                     printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%%\n' "$rate" "$gp" "$loss"
                     if loss_spike "$loss" "$threshold" "$base_loss"; then broke_at="$rate"; break; fi
-                    if awk -v g="$gp" -v p="$previous_gp" -v r="$rate" -v pr="$previous_rate" 'BEGIN {d=r-pr; gain=g-p; exit !(d>=1 && gain<d*0.25 && g<r*0.90)}'; then
+                    if throughput_stalled "$gp" "$previous_gp" "$rate" "$previous_rate" "$min_efficiency"; then
                         ((stall_count+=1)); [[ -n "$stalled_rate" ]] || stalled_rate="$rate"
                         if (( stall_count >= 2 )); then broke_at="$stalled_rate"; break; fi
                         continue
                     fi
-                    stall_count=0; stalled_rate=""; last_ok="$rate"; previous_gp="$gp"; previous_rate="$rate"
+                    stall_count=0; stalled_rate=""; last_ok="$rate"; last_ok_gp="$gp"; previous_gp="$gp"; previous_rate="$rate"
                 done
             fi
             if (( rc == 0 )) && [[ -n "$broke_at" ]]; then
                 fine_step=$((step / 5)); ((fine_step < 1)) && fine_step=1
                 fine_start=$((last_ok + fine_step))
+                previous_gp="$last_ok_gp"; previous_rate="$last_ok"; stall_count=0; stalled_rate=""
                 for ((rate=fine_start; rate<broke_at; rate+=fine_step)); do
                     apply_shaping "$iface" "$rate" || { rc=$?; break; }
                     row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "refine-${rate}") || { rc=$?; break; }
-                    loss=$(cut -f4 <<< "$row")
+                    gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
+                    printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%% (refine)\n' "$rate" "$gp" "$loss"
                     if loss_spike "$loss" "$threshold" "$base_loss"; then broke_at="$rate"; break; fi
-                    last_ok="$rate"
+                    if throughput_stalled "$gp" "$previous_gp" "$rate" "$previous_rate" "$min_efficiency"; then
+                        ((stall_count+=1)); [[ -n "$stalled_rate" ]] || stalled_rate="$rate"
+                        if (( stall_count >= 2 )); then broke_at="$stalled_rate"; break; fi
+                        continue
+                    fi
+                    stall_count=0; stalled_rate=""; last_ok="$rate"; last_ok_gp="$gp"; previous_gp="$gp"; previous_rate="$rate"
                 done
             fi
             if (( rc == 0 )) && [[ -n "$last_ok" && -n "$broke_at" ]]; then
-                recommend=$(( last_ok * (100-margin) / 100 )); ((recommend < 1)) && recommend=1
-                apply_shaping "$iface" "$recommend" || rc=$?
+                candidate=$(( last_ok * (100-margin) / 100 )); ((candidate < 1)) && candidate=1
+                apply_shaping "$iface" "$candidate" || rc=$?
                 if (( rc == 0 )); then
-                    confirm_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "confirm-${recommend}") || rc=$?
-                    loss=$(cut -f4 <<< "${confirm_row:-$'0\t0\t0\t999'}")
-                    if (( rc == 0 )) && loss_spike "$loss" "$threshold" "$base_loss"; then
-                        log WARN "推荐档复测仍有跳变，请降低速率或更换对端复测"
+                    confirm_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "confirm-${candidate}") || rc=$?
+                    confirm_gp=$(cut -f1 <<< "${confirm_row:-$'0\t0\t0\t999'}")
+                    confirm_loss=$(cut -f4 <<< "${confirm_row:-$'0\t0\t0\t999'}")
+                    if (( rc == 0 )) && measurement_sample_acceptable "$confirm_gp" "$confirm_loss" "$candidate" "$min_efficiency" "$threshold" "$base_loss"; then
+                        recommend="$candidate"; confirmed=1
+                    elif (( rc == 0 )); then
+                        reject_reason="confirmation-failed"
+                        log WARN "候选档 ${candidate} Mbit 复测未通过吞吐/重传门槛，不生成推荐值"
                     fi
                 fi
             elif (( rc == 0 )); then
@@ -370,11 +417,15 @@ measure_sweep() {
     fi
 
     if (( rc == 0 )); then
-        printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nABOVE_CAP\t%s\n' \
-            "$peer" "$port" "$iface" "${baseline_gp:-}" "${baseline_loss:-}" "$low" "$high" "$step" "${last_ok:-}" "${broke_at:-}" "${recommend:-}" "$margin" "$no_knee" "$above_cap" > "$dir/summary.tsv"
+        printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nCLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nMIN_EFFICIENCY_RATIO\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nCANDIDATE\t%s\nCONFIRM_MBIT\t%s\nCONFIRM_RETRANS_RATIO_EST_PERCENT\t%s\nCONFIRMED\t%s\nREJECT_REASON\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nABOVE_CAP\t%s\n' \
+            "$peer" "$port" "$iface" "${baseline_gp:-}" "${baseline_loss:-}" "${base_loss:-0}" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$above_cap" > "$dir/summary.tsv"
         if [[ -n "${recommend:-}" ]]; then
             log OK "扫描完成: last clean=${last_ok} Mbit, break=${broke_at:-above-range} Mbit, 推荐=${recommend} Mbit"
-            log INFO "确认业务表现后执行: ${0##*/} tc enable ${recommend} --knee ${broke_at:-0} --margin ${margin} --interface ${requested}"
+            if [[ "$result_mode" == auto ]]; then
+                log INFO "候选档已通过扫描确认；最终单双流复验通过后才会持久化"
+            else
+                log INFO "确认业务表现后执行: ${0##*/} tc enable ${recommend} --knee ${broke_at:-0} --margin ${margin} --interface ${requested}"
+            fi
         fi
         log INFO "完整结果: $dir"
     fi
@@ -419,21 +470,41 @@ measure_path_check() {
 measure_verify() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
-    local peer="$1" port="$2" requested="$3" duration="${4:-8}" iface dir one multi rc=0
+    local peer="$1" port="$2" requested="$3" duration="${4:-8}" expected_rate="${5:-0}" min_efficiency="${6:-0.90}"
+    local baseline_loss="${7:-0}" threshold="${8:-0.1}" iface dir one multi one_gp one_loss multi_gp multi_loss rc=0 accepted=1 reject_reason=""
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && (( duration >= 3 && duration <= 120 )) || { die "verify duration 超出安全范围"; return 1; }
+    is_uint "$expected_rate" && (( expected_rate <= 1000000 )) || { die "verify 期望速率无效"; return 1; }
+    is_decimal "$min_efficiency" && is_decimal "$baseline_loss" && is_decimal "$threshold" || { die "verify 验收参数无效"; return 1; }
+    awk -v e="$min_efficiency" -v b="$baseline_loss" -v t="$threshold" 'BEGIN {exit !(e>0 && e<=1 && b>=0 && b<=100 && t>=0 && t<=100)}' || {
+        die "verify 验收参数超出安全范围"
+        return 1
+    }
     peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return 1; }
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
-    new_measure_run verify; dir="$MEASURE_RUN_DIR"
+    new_measure_run verify || return 1; dir="$MEASURE_RUN_DIR"
     measure_begin "$iface" || return 1
     one=$(sample_repeated "$peer" "$port" "$duration" 1 1 verify-single) || rc=$?
     if (( rc == 0 )); then multi=$(sample_repeated "$peer" "$port" "$duration" 4 1 verify-four) || rc=$?; fi
     if (( rc == 0 )); then
-        printf 'TYPE\tverify\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nSINGLE_MBIT\t%s\nSINGLE_RETRANS_EST_PERCENT\t%s\nFOUR_MBIT\t%s\nFOUR_RETRANS_EST_PERCENT\t%s\n' \
-            "$peer" "$port" "$iface" "$(cut -f1 <<< "$one")" "$(cut -f4 <<< "$one")" \
-            "$(cut -f1 <<< "$multi")" "$(cut -f4 <<< "$multi")" > "$dir/summary.tsv"
-        log OK "验证完成: 单流 $(cut -f1 <<< "$one") Mbit/s，多流 $(cut -f1 <<< "$multi") Mbit/s"
+        one_gp=$(cut -f1 <<< "$one"); one_loss=$(cut -f4 <<< "$one")
+        multi_gp=$(cut -f1 <<< "$multi"); multi_loss=$(cut -f4 <<< "$multi")
+        if (( expected_rate > 0 )); then
+            if ! measurement_sample_acceptable "$one_gp" "$one_loss" "$expected_rate" "$min_efficiency" "$threshold" "$baseline_loss"; then
+                accepted=0; reject_reason="single-flow-below-threshold"
+            elif ! measurement_sample_acceptable "$multi_gp" "$multi_loss" "$expected_rate" "$min_efficiency" "$threshold" "$baseline_loss"; then
+                accepted=0; reject_reason="four-flow-below-threshold"
+            fi
+        fi
+        printf 'TYPE\tverify\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nEXPECTED_RATE_MBIT\t%s\nMIN_EFFICIENCY_RATIO\t%s\nSINGLE_MBIT\t%s\nSINGLE_RETRANS_EST_PERCENT\t%s\nFOUR_MBIT\t%s\nFOUR_RETRANS_EST_PERCENT\t%s\nACCEPTED\t%s\nREJECT_REASON\t%s\n' \
+            "$peer" "$port" "$iface" "$expected_rate" "$min_efficiency" "$one_gp" "$one_loss" "$multi_gp" "$multi_loss" "$accepted" "$reject_reason" > "$dir/summary.tsv"
+        if (( accepted )); then
+            log OK "验证完成: 单流 ${one_gp} Mbit/s，多流 ${multi_gp} Mbit/s"
+        else
+            log ERR "最终复验未通过（$reject_reason）：单流 ${one_gp} Mbit/s，多流 ${multi_gp} Mbit/s"
+            rc=2
+        fi
         log INFO "验证结果: $dir"
     fi
     traffic_report "$iface"

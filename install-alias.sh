@@ -8,6 +8,11 @@ CHANNEL="release"
 VERSION=""
 PREFIX=""
 RUN_AFTER_INSTALL=0
+MODE_EXPLICIT=0
+CHANNEL_EXPLICIT=0
+VERSION_EXPLICIT=0
+RUN_EXPLICIT=0
+PREFIX_EXPLICIT=0
 
 usage() {
     cat <<EOF
@@ -19,26 +24,66 @@ The main channel is intended for testing and still requires the repository SHA25
 EOF
 }
 
+require_value() {
+    if (($# < 2)) || [[ -z "$2" || "$2" == --* ]]; then
+        echo "$1 requires a value" >&2
+        exit 1
+    fi
+}
+
+managed_bbr_file() {
+    local file="$1"
+    [[ -f "$file" || -L "$file" ]] || return 1
+    grep -Eq 'SCRIPT_NAME="bbrv3-lite"|github[.]com/ike-sh/bbrv3-lite' "$file" 2>/dev/null
+}
+
 while (($#)); do
     case "$1" in
-        install|uninstall) MODE="$1"; shift ;;
-        --channel) CHANNEL="${2:?missing channel}"; shift 2 ;;
-        --version) VERSION="${2:?missing version}"; shift 2 ;;
-        --prefix) PREFIX="${2:?missing prefix}"; shift 2 ;;
-        --run) RUN_AFTER_INSTALL=1; shift ;;
+        install|uninstall)
+            (( MODE_EXPLICIT == 0 )) || { echo "install/uninstall may be specified only once" >&2; exit 1; }
+            MODE="$1"; MODE_EXPLICIT=1; shift
+            ;;
+        --channel)
+            (( CHANNEL_EXPLICIT == 0 )) || { echo "--channel may be specified only once" >&2; exit 1; }
+            require_value "$@"; CHANNEL="$2"; CHANNEL_EXPLICIT=1; shift 2
+            ;;
+        --version)
+            (( VERSION_EXPLICIT == 0 )) || { echo "--version may be specified only once" >&2; exit 1; }
+            require_value "$@"; VERSION="$2"; VERSION_EXPLICIT=1; shift 2
+            ;;
+        --prefix)
+            (( PREFIX_EXPLICIT == 0 )) || { echo "--prefix may be specified only once" >&2; exit 1; }
+            require_value "$@"; PREFIX="$2"; PREFIX_EXPLICIT=1; shift 2
+            ;;
+        --run)
+            (( RUN_EXPLICIT == 0 )) || { echo "--run may be specified only once" >&2; exit 1; }
+            RUN_AFTER_INSTALL=1; RUN_EXPLICIT=1; shift
+            ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
 
 [[ "$CHANNEL" == release || "$CHANNEL" == main ]] || { echo "channel must be release or main" >&2; exit 1; }
+if [[ "$MODE" == uninstall ]] && (( CHANNEL_EXPLICIT || VERSION_EXPLICIT || RUN_EXPLICIT )); then
+    echo "uninstall accepts only --prefix" >&2
+    exit 1
+fi
 if [[ -z "$PREFIX" ]]; then
     if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then PREFIX=/usr/local/bin; else PREFIX="${HOME}/.local/bin"; fi
 fi
+[[ "$PREFIX" == /* && "$PREFIX" != / ]] || { echo "--prefix must be an absolute directory other than /" >&2; exit 1; }
 TARGET="$PREFIX/bbr"
 
 if [[ "$MODE" == uninstall ]]; then
-    if [[ -e "$TARGET" || -L "$TARGET" ]]; then rm -f -- "$TARGET"; echo "removed: $TARGET"; else echo "not found: $TARGET"; fi
+    for command in grep sed mktemp mv rm; do command -v "$command" >/dev/null 2>&1 || { echo "missing command: $command" >&2; exit 1; }; done
+    if [[ -e "$TARGET" || -L "$TARGET" ]]; then
+        managed_bbr_file "$TARGET" || { echo "refusing to remove an unmanaged file: $TARGET" >&2; exit 1; }
+        rm -f -- "$TARGET"
+        echo "removed: $TARGET"
+    else
+        echo "not found: $TARGET"
+    fi
     for rc_file in "${HOME}/.bashrc" "${HOME}/.bash_profile" "${HOME}/.zshrc"; do
         [[ -f "$rc_file" ]] || continue
         grep -Fq '# ================ net-tcp-tune 快捷别名 ================' "$rc_file" || continue
@@ -52,7 +97,7 @@ if [[ "$MODE" == uninstall ]]; then
     exit 0
 fi
 
-for command in curl sha256sum awk install; do command -v "$command" >/dev/null 2>&1 || { echo "missing command: $command" >&2; exit 1; }; done
+for command in curl sha256sum awk install grep sort bash mktemp mv; do command -v "$command" >/dev/null 2>&1 || { echo "missing command: $command" >&2; exit 1; }; done
 
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
@@ -103,7 +148,12 @@ if [[ -n "$VERSION" ]]; then
 fi
 
 mkdir -p -- "$PREFIX"
-install -m 0755 "$tmp/net-tcp-tune.sh" "$TARGET"
+if [[ -e "$TARGET" || -L "$TARGET" ]]; then
+    managed_bbr_file "$TARGET" || { echo "refusing to overwrite an unmanaged file: $TARGET" >&2; exit 1; }
+fi
+target_temp=$(mktemp "${TARGET}.tmp.XXXXXX")
+if ! install -m 0755 "$tmp/net-tcp-tune.sh" "$target_temp"; then rm -f -- "$target_temp"; exit 1; fi
+if ! mv -f -- "$target_temp" "$TARGET"; then rm -f -- "$target_temp"; exit 1; fi
 echo "installed: $TARGET"
 echo "source: $BASE"
 if [[ ":$PATH:" != *":$PREFIX:"* ]]; then echo "add $PREFIX to PATH before running: bbr"; fi

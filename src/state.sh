@@ -15,7 +15,8 @@ ensure_state_layout() {
 }
 
 managed_artifacts_exist() {
-    [[ -e "$CONFIG_FILE" || -e "$SYSCTL_FILE" || -e "$LEGACY_SYSCTL_FILE" || -e "$SERVICE_FILE" || -e "$LEGACY_SERVICE_FILE" ]]
+    [[ -e "$CONFIG_FILE" || -e "$SYSCTL_FILE" || -e "$LEGACY_SYSCTL_FILE" ||
+       -e "$SERVICE_FILE" || -e "$LEGACY_SERVICE_FILE" || -e "$PERSIST_SCRIPT" ]]
 }
 
 import_legacy_baseline() {
@@ -93,13 +94,16 @@ capture_baseline() {
     backup_path "$LEGACY_SYSCTL_FILE" legacy-sysctl || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
     backup_path "$SERVICE_FILE" service || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
     backup_path "$LEGACY_SERVICE_FILE" legacy-service || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    backup_path "$PERSIST_SCRIPT" persist-script || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    capture_unit_state "$SERVICE_NAME" "$BASELINE_DIR/service.unit" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
+    capture_unit_state bbr-optimize-persist.service "$BASELINE_DIR/legacy-service.unit" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
     chmod -R go-rwx "$BASELINE_DIR" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
     mv "$BASELINE_DIR/manifest.pending" "$BASELINE_DIR/manifest" || { remove_tree_within "$BASELINE_DIR" "$STATE_DIR"; return 1; }
     log OK "已保存不可覆盖的初始基线: $BASELINE_DIR ($provenance)"
 }
 
 baseline_adopt() {
-    require_root; acquire_lock; require_commands ip tc sysctl
+    require_root || return 1; acquire_lock || return 1; require_commands ip tc sysctl || return 1
     local iface
     iface=$(detect_interface "${1:-auto}") || return 1
     [[ ! -e "$BASELINE_DIR" ]] || { die "基线已经存在，不会覆盖"; return 1; }
@@ -112,7 +116,10 @@ restore_backed_path() {
     [[ -f "$BASELINE_DIR/${name}.state" ]] || return 0
     state=$(<"$BASELINE_DIR/${name}.state")
     rm -f -- "$target" || return 1
-    if [[ "$state" == present ]]; then cp -a -- "$BASELINE_DIR/$name" "$target" || return 1; fi
+    if [[ "$state" == present ]]; then
+        mkdir -p -- "$(dirname "$target")" || return 1
+        cp -a -- "$BASELINE_DIR/$name" "$target" || return 1
+    fi
 }
 
 restore_runtime_sysctls() {

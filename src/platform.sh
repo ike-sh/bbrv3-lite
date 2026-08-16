@@ -14,7 +14,22 @@ virtualization_type() {
 }
 
 is_container() {
-    case "$(virtualization_type)" in docker|lxc|openvz|podman|container-other) return 0 ;; *) return 1 ;; esac
+    if command_exists systemd-detect-virt && systemd-detect-virt --quiet --container 2>/dev/null; then return 0; fi
+    case "$(virtualization_type)" in docker|lxc|openvz|podman|container-other|systemd-nspawn|wsl) return 0 ;; *) return 1 ;; esac
+}
+
+require_host_network_control() {
+    if is_container; then
+        die "容器环境不能安全修改宿主机内核、sysctl 或 qdisc；请在 VPS 宿主系统执行"
+        return 1
+    fi
+    return 0
+}
+
+require_systemd_runtime() {
+    require_commands systemctl || return 1
+    [[ -d /run/systemd/system ]] || { die "当前系统没有运行 systemd，不能安装持久化服务"; return 1; }
+    systemctl show-environment >/dev/null 2>&1 || { die "无法连接 systemd，不能安全提交持久化配置"; return 1; }
 }
 
 default_route_interface() {
@@ -55,19 +70,23 @@ memory_mb() { awk '/MemTotal:/ {printf "%d\n", $2/1024}' /proc/meminfo; }
 
 median_ping_ms() {
     local target="$1" family="${2:-auto}" output
+    [[ -n "$target" && "$target" != -* && "$target" =~ ^[a-zA-Z0-9._:-]{1,253}$ ]] || return 1
     case "$family" in
-        4) output=$(ping -4 -n -c 5 -W 2 "$target" 2>/dev/null || true) ;;
-        6) output=$(ping -6 -n -c 5 -W 2 "$target" 2>/dev/null || true) ;;
-        *) output=$(ping -n -c 5 -W 2 "$target" 2>/dev/null || true) ;;
+        4) output=$(ping -4 -n -c 5 -W 2 -- "$target" 2>/dev/null || true) ;;
+        6) output=$(ping -6 -n -c 5 -W 2 -- "$target" 2>/dev/null || true) ;;
+        *) output=$(ping -n -c 5 -W 2 -- "$target" 2>/dev/null || true) ;;
     esac
     awk -F'/' '/rtt|round-trip/ {printf "%.0f\n", $5}' <<< "$output"
 }
 
 detect_profile() {
     local requested="${1:-auto}" target="${2:-}" iface rtt="not measured"
-    require_commands ip awk uname
+    require_commands ip awk uname || return 1
     iface=$(detect_interface "$requested") || return 1
-    if [[ -n "$target" ]]; then rtt=$(median_ping_ms "$target"); [[ -n "$rtt" ]] || rtt="unreachable"; fi
+    if [[ -n "$target" ]]; then
+        [[ "$target" != -* && "$target" =~ ^[a-zA-Z0-9._:-]{1,253}$ ]] || { die "非法探测目标: $target"; return 1; }
+        rtt=$(median_ping_ms "$target"); [[ -n "$rtt" ]] || rtt="unreachable"
+    fi
     printf '%-18s %s\n' "Version" "v${SCRIPT_VERSION}"
     printf '%-18s %s\n' "OS" "$(os_id) $(os_codename)"
     printf '%-18s %s\n' "Kernel" "$(uname -r)"
@@ -90,7 +109,7 @@ detect_profile() {
 }
 
 install_measure_dependencies() {
-    require_root
+    require_root || return 1
     local -a packages=()
     command_exists iperf3 || packages+=(iperf3)
     command_exists jq || packages+=(jq)
