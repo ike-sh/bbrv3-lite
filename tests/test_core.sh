@@ -104,8 +104,8 @@ test_qdisc_replay_filters_kernel_runtime_fields() {
 
 test_tc_transaction() {
     local MOCK_ROOT=fq MOCK_CLASS=0 MOCK_LEAF=0 MOCK_RATE=0 MOCK_FAIL_LEAF=0
+    TC_SESSION_HTB_IFACE=""
     tc_dependencies() { :; }
-    qdisc_guard() { [[ "$MOCK_ROOT" != cake ]]; }
     detect_mtu() { echo 1500; }
     tc() {
         case "$*" in
@@ -133,6 +133,7 @@ test_tc_transaction() {
             'qdisc del dev eth0 root') MOCK_ROOT=fq; MOCK_CLASS=0; MOCK_LEAF=0 ;;
             *) fail "unexpected tc invocation: $*" ;;
         esac
+        return 0
     }
     apply_shaping eth0 300
     assert_eq htb "$MOCK_ROOT" "HTB root"
@@ -143,6 +144,11 @@ test_tc_transaction() {
     assert_eq htb "$MOCK_ROOT" "HTB root after in-place rate update"
     assert_eq 320 "$MOCK_RATE" "in-place HTB class rate update"
     assert_eq 1 "$MOCK_LEAF" "FQ leaf after in-place rate update"
+
+    MOCK_LEAF=0
+    apply_shaping eth0 340
+    assert_eq 340 "$MOCK_RATE" "session-owned HTB class repair rate"
+    assert_eq 1 "$MOCK_LEAF" "session-owned FQ leaf repair"
 
     MOCK_ROOT=fq; MOCK_CLASS=0; MOCK_LEAF=0; MOCK_FAIL_LEAF=1
     if apply_shaping eth0 300; then fail "failed leaf reported success"; fi

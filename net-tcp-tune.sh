@@ -3,7 +3,7 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="7.0.5"
+SCRIPT_VERSION="7.0.6"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
@@ -633,11 +633,15 @@ apply_initial_windows() {
 # Traffic control: HTB aggregate shaper + FQ leaf, full verification and rollback.
 # -----------------------------------------------------------------------------
 
+TC_SESSION_HTB_IFACE=""
+
 tc_dependencies() { require_commands ip tc awk; }
 has_net_admin() { tc qdisc show >/dev/null 2>&1; }
 
 root_qdisc_kind() {
-    tc qdisc show dev "$1" 2>/dev/null | awk '$1=="qdisc" && $0 ~ / root / {print $2; exit}'
+    local text
+    text=$(tc qdisc show dev "$1" 2>/dev/null) || return 1
+    awk '$1=="qdisc" && $0 ~ / root / {print $2; exit}' <<< "$text"
 }
 
 qdisc_replay_args_from_stream() {
@@ -664,15 +668,30 @@ root_qdisc_replay_args() {
 }
 
 managed_htb() {
-    local iface="$1"
-    tc qdisc show dev "$iface" 2>/dev/null | grep -Eq '^qdisc htb 1: root([[:space:]]|$)' &&
-        tc class show dev "$iface" 2>/dev/null | grep -Eq '^class htb 1:10 (root|parent 1:)' &&
-        tc qdisc show dev "$iface" 2>/dev/null | grep -Eq '^qdisc fq 10: parent 1:10([[:space:]]|$)'
+    local iface="$1" qdisc_text class_text
+    qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null) || return 1
+    class_text=$(tc class show dev "$iface" 2>/dev/null) || return 1
+    grep -Eq '^qdisc htb 1: root([[:space:]]|$)' <<< "$qdisc_text" &&
+        grep -Eq '^class htb 1:10 (root|parent 1:)' <<< "$class_text" &&
+        grep -Eq '^qdisc fq 10: parent 1:10([[:space:]]|$)' <<< "$qdisc_text"
+}
+
+managed_htb_root() {
+    local text
+    text=$(tc qdisc show dev "$1" 2>/dev/null) || return 1
+    grep -Eq '^qdisc htb 1: root([[:space:]]|$)' <<< "$text"
+}
+
+managed_fq_leaf() {
+    local text
+    text=$(tc qdisc show dev "$1" 2>/dev/null) || return 1
+    grep -Eq '^qdisc fq 10: parent 1:10([[:space:]]|$)' <<< "$text"
 }
 
 managed_rate_mbit() {
-    local iface="$1" token
-    token=$(tc class show dev "$iface" 2>/dev/null | awk '$1=="class" && $2=="htb" && $3=="1:10" {for(i=1;i<=NF;i++) if($i=="rate") {print $(i+1); exit}}')
+    local iface="$1" text token
+    text=$(tc class show dev "$iface" 2>/dev/null) || return 1
+    token=$(awk '$1=="class" && $2=="htb" && $3=="1:10" {for(i=1;i<=NF;i++) if($i=="rate") {print $(i+1); exit}}' <<< "$text")
     awk -v r="$token" 'BEGIN {
         if (r ~ /Gbit$/) {sub(/Gbit$/, "", r); printf "%.0f\n", r*1000}
         else if (r ~ /Mbit$/) {sub(/Mbit$/, "", r); printf "%.0f\n", r}
@@ -680,12 +699,37 @@ managed_rate_mbit() {
     }'
 }
 
+session_owned_htb() {
+    local iface="$1" rate
+    [[ -n "$TC_SESSION_HTB_IFACE" && "$TC_SESSION_HTB_IFACE" == "$iface" ]] || return 1
+    managed_htb_root "$iface" || return 1
+    rate=$(managed_rate_mbit "$iface") || return 1
+    is_uint "$rate" && (( rate > 0 ))
+}
+
+managed_htb_diagnostic() {
+    local iface="$1" qdisc_text class_text root=no class=no leaf=no rate
+    qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null || true)
+    class_text=$(tc class show dev "$iface" 2>/dev/null || true)
+    grep -Eq '^qdisc htb 1: root([[:space:]]|$)' <<< "$qdisc_text" && root=yes
+    grep -Eq '^class htb 1:10 (root|parent 1:)' <<< "$class_text" && class=yes
+    grep -Eq '^qdisc fq 10: parent 1:10([[:space:]]|$)' <<< "$qdisc_text" && leaf=yes
+    rate=$(managed_rate_mbit "$iface") || rate=""
+    rate="${rate:--}"
+    printf 'root-1=%s class-1:10=%s fq-10=%s rate=%sMbit' "$root" "$class" "$leaf" "$rate"
+}
+
 qdisc_guard() {
-    local iface="$1" kind
-    kind=$(root_qdisc_kind "$iface")
-    if managed_htb "$iface"; then return 0; fi
+    local iface="$1" kind detail
+    kind=$(root_qdisc_kind "$iface") || { die "无法读取 $iface 的 root qdisc"; return 1; }
+    if managed_htb "$iface" || session_owned_htb "$iface"; then return 0; fi
     case "$kind" in
         ""|fq|fq_codel|noqueue|mq|pfifo_fast) return 0 ;;
+        htb)
+            detail=$(managed_htb_diagnostic "$iface")
+            die "拒绝覆盖未管理的 root qdisc 'htb'（$iface；$detail）"
+            return 1
+            ;;
         *)
             die "拒绝覆盖未管理的 root qdisc '$kind'（$iface）；请先自行恢复或删除"
             return 1
@@ -695,10 +739,13 @@ qdisc_guard() {
 
 action_qdisc_snapshot() {
     local iface="$1" file="$2" kind rate="" replay_args_string=""
-    kind=$(root_qdisc_kind "$iface")
-    managed_htb "$iface" && { kind=managed-htb; rate=$(managed_rate_mbit "$iface"); }
+    kind=$(root_qdisc_kind "$iface") || return 1
+    if managed_htb "$iface" || session_owned_htb "$iface"; then
+        kind=managed-htb
+        rate=$(managed_rate_mbit "$iface") || return 1
+    fi
     [[ "$kind" == fq || "$kind" == fq_codel ]] && replay_args_string=$(root_qdisc_replay_args "$iface")
-    printf 'KIND\t%s\nRATE\t%s\nARGS\t%s\n' "$kind" "$rate" "$replay_args_string" > "$file"
+    printf 'KIND\t%s\nRATE\t%s\nARGS\t%s\n' "$kind" "$rate" "$replay_args_string" > "$file" || return 1
     tc qdisc show dev "$iface" >> "$file" 2>/dev/null || true
     tc class show dev "$iface" >> "$file" 2>/dev/null || true
 }
@@ -715,8 +762,16 @@ restore_action_qdisc() {
     [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
     case "$kind" in
         managed-htb) _apply_shaping_raw "$iface" "$rate" ;;
-        fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null 2>&1 || tc qdisc replace dev "$iface" root "$kind" >/dev/null ;;
-        ""|noqueue|mq|pfifo_fast) tc qdisc del dev "$iface" root >/dev/null 2>&1 || true ;;
+        fq|fq_codel)
+            if tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null 2>&1 || tc qdisc replace dev "$iface" root "$kind" >/dev/null; then
+                if [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]]; then TC_SESSION_HTB_IFACE=""; fi
+            else return 1
+            fi
+            ;;
+        ""|noqueue|mq|pfifo_fast)
+            tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
+            if [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]]; then TC_SESSION_HTB_IFACE=""; fi
+            ;;
         *) die "无法安全恢复 qdisc 类型: $kind" ;;
     esac
 }
@@ -757,29 +812,35 @@ verify_shaping() {
 }
 
 _apply_shaping_raw() {
-    local iface="$1" rate="$2" mtu burst quantum cburst hierarchy_exists=0
+    local iface="$1" rate="$2" mtu burst quantum cburst hierarchy_exists=0 kind
     is_uint "$rate" && (( rate > 0 && rate <= 1000000 )) || { die "非法整形速率: $rate"; return 1; }
     mtu=$(detect_mtu "$iface"); is_uint "$mtu" || mtu=1500
     burst=$(calc_htb_burst "$rate" "$mtu")
     quantum=$(calc_htb_quantum "$mtu")
     cburst=$((mtu * 2))
-    managed_htb "$iface" && hierarchy_exists=1
+    if managed_htb "$iface" || session_owned_htb "$iface"; then
+        hierarchy_exists=1
+    else
+        kind=$(root_qdisc_kind "$iface")
+        [[ "$kind" != htb ]] || { die "拒绝修改来源不明的 HTB root（$iface）"; return 1; }
+    fi
     if (( ! hierarchy_exists )); then
         tc qdisc replace dev "$iface" root handle 1: htb default 10 || return 1
     fi
     tc class replace dev "$iface" parent 1: classid 1:10 htb \
         rate "${rate}mbit" ceil "${rate}mbit" burst "$burst" cburst "$cburst" quantum "$quantum" || return 1
-    if (( ! hierarchy_exists )); then
+    if ! managed_fq_leaf "$iface"; then
         tc qdisc replace dev "$iface" parent 1:10 handle 10: fq || return 1
     fi
-    verify_shaping "$iface"
+    verify_shaping "$iface" || return 1
+    TC_SESSION_HTB_IFACE="$iface"
 }
 
 apply_shaping() {
     local iface="$1" rate="$2" snapshot
     tc_dependencies || return 1; qdisc_guard "$iface" || return 1
     snapshot=$(mktemp) || return 1
-    action_qdisc_snapshot "$iface" "$snapshot"
+    action_qdisc_snapshot "$iface" "$snapshot" || { rm -f -- "$snapshot"; return 1; }
     if ! _apply_shaping_raw "$iface" "$rate"; then
         log ERR "应用 ${rate} Mbit 整形失败，正在恢复操作前 qdisc"
         restore_action_qdisc "$iface" "$snapshot" || true
@@ -793,13 +854,14 @@ apply_fq() {
     local iface="$1" snapshot
     tc_dependencies || return 1; qdisc_guard "$iface" || return 1
     snapshot=$(mktemp) || return 1
-    action_qdisc_snapshot "$iface" "$snapshot"
+    action_qdisc_snapshot "$iface" "$snapshot" || { rm -f -- "$snapshot"; return 1; }
     if ! tc qdisc replace dev "$iface" root fq || [[ "$(root_qdisc_kind "$iface")" != fq ]]; then
         restore_action_qdisc "$iface" "$snapshot" || true
         rm -f -- "$snapshot"
         die "root FQ 应用失败"
         return 1
     fi
+    [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]] && TC_SESSION_HTB_IFACE=""
     rm -f -- "$snapshot"
 }
 
@@ -940,7 +1002,11 @@ measure_begin() {
     local iface="$1"
     MEASURE_IFACE="$iface"
     MEASURE_SNAPSHOT=$(mktemp) || return 1
-    action_qdisc_snapshot "$iface" "$MEASURE_SNAPSHOT"
+    action_qdisc_snapshot "$iface" "$MEASURE_SNAPSHOT" || {
+        rm -f -- "$MEASURE_SNAPSHOT"
+        MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+        return 1
+    }
     MEASURE_TX_START=$(interface_counter "$iface" tx_bytes)
     MEASURE_RX_START=$(interface_counter "$iface" rx_bytes)
     trap 'measure_abort 130' INT TERM HUP

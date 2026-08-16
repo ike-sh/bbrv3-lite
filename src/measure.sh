@@ -85,7 +85,11 @@ measure_begin() {
     local iface="$1"
     MEASURE_IFACE="$iface"
     MEASURE_SNAPSHOT=$(mktemp) || return 1
-    action_qdisc_snapshot "$iface" "$MEASURE_SNAPSHOT"
+    action_qdisc_snapshot "$iface" "$MEASURE_SNAPSHOT" || {
+        rm -f -- "$MEASURE_SNAPSHOT"
+        MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+        return 1
+    }
     MEASURE_TX_START=$(interface_counter "$iface" tx_bytes)
     MEASURE_RX_START=$(interface_counter "$iface" rx_bytes)
     trap 'measure_abort 130' INT TERM HUP
