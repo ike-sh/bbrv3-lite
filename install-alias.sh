@@ -38,8 +38,17 @@ fi
 TARGET="$PREFIX/bbr"
 
 if [[ "$MODE" == uninstall ]]; then
-    rm -f -- "$TARGET"
-    echo "removed: $TARGET"
+    if [[ -e "$TARGET" || -L "$TARGET" ]]; then rm -f -- "$TARGET"; echo "removed: $TARGET"; else echo "not found: $TARGET"; fi
+    for rc_file in "${HOME}/.bashrc" "${HOME}/.bash_profile" "${HOME}/.zshrc"; do
+        [[ -f "$rc_file" ]] || continue
+        grep -Fq '# ================ net-tcp-tune 快捷别名 ================' "$rc_file" || continue
+        temp_rc=$(mktemp) || exit 1
+        sed '/^# ================ net-tcp-tune 快捷别名 ================/,/^# ================ net-tcp-tune 快捷别名结束 ================/d' "$rc_file" > "$temp_rc"
+        chmod --reference="$rc_file" "$temp_rc" 2>/dev/null || true
+        mv -f -- "$temp_rc" "$rc_file"
+        echo "removed legacy shell function: $rc_file"
+    done
+    echo "run in the current shell: unset -f bbr 2>/dev/null; hash -r"
     exit 0
 fi
 

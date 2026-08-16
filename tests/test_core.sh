@@ -147,6 +147,49 @@ test_systemd_generation() {
     if grep -Eq 'TC_RATE_MBIT|TC_INTERFACE' "$SERVICE_FILE"; then fail "parameters hard-coded into unit"; fi
 }
 
+test_cli_command_removal_is_scoped() {
+    local old_home="$HOME" cli="$TEST_ROOT/bin/bbr" rc_file
+    HOME="$TEST_ROOT/home"; rc_file="$HOME/.bashrc"
+    mkdir -p "$(dirname "$cli")" "$HOME"
+    cp "$ROOT_DIR/net-tcp-tune.sh" "$cli"; chmod 0755 "$cli"
+    cat > "$rc_file" <<'EOF'
+keep-before
+# ================ net-tcp-tune 快捷别名 ================
+bbr() { echo legacy; }
+# ================ net-tcp-tune 快捷别名结束 ================
+keep-after
+EOF
+    BBRV3_CLI_PATH="$cli"
+    remove_cli_command
+    [[ ! -e "$cli" ]] || fail "managed bbr command was not removed"
+    grep -Fq keep-before "$rc_file" || fail "shell rc content before legacy block was lost"
+    grep -Fq keep-after "$rc_file" || fail "shell rc content after legacy block was lost"
+    if grep -Fq 'net-tcp-tune 快捷别名' "$rc_file"; then fail "legacy shell function block was not removed"; fi
+
+    printf '#!/bin/sh\necho unrelated\n' > "$cli"; chmod 0755 "$cli"
+    remove_cli_command
+    [[ -e "$cli" ]] || fail "unrelated bbr command was removed"
+    BBRV3_CLI_PATH=""; HOME="$old_home"
+}
+
+test_uninstall_restores_before_removal() {
+    local events=""
+    mkdir -p "$BASELINE_DIR" "$DNS_BACKUP_DIR/baseline" "$IPV6_BACKUP_DIR/baseline"
+    : > "$BASELINE_DIR/manifest"; : > "$DNS_BACKUP_DIR/baseline/manifest"; : > "$IPV6_BACKUP_DIR/baseline/sysctl.tsv"
+    require_root() { :; }; acquire_lock() { :; }
+    restore_baseline() { events+=" tcp"; }
+    dns_restore() { events+=" dns"; }
+    ipv6_restore() { events+=" ipv6"; }
+    remove_cli_command() { events+=" cli"; }
+    uninstall_managed 0
+    assert_eq ' tcp dns ipv6 cli' "$events" "uninstall restore/delete order"
+}
+
+test_menu_exits_after_uninstall_signal() {
+    maintenance_menu() { return 90; }
+    if menu_run maintenance_menu; then fail "menu ignored uninstall exit signal"; fi
+}
+
 test_peer_parser() {
     parse_peer_spec 'iperf.example.com:5202'
     assert_eq iperf.example.com "$PEER_HOST" "peer host parser"
@@ -231,6 +274,9 @@ test_legacy_baseline_reference
 test_tc_transaction
 test_measurement_math_and_history
 test_systemd_generation
+test_cli_command_removal_is_scoped
+test_uninstall_restores_before_removal
+test_menu_exits_after_uninstall_signal
 test_peer_parser
 test_sweep_without_knee_does_not_recommend_ceiling
 test_persistence_restart_hands_off_lock

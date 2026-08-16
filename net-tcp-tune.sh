@@ -3,7 +3,7 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="7.0.2"
+SCRIPT_VERSION="7.0.3"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
@@ -1472,22 +1472,83 @@ restore_baseline() {
     else die "基线只完成了部分恢复；快照仍保留在 $BASELINE_DIR，请查看上述警告"; fi
 }
 
+managed_bbr_command() {
+    local file="$1"
+    [[ -f "$file" || -L "$file" ]] || return 1
+    grep -Eq 'SCRIPT_NAME="bbrv3-lite"|github[.]com/ike-sh/bbrv3-lite' "$file" 2>/dev/null
+}
+
+remove_legacy_shell_commands() {
+    local rc_file temp changed=0
+    for rc_file in "${HOME:-/root}/.bashrc" "${HOME:-/root}/.bash_profile" "${HOME:-/root}/.zshrc"; do
+        [[ -f "$rc_file" ]] || continue
+        grep -Fq '# ================ net-tcp-tune 快捷别名 ================' "$rc_file" || continue
+        temp=$(mktemp "${rc_file}.bbrv3-lite.XXXXXX") || return 1
+        if ! sed '/^# ================ net-tcp-tune 快捷别名 ================/,/^# ================ net-tcp-tune 快捷别名结束 ================/d' "$rc_file" > "$temp"; then
+            rm -f -- "$temp"; return 1
+        fi
+        chmod --reference="$rc_file" "$temp" 2>/dev/null || true
+        [[ "${EUID:-$(id -u)}" -ne 0 ]] || chown --reference="$rc_file" "$temp" 2>/dev/null || true
+        mv -f -- "$temp" "$rc_file" || return 1
+        log OK "已从 $rc_file 删除旧版 bbr shell function"
+        ((changed+=1))
+    done
+    LEGACY_SHELL_REMOVED="$changed"
+}
+
+remove_cli_command() {
+    local current="" candidate resolved removed=0
+    local -A seen=()
+    current=$(current_script_path 2>/dev/null || true)
+    for candidate in "${BBRV3_CLI_PATH:-}" "$current" "/usr/local/bin/bbr" "${HOME:-/root}/.local/bin/bbr"; do
+        [[ -n "$candidate" ]] || continue
+        resolved=$(readlink -m "$candidate" 2>/dev/null || printf '%s' "$candidate")
+        [[ -z "${seen[$resolved]:-}" ]] || continue
+        seen[$resolved]=1
+        [[ "${candidate##*/}" == bbr ]] || continue
+        managed_bbr_command "$candidate" || continue
+        rm -f -- "$candidate" || { die "无法删除 bbr 命令: $candidate"; return 1; }
+        log OK "已删除 bbr 命令: $candidate"
+        ((removed+=1))
+    done
+    remove_legacy_shell_commands || return 1
+    if (( removed == 0 && ${LEGACY_SHELL_REMOVED:-0} == 0 )); then
+        log WARN "未在标准位置找到本项目的 bbr 命令；自定义 --prefix 安装需用安装器 uninstall 删除"
+    fi
+}
+
 uninstall_managed() {
     require_root || return 1; acquire_lock || return 1
-    local purge="${1:-0}" iface="" resolved_state
-    load_config || true
-    iface=$(detect_interface "${TC_INTERFACE:-auto}" 2>/dev/null || true)
-    [[ -n "$iface" ]] && managed_htb "$iface" && tc qdisc replace dev "$iface" root fq || true
-    remove_persistence
-    rm -f -- "$CONFIG_FILE" "$SYSCTL_FILE"
+    local purge="${1:-0}" iface="" resolved_state restored_tcp=0 restored_dns=0 restored_ipv6=0
+
+    # Restore before deleting either the executable or the only recovery data.
+    if [[ -f "$BASELINE_DIR/manifest" ]]; then
+        restore_baseline || return 1
+        restored_tcp=1
+    else
+        load_config || true
+        iface=$(detect_interface "${TC_INTERFACE:-auto}" 2>/dev/null || true)
+        if [[ -n "$iface" ]] && managed_htb "$iface"; then apply_fq "$iface" || return 1; fi
+        remove_persistence
+        rm -f -- "$CONFIG_FILE" "$SYSCTL_FILE"
+        log WARN "没有 TCP 基线：已移除管理文件和 HTB，但无法精确恢复修改前的运行时 sysctl/qdisc"
+    fi
+    if [[ -f "$DNS_BACKUP_DIR/baseline/manifest" ]]; then dns_restore || return 1; restored_dns=1; fi
+    if [[ -f "$IPV6_BACKUP_DIR/baseline/sysctl.tsv" ]]; then ipv6_restore || return 1; restored_ipv6=1; fi
+
+    remove_cli_command || return 1
     if (( purge )); then
         resolved_state=$(readlink -m "$STATE_DIR")
         [[ "$resolved_state" == /var/lib/bbrv3-lite || "$resolved_state" == /tmp/bbrv3-lite-test-* ]] || { die "拒绝清理非标准状态目录: $resolved_state"; return 1; }
-        rm -rf -- "$resolved_state"
-        log WARN "已删除配置、服务和状态历史；基线不可恢复"
+        [[ ! -e "$resolved_state" ]] || rm -rf -- "$resolved_state"
+        log WARN "已完整卸载并永久删除状态目录"
+    elif [[ -d "$STATE_DIR" ]]; then
+        log OK "已完整卸载；可用基线已恢复，备份和历史保留在 $STATE_DIR"
     else
-        log OK "已卸载管理组件；基线和历史保留在 $STATE_DIR"
+        log OK "已完整卸载；此前没有可保留的基线或历史"
     fi
+    log INFO "恢复结果: TCP=$restored_tcp DNS=$restored_dns IPv6=$restored_ipv6；重新打开 shell 后 bbr 命令将消失"
+    log INFO "当前 shell 如缓存过旧命令，可执行: unset -f bbr 2>/dev/null; hash -r"
 }
 
 show_status() {
@@ -2075,6 +2136,7 @@ menu_run() {
     ( set -Eeuo pipefail; "$@" )
     rc=$?
     set -e
+    (( rc != 90 )) || return 90
     (( rc == 0 )) || log WARN "操作失败（exit $rc）；系统不会把本次操作报告为成功"
     return 0
 }
@@ -2137,14 +2199,15 @@ ipv6_menu() {
 
 maintenance_menu() {
     local choice
-    printf '%s\n' '1) 查看基线' '2) 恢复首次可信基线' '3) 检查更新' '4) 卸载（保留基线）' '5) 完全清理状态' '0) 返回'
+    printf '%s\n' '1) 查看基线' '2) 只恢复首次可信基线' '3) 检查更新' \
+        '4) 完整卸载（恢复配置、删除 bbr，保留备份）' '5) 完整卸载并永久删除全部状态' '0) 返回'
     read -r -p '选择: ' choice || return 0
     case "$choice" in
         1) baseline_info ;;
         2) if confirm '恢复首次可信基线？'; then restore_baseline; else log INFO "已取消"; fi ;;
         3) self_update ;;
-        4) if confirm '卸载管理组件？'; then uninstall_managed 0; else log INFO "已取消"; fi ;;
-        5) if confirm '永久删除全部状态和基线？'; then uninstall_managed 1; else log INFO "已取消"; fi ;;
+        4) if confirm '恢复可恢复配置并删除 bbr 命令？'; then uninstall_managed 0 && return 90; else log INFO "已取消"; fi ;;
+        5) if confirm '先恢复可恢复配置，再永久删除 bbr 命令、基线和历史？'; then uninstall_managed 1 && return 90; else log INFO "已取消"; fi ;;
         0) return 0 ;;
         *) die "无效选择" ;;
     esac
@@ -2166,7 +2229,7 @@ interactive_menu() {
             6) menu_run kernel_menu ;;
             7) menu_run dns_menu ;;
             8) menu_run ipv6_menu ;;
-            9) menu_run maintenance_menu ;;
+            9) if ! menu_run maintenance_menu; then return 0; fi ;;
             0) return 0 ;;
             *) log WARN "无效选择" ;;
         esac

@@ -226,6 +226,7 @@ menu_run() {
     ( set -Eeuo pipefail; "$@" )
     rc=$?
     set -e
+    (( rc != 90 )) || return 90
     (( rc == 0 )) || log WARN "操作失败（exit $rc）；系统不会把本次操作报告为成功"
     return 0
 }
@@ -288,14 +289,15 @@ ipv6_menu() {
 
 maintenance_menu() {
     local choice
-    printf '%s\n' '1) 查看基线' '2) 恢复首次可信基线' '3) 检查更新' '4) 卸载（保留基线）' '5) 完全清理状态' '0) 返回'
+    printf '%s\n' '1) 查看基线' '2) 只恢复首次可信基线' '3) 检查更新' \
+        '4) 完整卸载（恢复配置、删除 bbr，保留备份）' '5) 完整卸载并永久删除全部状态' '0) 返回'
     read -r -p '选择: ' choice || return 0
     case "$choice" in
         1) baseline_info ;;
         2) if confirm '恢复首次可信基线？'; then restore_baseline; else log INFO "已取消"; fi ;;
         3) self_update ;;
-        4) if confirm '卸载管理组件？'; then uninstall_managed 0; else log INFO "已取消"; fi ;;
-        5) if confirm '永久删除全部状态和基线？'; then uninstall_managed 1; else log INFO "已取消"; fi ;;
+        4) if confirm '恢复可恢复配置并删除 bbr 命令？'; then uninstall_managed 0 && return 90; else log INFO "已取消"; fi ;;
+        5) if confirm '先恢复可恢复配置，再永久删除 bbr 命令、基线和历史？'; then uninstall_managed 1 && return 90; else log INFO "已取消"; fi ;;
         0) return 0 ;;
         *) die "无效选择" ;;
     esac
@@ -317,7 +319,7 @@ interactive_menu() {
             6) menu_run kernel_menu ;;
             7) menu_run dns_menu ;;
             8) menu_run ipv6_menu ;;
-            9) menu_run maintenance_menu ;;
+            9) if ! menu_run maintenance_menu; then return 0; fi ;;
             0) return 0 ;;
             *) log WARN "无效选择" ;;
         esac
