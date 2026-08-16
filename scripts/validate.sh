@@ -30,7 +30,8 @@ fi
 
 echo "==> ShellCheck"
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck -S warning net-tcp-tune.sh scripts/build.sh scripts/release.sh scripts/validate.sh tests/test_core.sh tests/test_installer.sh tests/integration_tc.sh install-alias.sh
+    # load_config/migrate_legacy_config intentionally accept optional paths used by sourced tests.
+    shellcheck -S warning -e SC2120 net-tcp-tune.sh scripts/build.sh scripts/release.sh scripts/validate.sh tests/test_core.sh tests/test_installer.sh tests/integration_tc.sh install-alias.sh
 else
     echo "shellcheck unavailable; skipped"
 fi
