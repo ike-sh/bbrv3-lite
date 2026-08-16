@@ -1,0 +1,257 @@
+# -----------------------------------------------------------------------------
+# Measurement: iperf3 JSON probe and policer-knee sweep with automatic restore.
+# -----------------------------------------------------------------------------
+
+MEASURE_IFACE=""
+MEASURE_SNAPSHOT=""
+MEASURE_TX_START=0
+MEASURE_RX_START=0
+MEASURE_RESULT_FILE=""
+MEASURE_RUN_DIR=""
+
+interface_counter() { cat "/sys/class/net/$1/statistics/$2" 2>/dev/null || printf '0\n'; }
+
+measure_begin() {
+    local iface="$1"
+    MEASURE_IFACE="$iface"
+    MEASURE_SNAPSHOT=$(mktemp) || return 1
+    action_qdisc_snapshot "$iface" "$MEASURE_SNAPSHOT"
+    MEASURE_TX_START=$(interface_counter "$iface" tx_bytes)
+    MEASURE_RX_START=$(interface_counter "$iface" rx_bytes)
+    trap 'measure_abort 130' INT TERM HUP
+}
+
+measure_restore() {
+    local rc=0
+    if [[ -n "$MEASURE_IFACE" && -n "$MEASURE_SNAPSHOT" && -f "$MEASURE_SNAPSHOT" ]]; then
+        restore_action_qdisc "$MEASURE_IFACE" "$MEASURE_SNAPSHOT" || rc=$?
+        rm -f -- "$MEASURE_SNAPSHOT"
+    fi
+    trap - INT TERM HUP
+    MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+    return "$rc"
+}
+
+measure_abort() {
+    local rc="${1:-130}"
+    log WARN "测试被中断，正在恢复操作前 qdisc"
+    measure_restore || true
+    release_lock
+    exit "$rc"
+}
+
+traffic_report() {
+    local tx_now rx_now tx rx
+    tx_now=$(interface_counter "$1" tx_bytes); rx_now=$(interface_counter "$1" rx_bytes)
+    tx=$((tx_now - MEASURE_TX_START)); rx=$((rx_now - MEASURE_RX_START))
+    (( tx < 0 )) && tx=0; (( rx < 0 )) && rx=0
+    log INFO "本轮接口流量: TX $(human_bytes "$tx"), RX $(human_bytes "$rx")"
+}
+
+validate_peer() {
+    [[ "$1" =~ ^[a-zA-Z0-9._:-]{1,253}$ ]] || { die "非法 peer: $1"; return 1; }
+    is_uint "$2" && (( $2 >= 1 && $2 <= 65535 )) || { die "非法端口: $2"; return 1; }
+}
+
+peer_port_open() {
+    local peer="$1" port="$2"
+    timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$peer" "$port" >/dev/null 2>&1
+}
+
+iperf_sample() {
+    local peer="$1" port="$2" duration="$3" parallel="$4" json bps bytes retrans goodput ratio
+    json=$(mktemp) || return 1
+    if ! timeout "$((duration + 20))" iperf3 -c "$peer" -p "$port" -t "$duration" -P "$parallel" -J > "$json" 2>/dev/null; then
+        rm -f -- "$json"
+        return 1
+    fi
+    bps=$(jq -r '.end.sum_sent.bits_per_second // .end.sum.bits_per_second // 0' "$json")
+    bytes=$(jq -r '.end.sum_sent.bytes // .end.sum.bytes // 0' "$json")
+    retrans=$(jq -r '.end.sum_sent.retransmits // ([.end.streams[]?.sender.retransmits // 0] | add) // 0' "$json")
+    rm -f -- "$json"
+    is_decimal "$bps" && is_uint "$bytes" && is_uint "$retrans" || return 1
+    goodput=$(awk -v b="$bps" 'BEGIN {printf "%.2f", b/1000000}')
+    # An estimate, not packet loss: iperf retransmits / estimated MSS-sized segments.
+    ratio=$(awk -v r="$retrans" -v b="$bytes" 'BEGIN {n=b/1448; if(n<1)n=1; printf "%.5f", r*100/n}')
+    printf '%s\t%s\t%s\t%s\n' "$goodput" "$retrans" "$bytes" "$ratio"
+}
+
+median_numbers() { sort -n | awk '{a[NR]=$1} END {if(NR) {if(NR%2) print a[(NR+1)/2]; else printf "%.5f\n", (a[NR/2]+a[NR/2+1])/2}}'; }
+
+sample_repeated() {
+    local peer="$1" port="$2" duration="$3" parallel="$4" count="$5" label="$6"
+    local -a rows=() goodputs=() retrans=() bytes=() ratios=()
+    local row i
+    for ((i=1; i<=count; i++)); do
+        log INFO "$label: ${duration}s × ${parallel} flow(s), sample ${i}/${count}"
+        row=$(iperf_sample "$peer" "$port" "$duration" "$parallel") || { die "iperf3 测试失败或对端繁忙"; return 1; }
+        rows+=("$row")
+        IFS=$'\t' read -r g r b l <<< "$row"
+        goodputs+=("$g"); retrans+=("$r"); bytes+=("$b"); ratios+=("$l")
+        [[ -n "$MEASURE_RESULT_FILE" ]] && printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(utc_now)" "$label" "$g" "$r" "$b" "$l" >> "$MEASURE_RESULT_FILE"
+        (( i < count )) && sleep 2
+    done
+    printf '%s\t%s\t%s\t%s\n' \
+        "$(printf '%s\n' "${goodputs[@]}" | median_numbers)" \
+        "$(printf '%s\n' "${retrans[@]}" | median_numbers)" \
+        "$(printf '%s\n' "${bytes[@]}" | median_numbers)" \
+        "$(printf '%s\n' "${ratios[@]}" | median_numbers)"
+}
+
+loss_spike() {
+    local value="$1" threshold="$2" base="$3"
+    awk -v v="$value" -v t="$threshold" -v b="$base" 'BEGIN {
+        if (v <= t) exit 1;
+        if (b > 0 && v < b*5) exit 1;
+        exit 0
+    }'
+}
+
+estimate_sweep_bytes() {
+    local high="$1" duration="$2" tests="$3"
+    awk -v r="$high" -v d="$duration" -v n="$tests" 'BEGIN {printf "%.0f", r*1000000/8*d*n*1.08}'
+}
+
+new_measure_run() {
+    local kind="$1" dir
+    ensure_state_layout
+    dir="$HISTORY_DIR/$(history_stamp)-${kind}"
+    mkdir -p "$dir"
+    chmod 0700 "$dir"
+    MEASURE_RESULT_FILE="$dir/samples.tsv"
+    MEASURE_RUN_DIR="$dir"
+    printf 'TIME\tLABEL\tGOODPUT_MBIT\tRETRANSMITS\tBYTES\tRETRANS_RATIO_EST_PERCENT\n' > "$MEASURE_RESULT_FILE"
+}
+
+measure_probe() {
+    require_root; acquire_lock; tc_dependencies
+    require_commands iperf3 jq timeout
+    local peer="$1" port="$2" requested="$3" duration="$4" parallel="$5" iface dir row rc=0 speed estimate
+    validate_peer "$peer" "$port" || return 1
+    is_uint "$duration" && is_uint "$parallel" && ((duration>=3 && duration<=120 && parallel>=1 && parallel<=32)) || { die "duration/parallel 超出安全范围"; return 1; }
+    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return 1; }
+    iface=$(detect_interface "$requested") || return 1
+    qdisc_guard "$iface" || return 1
+    speed=$(detect_link_speed "$iface")
+    if is_uint "$speed"; then
+        estimate=$(estimate_sweep_bytes "$speed" "$duration" 3)
+        log INFO "按接口速率估算，probe 最多可能产生约 $(human_bytes "$estimate") 出站流量"
+    fi
+    new_measure_run probe
+    dir="$MEASURE_RUN_DIR"
+    measure_begin "$iface" || return 1
+    if apply_fq "$iface" && row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 3 unshaped); then
+        printf 'TYPE\tprobe\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nGOODPUT_MBIT\t%s\nRETRANS_RATIO_EST_PERCENT\t%s\n' \
+            "$peer" "$port" "$iface" "$(cut -f1 <<< "$row")" "$(cut -f4 <<< "$row")" > "$dir/summary.tsv"
+        log OK "可用带宽中位数: $(cut -f1 <<< "$row") Mbit/s，重传比例估算: $(cut -f4 <<< "$row")%"
+        log INFO "结果: $dir"
+    else rc=$?; fi
+    traffic_report "$iface"
+    measure_restore || rc=$?
+    return "$rc"
+}
+
+measure_sweep() {
+    require_root; acquire_lock; tc_dependencies
+    require_commands iperf3 jq timeout
+    local peer="$1" port="$2" requested="$3" nominal="$4" low="$5" high="$6" step="$7"
+    local duration="$8" parallel="$9" margin="${10}" threshold="${11}" force_scan="${12}" cap="${13}"
+    local iface dir baseline_row baseline_gp baseline_loss base_row base_loss rate row gp loss
+    local last_ok="" broke_at="" fine_start fine_step recommend confirm_row estimated tests rc=0 no_knee=0 above_cap=0 baseline_duration
+    validate_peer "$peer" "$port" || return 1
+    for value in "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$cap"; do is_uint "$value" || { die "扫描参数必须为非负整数"; return 1; }; done
+    is_decimal "$threshold" || { die "loss threshold 必须是数字"; return 1; }
+    (( duration >= 3 && duration <= 120 && parallel >= 1 && parallel <= 32 && margin <= 25 && cap >= 100 && cap <= 1000000 )) || { die "扫描参数超出安全范围"; return 1; }
+    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return 1; }
+    iface=$(detect_interface "$requested") || return 1
+    qdisc_guard "$iface" || return 1
+    new_measure_run sweep
+    dir="$MEASURE_RUN_DIR"
+    measure_begin "$iface" || return 1
+
+    baseline_duration="$duration"; ((baseline_duration>5)) && baseline_duration=5
+    if ! apply_fq "$iface" || ! baseline_row=$(sample_repeated "$peer" "$port" "$baseline_duration" 1 2 unshaped); then rc=$?; else
+        baseline_gp=$(cut -f1 <<< "$baseline_row"); baseline_loss=$(cut -f4 <<< "$baseline_row")
+        if awk -v g="$baseline_gp" -v c="$cap" 'BEGIN {exit !(g>c)}'; then
+            above_cap=1; no_knee=1
+            log WARN "不限速单流达到 ${baseline_gp} Mbit/s，超过扫描上限 ${cap} Mbit/s；跳过整形扫描"
+        fi
+        (( nominal > 0 )) || nominal=$(awk -v g="$baseline_gp" 'BEGIN {printf "%d", g+0.5}')
+        (( low > 0 )) || low=$(awk -v g="$baseline_gp" 'BEGIN {v=g*0.80; if(v<1)v=1; printf "%d", v}')
+        (( high > 0 )) || high=$(awk -v g="$baseline_gp" 'BEGIN {v=g*1.30; if(v<2)v=2; printf "%d", v}')
+        (( step > 0 )) || { step=$((nominal / 20)); ((step < 5)) && step=5; }
+        (( high > low )) || { die "扫描上界必须大于下界"; rc=1; }
+    fi
+
+    if (( rc == 0 )); then
+        tests=$((2 + (high-low)/step + 6))
+        estimated=$(estimate_sweep_bytes "$high" "$duration" "$tests")
+        log INFO "预计最多测试 $tests 次、产生约 $(human_bytes "$estimated") 出站流量"
+
+        if (( above_cap )); then
+            :
+        elif (( ! force_scan )) && ! loss_spike "$baseline_loss" "$threshold" 0; then
+            no_knee=1
+            log WARN "不限速测试未出现明显重传跳变，不建议启用 HTB"
+        else
+            apply_shaping "$iface" "$low" || rc=$?
+            if (( rc == 0 )); then
+                base_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "rate-${low}") || rc=$?
+                base_loss=$(cut -f4 <<< "${base_row:-$'0\t0\t0\t0'}")
+            fi
+            if (( rc == 0 )) && loss_spike "$base_loss" "$threshold" 0; then
+                die "扫描下界 ${low} Mbit 已有明显重传，无法建立干净本底；请降低 --low 或更换 peer"
+                rc=2
+            fi
+            if (( rc == 0 )); then
+                last_ok="$low"
+                for ((rate=low+step; rate<=high; rate+=step)); do
+                    apply_shaping "$iface" "$rate" || { rc=$?; break; }
+                    row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "rate-${rate}") || { rc=$?; break; }
+                    gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
+                    printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%%\n' "$rate" "$gp" "$loss"
+                    if loss_spike "$loss" "$threshold" "$base_loss"; then broke_at="$rate"; break; fi
+                    last_ok="$rate"
+                done
+            fi
+            if (( rc == 0 )) && [[ -n "$broke_at" ]]; then
+                fine_step=$((step / 5)); ((fine_step < 1)) && fine_step=1
+                fine_start=$((last_ok + fine_step))
+                for ((rate=fine_start; rate<broke_at; rate+=fine_step)); do
+                    apply_shaping "$iface" "$rate" || { rc=$?; break; }
+                    row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "refine-${rate}") || { rc=$?; break; }
+                    loss=$(cut -f4 <<< "$row")
+                    if loss_spike "$loss" "$threshold" "$base_loss"; then broke_at="$rate"; break; fi
+                    last_ok="$rate"
+                done
+            fi
+            if (( rc == 0 )) && [[ -n "$last_ok" ]]; then
+                recommend=$(( last_ok * (100-margin) / 100 )); ((recommend < 1)) && recommend=1
+                apply_shaping "$iface" "$recommend" || rc=$?
+                if (( rc == 0 )); then
+                    confirm_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "confirm-${recommend}") || rc=$?
+                    loss=$(cut -f4 <<< "${confirm_row:-$'0\t0\t0\t999'}")
+                    if (( rc == 0 )) && loss_spike "$loss" "$threshold" "$base_loss"; then
+                        log WARN "推荐档复测仍有跳变，请降低速率或更换对端复测"
+                    fi
+                fi
+            elif (( rc == 0 )); then
+                no_knee=1
+                log WARN "扫描到上界仍未发现拐点，不建议基于本次结果启用整形"
+            fi
+        fi
+    fi
+
+    if (( rc == 0 )); then
+        printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nABOVE_CAP\t%s\n' \
+            "$peer" "$port" "$iface" "${baseline_gp:-}" "${baseline_loss:-}" "$low" "$high" "$step" "${last_ok:-}" "${broke_at:-}" "${recommend:-}" "$margin" "$no_knee" "$above_cap" > "$dir/summary.tsv"
+        if [[ -n "${recommend:-}" ]]; then
+            log OK "扫描完成: last clean=${last_ok} Mbit, break=${broke_at:-above-range} Mbit, 推荐=${recommend} Mbit"
+            log INFO "确认业务表现后执行: ${0##*/} tc enable ${recommend} --knee ${broke_at:-0} --margin ${margin} --interface ${requested}"
+        fi
+        log INFO "完整结果: $dir"
+    fi
+    traffic_report "$iface"
+    measure_restore || rc=$?
+    return "$rc"
+}

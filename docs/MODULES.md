@@ -1,26 +1,68 @@
-# net-tcp-tune.sh 逻辑模块地图
+# BBRv3 Lite 模块结构
 
-主脚本 `net-tcp-tune.sh` 为单文件部署设计（支持 curl 在线执行），以下为内部逻辑分区，便于后续按需拆分。
+`src/` 是可维护源码，`net-tcp-tune.sh` 是生成的单文件发布物。不要直接修改生成文件；修改模块后运行 `bash scripts/build.sh`。
 
-| 行号区间（约） | 模块 | 核心函数 |
-| --- | --- | --- |
-| 1–200 | 初始化 | 颜色、常量、`log()`、`check_root()` |
-| 200–560 | 依赖与磁盘 | `ensure_packages()`、`check_disk_space()`、`add_swap()` |
-| 560–1040 | IPv6 | `manage_ipv6()`、`disable_ipv6_permanent()` |
-| 1040–1720 | 测速与带宽 | `detect_bandwidth()`、`calculate_buffer_size()` |
-| 1720–2580 | TCP/BBR 调优 | `bbr_configure_direct()`、`apply_tc_fq_now()` |
-| 2580–3120 | 内核与预检 | `check_bbr_status()`、`import_xanmod_gpg_key()`、`show_environment_precheck()` |
-| 3120–3550 | 状态展示 | `install_xanmod_kernel()`、`show_detailed_status()` |
-| 3550–5740 | DNS 净化 | `dns_purify_and_harden()`（含动态生成 rollback.sh） |
-| 5740–6180 | 网络测试 | `run_speedtest()`、`run_backtrace()`、`iperf3_single_thread_test()` |
-| 6180–6580 | 一键优化 | `one_click_optimize()` |
-| 6580–6994 | 菜单与入口 | `show_main_menu()`、`main()` |
+| 顺序 | 模块 | 职责 |
+| ---: | --- | --- |
+| 00 | `00-header.sh` | shebang、版本、项目与 schema 常量 |
+| 10 | `core.sh` | 路径、日志、确认、全局锁、原子安装 |
+| 20 | `config.sh` | 默认配置、白名单验证、严格加载与保存 |
+| 30 | `platform.sh` | OS/虚拟化/网卡/MTU/机器画像与依赖 |
+| 40 | `state.sh` | 状态 schema、不可覆盖基线、路径与 sysctl 快照 |
+| 50 | `sysctl.sh` | balanced/adaptive profile、BBR 验证、init windows |
+| 60 | `tc.sh` | qdisc guard、HTB/FQ、动态 bucket、事务和状态 |
+| 70 | `measure.sh` | iperf3 JSON、probe、sweep、历史和流量统计 |
+| 80 | `systemd.sh` | v6 迁移、统一服务、apply、restore、uninstall |
+| 90 | `kernel.sh` | 官方 XanMod APT、CPU level、安全预检 |
+| 100 | `dns.sh` | systemd-resolved 策略和独立恢复 |
+| 110 | `ipv6.sh` | 临时/永久禁用和原值恢复 |
+| 120 | `update.sh` | GitHub Release + SHA256 自更新 |
+| 130 | `cli.sh` | 子命令、帮助、交互菜单和 main |
 
-## 拆分建议（未来）
+## 依赖方向
 
-1. `lib/download.sh` — `safe_download_script` / `verify_downloaded_script` / `run_remote_script`
-2. `lib/xanmod.sh` — GPG、APT 源、CPU level、包选择
-3. `lib/dns.sh` — DNS 净化与回滚生成
-4. `lib/tcp-tune.sh` — sysctl、tc fq、RPS/RFS
+```text
+core
+  ├─ config
+  ├─ platform
+  └─ state
+       ├─ sysctl
+       └─ tc
+            └─ measure
 
-拆分时须保留单文件 curl 发布通道，或同步更新 `install-alias.sh` 拉取完整包。
+systemd -> config + state + sysctl + tc
+kernel  -> core + platform
+dns     -> core + measure(peer TCP check)
+ipv6    -> core
+cli     -> all modules
+```
+
+构建顺序由 `scripts/build.sh` 中的显式数组控制。模块不互相 `source`，避免发布单文件中出现运行时路径依赖。
+
+## 状态边界
+
+- `/etc/bbrv3-lite.conf`：唯一运行配置，严格解析。
+- `/etc/sysctl.d/99-bbrv3-lite.conf`：本项目 TCP sysctl。
+- `/var/lib/bbrv3-lite/baseline`：第一次可信基线，永不覆盖。
+- `/var/lib/bbrv3-lite/history`：probe/sweep 每次运行的样本与摘要。
+- `/usr/local/lib/bbrv3-lite/net-tcp-tune.sh`：systemd 使用的固定副本。
+- `/etc/systemd/system/bbrv3-lite.service`：唯一持久化服务。
+
+DNS 和 IPv6 使用各自的状态子目录，不由 TCP `restore` 擅自处理。
+
+## 关键不变量
+
+1. 配置文件不得由 shell `source` 或 `eval`。
+2. 未知 root qdisc 不得覆盖。
+3. 测量退出、超时和信号中断后必须恢复操作前 qdisc。
+4. 扫描结果不得自动持久化。
+5. systemd unit 不得硬编码接口、速率或 profile。
+6. 缺少 BBR 时不得静默回退到 cubic。
+7. 初始基线不得被后续运行覆盖。
+8. 生成脚本必须通过 `bash -n`、核心测试和 ShellCheck。
+
+## 测试
+
+- `tests/test_core.sh`：配置注入、v6 迁移、profile 计算、TC 事务、测量判断、systemd unit。
+- `tests/integration_tc.sh`：一次性网络命名空间中的真实 HTB/FQ 创建、验证和移除。
+- `scripts/validate.sh`：重建发布物、语法、架构标记、单元测试和 ShellCheck。

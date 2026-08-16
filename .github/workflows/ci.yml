@@ -13,3 +13,11 @@ jobs:
 
       - name: Validate
         run: bash scripts/validate.sh
+
+      - name: Generated file is current
+        run: git diff --exit-code -- net-tcp-tune.sh
+
+      - name: TC integration test
+        run: |
+          docker run --rm --cap-add NET_ADMIN -v "$PWD:/src:ro" debian:12 \
+            bash -lc 'apt-get update -qq && apt-get install -y -qq iproute2 procps util-linux >/dev/null && bash /src/tests/integration_tc.sh'

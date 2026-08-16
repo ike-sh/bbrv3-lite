@@ -1,306 +1,334 @@
-# BBR v3 / XanMod / TCP 网络调优脚本
+# BBRv3 Lite
 
-当前版本：v5.2.14
+BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-本精简版只保留网络调优相关功能，聚焦 XanMod 内核、BBR v3、TCP 参数调优、DNS 净化、IPv6 管理，以及必要的测速、预检和回滚能力。
-原项目：https://github.com/Eric86777/vps-tcp-tune
-项目 License 保持不变，详见 [LICENSE](LICENSE)。
+当前版本：v7.0.0
 
-## 安装快捷命令
+项目不追求“sysctl 越多越好”。默认配置保持克制，出口整形必须经过测试，测量结果不会自动写入生产配置。
 
-新机器如果未安装 `curl`，请先执行：
+## 核心能力
 
-```bash
-apt update -y && apt install curl -y
+- BBR + FQ 基础调优，以及可选的 BDP/RAM 自适应缓冲区。
+- `HTB root -> FQ leaf` 接口聚合出口整形，不用 FQ `maxrate` 冒充总限速。
+- `iperf3 -J` JSON 探测、粗扫、细扫、边界复测和测速流量统计。
+- IPv4 优先、IPv6 兜底的默认出口检测；不会遍历修改 Docker/veth/bridge 接口。
+- 全局 `flock`，防止两个进程同时修改 sysctl、qdisc 或配置。
+- 严格 `KEY=VALUE` 白名单解析，配置文件从不被 shell `source`。
+- 首次可信基线不可覆盖；测试中断或应用失败时恢复操作前 qdisc。
+- 一个配置、一个 systemd 服务、一个发布脚本，不产生竞争 root qdisc 的服务。
+- 官方 XanMod APT 安装、Secure Boot/容器检查、CPU level 保守选择和 APT 网络组件保护。
+- DNS 和 IPv6 各自独立备份、独立恢复，不把无关系统改动塞进一次“大回滚”。
+
+## 架构
+
+```mermaid
+flowchart LR
+    CLI["CLI / 交互菜单"] --> CFG["严格配置解析"]
+    CLI --> DETECT["机器与默认出口检测"]
+    CLI --> MEASURE["probe / sweep"]
+    MEASURE --> TEMP["临时 HTB + FQ"]
+    TEMP --> RESULT["历史样本与推荐值"]
+    CFG --> APPLY["事务化 apply"]
+    APPLY --> SYSCTL["BBR + sysctl profile"]
+    APPLY --> TC["HTB aggregate -> FQ leaf"]
+    APPLY --> SERVICE["bbrv3-lite.service"]
+    APPLY --> BASELINE["不可覆盖的可信基线"]
 ```
 
-推荐安装 `/usr/local/bin/bbr` 系统命令：
+仓库源码位于 `src/`，发布时由 `scripts/build.sh` 按固定顺序生成根目录的 `net-tcp-tune.sh`。用户仍然可以只下载一个文件，维护和测试则按模块进行。
+
+## 安装
+
+推荐安装最新 GitHub Release，并校验 `SHA256SUMS`：
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/install-alias.sh?$(date +%s)")
-bbr
+curl -fsSL https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/install-alias.sh -o /tmp/install-bbrv3-lite.sh
+bash /tmp/install-bbrv3-lite.sh
+bbr version
 ```
 
-安装脚本会优先写入 `/usr/local/bin/bbr`。如果当前用户无法写入 `/usr/local/bin`，会自动回退到 shell function 方式，并提示执行 `source ~/.bashrc` 或 `source ~/.zshrc`。
-
-卸载快捷命令：
+测试尚未发布的 `main` 分支时必须显式选择 channel；它同样校验仓库中的 `SHA256SUMS`：
 
 ```bash
-bash install-alias.sh uninstall
+bash /tmp/install-bbrv3-lite.sh --channel main
 ```
 
-卸载时会同时尝试删除 `/usr/local/bin/bbr` 和 shell 快捷命令 block。
+root 用户默认安装到 `/usr/local/bin/bbr`；普通用户安装到 `~/.local/bin/bbr`。普通用户仍需使用 `sudo bbr ...` 执行会修改系统的命令。
 
-## 本地验证
-
-```bash
-bash scripts/validate.sh
-bash install-alias.sh uninstall
-```
-
-## 在线运行
-
-不安装快捷命令，临时在线运行：
+也可以直接下载单文件：
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh?$(date +%s)")
-```
-
-也可以下载到本地后执行：
-
-```bash
-wget -O net-tcp-tune.sh "https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/net-tcp-tune.sh?$(date +%s)"
+curl -fsSLO https://github.com/ike-sh/bbrv3-lite/releases/latest/download/net-tcp-tune.sh
+curl -fsSLO https://github.com/ike-sh/bbrv3-lite/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
 chmod +x net-tcp-tune.sh
-./net-tcp-tune.sh
+sudo ./net-tcp-tune.sh status
 ```
 
-## 保留功能
+## 推荐流程
 
-| 编号 | 功能 |
-| :--: | --- |
-| 1 | 安装/更新 XanMod 内核 + BBR v3 |
-| 2 | 卸载 XanMod 内核 |
-| 3 | BBR 直连/落地优化（智能带宽检测） |
-| 4 | DNS 净化（抗污染/驯服 DHCP） |
-| 5 | IPv6 管理（临时/永久禁用/取消） |
-| 6 | 查看系统详细状态 |
-| 7 | 服务器带宽测试 |
-| 8 | iperf3 单线程测试 |
-| 9 | 三网回程路由测试 |
-| 10 | 一键全自动优化（BBR v3 + 网络调优） |
-| 11 | 环境预检 / 兼容性检查 |
-| 12 | 回滚 / 卸载管理 |
+### 1. 只读检测
 
-## 系统兼容性
+```bash
+sudo bbr detect
+sudo bbr detect --target 你的业务目标或近端iperf服务器
+sudo bbr kernel status
+```
 
-完整支持 Debian/Ubuntu KVM；其他发行版仅保证部分功能可尝试，不作为主要支持目标。
+`detect` 输出内核、虚拟化、内存、默认出口、驱动、MTU、链路速率、RX 队列、BBR 可用性和可选目标 RTT，不修改系统。
 
-| 环境 | 支持状态 | 说明 |
-| --- | --- | --- |
-| Debian 12 bookworm / Debian 13 trixie + KVM + x86_64 | 完整支持 | 推荐环境，支持 XanMod + BBR v3 + TCP 调优 |
-| Ubuntu 22.04 / 24.04 或常见 LTS + KVM + x86_64 | 完整支持 | 使用系统自身 codename 添加 XanMod 源 |
-| Debian/Ubuntu ARM64 | 实验/部分支持 | 使用仓库内 `bbrv3arm.sh`；社区 XanMod 内核，建议先做快照 |
-| Rocky / Alma / CentOS / Fedora / RHEL | 部分支持 | sysctl、测速等功能可尝试，不保证 XanMod 安装 |
-| OpenVZ / LXC / Docker 容器 | 不建议/通常不支持 | 通常不能自行更换内核 |
-| Alpine | 非主要目标 | 仅少量逻辑可能兼容 |
-| 非 systemd 系统 | 部分功能不可用 | DNS 净化、服务持久化等可能不可用 |
+### 2. 按需安装 XanMod
 
-建议先执行功能 11：环境预检 / 兼容性检查，截图结果便于排障。
+如果当前内核没有 BBR，或希望使用包含 BBRv3 的 XanMod：
 
-## XanMod 源与包名选择
+```bash
+sudo bbr kernel install --track lts
+sudo reboot
+```
 
-脚本不使用固定的 `releases` APT 源，也不固定安装单一包名。
+重启后再次执行 `sudo bbr kernel status`。XanMod 官方 APT 当前只面向 amd64 Debian 系发行版；ARM64 社区内核不再由本项目自动下载和安装，避免把未经项目控制的第三方内核带入默认信任链。
 
-- 通过 `/etc/os-release` 读取 `VERSION_CODENAME`。
-- Debian 12 使用 `bookworm`，Debian 13 使用 `trixie`。
-- Ubuntu 使用系统自身 codename。
-- 添加的 XanMod APT 源格式为：
+### 3. 安装基础调优
+
+推荐默认档：
+
+```bash
+sudo bbr install --profile balanced
+```
+
+高 BDP 线路可以先查看自适应计算结果，再应用：
+
+```bash
+sudo bbr explain --profile adaptive --role proxy --bandwidth 1000 --rtt 180
+sudo bbr install --profile adaptive --role proxy --bandwidth 1000 --rtt 180
+```
+
+`balanced` 使用 16 MiB TCP 自动调优上限。`adaptive` 使用 `2 × BDP`，同时受 4 MiB 下限、RAM/32 和 256 MiB 绝对上限约束。两种 profile 都不会修改 `tcp_mem`、`tcp_adv_win_scale`、TIME_WAIT、端口范围、VM、文件句柄或 RPS/RFS。
+
+### 4. 准备可信 iperf3 对端
+
+优先使用同机房或低 RTT 的自有服务器：
+
+```bash
+# 对端
+iperf3 -s
+
+# 本机安装测量依赖
+sudo bbr measure deps
+```
+
+公共 iperf3 节点可能繁忙、限速或路径不稳定。工具不会内置不受控制的公共节点列表，也不会把“到中国大陆的线路表现”和“VPS 端口能力”混为一谈。
+
+### 5. 探测与扫描
+
+先探测可用吞吐：
+
+```bash
+sudo bbr measure probe --peer 192.0.2.10 --port 5201 --duration 10 --parallel 4
+```
+
+自动扫描 policer 拐点：
+
+```bash
+sudo bbr measure sweep --peer 192.0.2.10 --nominal 500
+```
+
+也可以控制扫描区间：
+
+```bash
+sudo bbr measure sweep \
+  --peer 192.0.2.10 \
+  --low 350 --high 600 --step 25 \
+  --duration 8 --parallel 1 \
+  --margin 3 --loss-threshold 0.1 --cap 5000
+```
+
+扫描流程：
+
+1. 保存操作前 qdisc 和接口流量计数器。
+2. 使用 root FQ 做两次不超过 5 秒的单流不限速 JSON 测试并取中位数；超过 `--cap` 时停止扫描。
+3. 建立低速率重传本底。
+4. 使用与最终部署完全相同的 HTB/FQ 层级向上粗扫。
+5. 发现重传比例跳变后细扫边界。
+6. 对最后干净档位退让 `--margin`，再进行两次确认测试。
+7. 保存样本并恢复操作前 qdisc。
+
+结果保存在 `/var/lib/bbrv3-lite/history/`。这里显示的 `RETRANS_RATIO_EST_PERCENT` 是“iperf3 retransmits / 按 1448 字节估算的 TCP 段数”，用于寻找相对跳变，不是抓包意义上的真实丢包率。
+
+如果不限速测试没有明显跳变，工具会建议保持纯 FQ。只有用户显式指定区间或 `--force-scan` 才会继续扫描。
+
+### 6. 试跑和持久化
+
+```bash
+# 临时试跑，不写配置、不安装服务
+sudo bbr tc trial 420
+
+# 确认业务延迟、吞吐和重传后再持久化
+sudo bbr tc enable 420 --knee 440 --margin 3
+
+sudo bbr tc status
+sudo bbr tc stats
+```
+
+关闭整形但保留 BBR + FQ：
+
+```bash
+sudo bbr tc disable
+```
+
+## HTB/FQ 参数原则
+
+- HTB 只负责接口聚合出口上限。
+- FQ 只负责流隔离和 pacing，不设置每流 `maxrate`。
+- HTB `burst` 根据 `rate / HZ`、MTU 和 32 KiB 下限动态计算，避免固定小 bucket 在高速率下限制吞吐。
+- `cburst` 使用 `2 × MTU`；单 class 场景的 quantum 使用 `10 × MTU`，最大 60000 字节。
+- 固定 handle 为 `1:`、`1:10`、`10:`，重复执行使用 `replace`，不会不断叠加层级。
+- FQ/FQ-CoDel 会保存并重放 `tc qdisc show` 可恢复的参数；发现未知 root qdisc（例如自建 CAKE）时拒绝覆盖。
+
+本工具只处理 egress，不自动创建 IFB，也不做 ingress shaping。
+
+## 配置和持久化
+
+配置文件：`/etc/bbrv3-lite.conf`
+
+```ini
+SCHEMA_VERSION=1
+BBR_ENABLED=1
+SYSCTL_PROFILE=adaptive
+ROLE=proxy
+BANDWIDTH_MBIT=1000
+RTT_MS=180
+TC_ENABLED=1
+TC_INTERFACE=auto
+TC_RATE_MBIT=420
+TC_KNEE_MBIT=440
+TC_MARGIN_PERCENT=3
+INITCWND=0
+INITRWND=0
+```
+
+配置只允许已知键和受限字符；生产环境要求 root 所有，权限为 `600` 或 `644`。`INITCWND/INITRWND` 默认保持 0，不覆盖路由默认值。
+
+唯一持久化服务为 `bbrv3-lite.service`。unit 只执行：
 
 ```text
-deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${VERSION_CODENAME} main
+/usr/local/lib/bbrv3-lite/net-tcp-tune.sh apply
 ```
 
-`apt update` 后，脚本会通过 `apt-cache search '^linux-xanmod'` 查找仓库中实际可用的包名，并严格按 CPU 支持等级选择：
+网卡、速率和 profile 始终从配置文件读取，不会硬编码进 systemd unit。
 
-- CPU 支持 x64v4：优先 `linux-xanmod-lts-x64v4`，再逐级回退到 x64v3、x64v2、x64v1。
-- CPU 支持 x64v3：优先 `linux-xanmod-lts-x64v3`，再回退到 x64v2、x64v1。
-- CPU 支持 x64v2：只会选择 x64v2 或 x64v1。
-- CPU 只支持 x64v1 或无法可靠识别：只会选择 x64v1。
+## 基线、迁移和恢复
 
-安装前会打印系统 codename、检测到的 CPU level、最终选择的 XanMod 包名和当前 XanMod APT 源。找不到合适包时，会打印当前 `apt-cache search '^linux-xanmod'` 的候选列表用于排障。
+第一次修改前会在 `/var/lib/bbrv3-lite/baseline/` 保存：
 
-## DoT 853 被封时的 DoH Fallback
+- 配置、sysctl 文件和新旧 systemd unit 的存在状态及内容。
+- 本工具会修改的运行时 sysctl 值。
+- 默认出口以及 qdisc/class 文本快照。
+- schema、脚本版本、时间和 provenance。
 
-功能 4：DNS 净化会保留原有 DoT 853 连通性检测。
+基线一旦存在就不会覆盖。如果检测到旧调优痕迹但没有可信备份，安装会中止。只有明确接受当前状态为恢复起点时才执行：
 
-- 如果 DoT 853 可达，继续使用原有 `systemd-resolved` + `DNSOverTLS` 配置。
-- 如果 DoT 853 不可达，脚本会提示可能是 NAT 商家或机房防火墙封锁出站 853，并询问是否自动切换到 DoH 443 模式。
-- DoH 443 模式优先使用系统源安装 `dnscrypt-proxy`，不会强行编译安装。
-- 配置 `dnscrypt-proxy` 前会检测本机 53 端口占用。
-- 如果 53 未占用，`dnscrypt-proxy` 监听 `127.0.0.1:53`。
-- 如果 53 已占用，自动改用 `127.0.0.1:5353`，并让 `systemd-resolved` 指向对应地址。
-- 如果 DoH 模式也失败，脚本会继续询问是否降级为普通 DNS 53。
-- 如果用户拒绝 DoH 和普通 DNS 53 降级，DNS 净化会被跳过，不影响后续 BBR/TCP 调优流程。
-
-DNS 净化执行前会备份 `systemd-resolved`、`resolv.conf`、`dnscrypt-proxy` 等相关配置；成功完成后会输出回滚脚本路径。
-
-## 功能 10：一键全自动优化
-
-一键全自动优化仍然保留原项目自动化逻辑。
-
-执行链路保持为：
-
-```text
-1 -> 3 -> 4 -> 5
+```bash
+sudo bbr baseline adopt
 ```
 
-一键全自动优化分两阶段执行：
+v6 的 `balanced-minimal`、`TC_BASELINE_MBIT`、`TC_PERCENT` 和旧 service 会在已有 `/var/lib/bbrv3-lite/original` 且能保存旧版持久化脚本的前提下迁移；新基线引用旧原始备份，旧备份不会删除。如果缺少其中任一项，工具会拒绝伪造“出厂基线”。
 
-- 首次执行：安装 XanMod/BBR v3 内核并提示重启。
-- 重启后再次进入脚本选择“一键全自动优化”：自动执行 BBR 直连优化、DNS 净化和 IPv6 管理。
+恢复首次可信基线：
 
-v5.1.0 起，一键优化最后会输出结果汇总，标记每一步成功、失败或跳过，并给出 DNS 回滚、IPv6 恢复、XanMod 卸载等提示。DNS、IPv6 这类辅助步骤失败时不会阻断 BBR/TCP 主流程。
+```bash
+sudo bbr restore
+```
 
-v5.1.1 起，IPv6 汇总状态以真实 sysctl 检测为准：只有 `net.ipv6.conf.all.disable_ipv6`、`net.ipv6.conf.default.disable_ipv6`、`net.ipv6.conf.lo.disable_ipv6` 三项均为 `1` 时，才显示 IPv6 已永久禁用。
+普通卸载保留基线和测量历史：
 
-v5.2.1 起，如果系统已有 `/etc/sysctl.conf` 中的 `disable_ipv6=0`，脚本会在永久禁用 IPv6 前自动备份并注释冲突项，避免 `sysctl --system` 后旧配置覆盖禁用结果。
+```bash
+sudo bbr uninstall
+```
 
-v5.2.2 起，永久禁用 IPv6 时不会再把脚本自身的 `/etc/sysctl.d/.ipv6-state-backup.conf` 误报为其他 `sysctl.d` 冲突项；这是提示修复，不影响 IPv6 禁用/恢复核心逻辑。
+不可恢复地删除状态目录必须显式指定：
 
-v5.2.3 起，DNS 净化安全检查的磁盘空间读取改为更稳健的 `df -Pm /`；只有明确读到根分区可用空间小于 100MB 时才阻止执行，无法读取时改为警告，不再误拦截。
+```bash
+sudo bbr uninstall --purge-state
+```
 
-v5.2.4 起，小盘机器如果不适合安装 XanMod / BBR v3，但系统内核支持普通 BBR，一键优化会提示是否继续轻量优化（TCP 调优 / DNS 净化 / IPv6 管理）。
+## DNS 与 IPv6
 
-v5.2.5 起，环境预检结论会综合磁盘空间、普通 BBR 支持和 XanMod 候选状态；小盘和轻量优化场景也会区分“系统普通 BBR”和“XanMod / BBR v3”。
+DNS 使用独立的 systemd-resolved drop-in：
 
-v5.2.6 起，speedtest 自动安装下载支持 curl/wget fallback；下载失败或缺少下载工具时会明确提示，并继续使用默认带宽值，不阻断 TCP 调优流程。
+```bash
+sudo bbr dns apply auto   # 853 可达用 DoT，否则明确降级普通 DNS
+sudo bbr dns apply dot
+sudo bbr dns status
+sudo bbr dns restore
+```
 
-v5.2.7 起，DNS 已存在有效配置并跳过重复执行时，一键优化汇总会显示“已配置，跳过重复执行”，不再误显示“未执行”。
+v7 不再自动安装和改写 dnscrypt-proxy。DoH 代理涉及本地 53 端口、发行版配置和额外软件生命周期，应该作为独立组件管理，而不是 BBR 安装的隐式副作用。
 
-v5.2.8 起，远程脚本、快捷命令 fallback、依赖安装判断、IPv6 取消永久禁用和 speedtest 自动安装路径增加安全校验；测速工具失败时仍降级到默认带宽，不阻断 TCP 调优流程。
+IPv6 管理：
 
-## 回滚 / 卸载
+```bash
+sudo bbr ipv6 disable temporary
+sudo bbr ipv6 disable permanent
+sudo bbr ipv6 status
+sudo bbr ipv6 restore
+```
 
-功能 12：回滚 / 卸载管理提供统一入口：
+IPv6 恢复使用首次记录的 `all/default/lo.disable_ipv6` 原值，不假设原始值一定为 0。
 
-- 卸载 XanMod 内核。
-- 删除本脚本生成的 TCP/sysctl 调优配置。
-- 删除 `tc` / MSS clamp / `bbr-optimize-persist.service` 持久化。
-- 自动查找并执行最近一次 DNS 净化回滚脚本。
-- 恢复 IPv6。
-- 删除 `/usr/local/bin/bbr` 快捷命令。
-- 查看 DNS、sysctl 相关备份目录。
+## 完整命令
 
-所有删除或恢复操作都会打印将处理的路径，并要求二次确认。
+```bash
+bbr help
+```
 
-## 使用建议
+无参数并连接终端时显示精简交互菜单；自动化和排障建议使用显式子命令。
 
-- 首次使用建议先执行功能 11 做环境预检。
-- 确认适合换内核后，再执行功能 1，重启进入 XanMod 内核后执行功能 3 或功能 10。
-- 不确定带宽档位时，功能 3 可使用自动检测，让脚本沿用原项目的 Speedtest、BDP 计算和 sysctl 模板逻辑。
-- 调优后可用功能 6 查看系统状态，用功能 7、8、9 辅助验证线路表现。
+## 支持范围
 
-## 风险提醒
+| 环境 | 支持情况 |
+| --- | --- |
+| Debian 12/13 amd64 KVM | 主要支持 |
+| Ubuntu 22.04/24.04 amd64 KVM | 主要支持 |
+| 其他 systemd Debian/Ubuntu | 尽力支持 |
+| ARM64 | BBR/TC 可用时可运行；不自动安装社区内核 |
+| OpenVZ/LXC/Docker | 只读检测；通常不能修改宿主内核/qdisc |
+| 非 systemd 系统 | 不支持持久化和 DNS 模块 |
 
-- 换内核前建议先给 VPS 做快照。
-- OpenVZ/LXC 等容器虚拟化环境通常不支持自行更换内核。
-- 生产机请谨慎执行内核安装、DNS 修改、IPv6 禁用等操作，建议确保有控制台或救援模式可用。
+XanMod 包和支持 codename 会变化，安装逻辑从官方仓库实际候选中选择，不写死内核版本。参见 [XanMod 官方安装说明](https://xanmod.org/)。
 
-## v5.2.14 更新记录
+## 开发与验证
 
-- 内核安装前增加 Secure Boot 预检，自动模式下检测到启用会中止，避免无人值守重启后断联。
-- XanMod x86_64 安装前增加 APT dry-run，若预演会移除 `isc-dhcp-client`、`ifupdown`、`systemd-resolved`、`resolvconf`、`network-manager`、`dhcpcd5` 等网络关键包则中止。
-- 内核安装前会将已安装网络关键包标记为 manual，安装后在 ifupdown DHCP 环境确认 `dhclient` 可用，降低内网 DHCP 机器丢 DNS/断网风险。
+```bash
+bash scripts/build.sh
+bash scripts/validate.sh
+```
 
-## v5.2.13 更新记录
+真实 TC 集成测试必须放在一次性容器或网络命名空间中：
 
-- 一键优化阶段 1 设置 `AUTO_MODE`，`install_xanmod_kernel` 与 `bbrv3arm.sh` 免交互确认。
-- `bbrv3arm.sh`：`dpkg -i` 失败后自动 `apt-get -f install` 修复依赖。
-- 普通 BBR + `AUTO_MODE` 时跳过社区内核安装，直接进入轻量 TCP 调优路径。
+```bash
+docker run --rm --cap-add NET_ADMIN -v "$PWD:/src:ro" debian:12 \
+  bash -lc 'apt-get update -qq && apt-get install -y -qq iproute2 procps util-linux >/dev/null && bash /src/tests/integration_tc.sh'
+```
 
-## v5.2.12 更新记录
+生成 release 校验文件：
 
-- 新增仓库内 `bbrv3arm.sh`，ARM64 不再从 `jhb.ovh` 下载第三方脚本。
-- ARM64 优先使用同目录脚本，在线场景从 `ike-sh/bbrv3-lite` raw 拉取并校验。
-- 社区 XanMod ARM64 内核可选安装（`zijiren233/xanmod-arm64` GitHub Release + SHA256 digest）。
+```bash
+bash scripts/release.sh
+```
 
-## v5.2.11 更新记录
+发布资产至少应包含 `net-tcp-tune.sh` 与 `SHA256SUMS`。模块边界见 [docs/MODULES.md](docs/MODULES.md)。
 
-- DNS 预生成 `rollback.sh` 从 3 文件基础版升级为增强版，覆盖 dhclient/interfaces/persist/dnscrypt 等备份路径。
-- 新增 `get_available_mem_mb()`，兼容 `free` 的 `available` 列与旧版 `free` 列；无法读取时改为警告而非误判失败。
-- ARM64 安装：curl 超时、空文件/HTML/shebang 校验，并提示第三方脚本来源域名。
+## v7 与旧版的差异
 
-## v5.2.10 更新记录
+- 删除八千行单文件中交织的 legacy/v6 双实现，改为模块源码、单文件发布。
+- 删除激进 sysctl、固定 `initcwnd=32`、多网卡 root qdisc 覆盖和第二套 TC service。
+- 删除自动执行第三方测速/回程脚本和社区 ARM64 内核安装。
+- 删除“一键修改内核、DNS、IPv6、TCP”的大范围自动化；各模块独立确认、独立恢复。
+- 新增测量历史、JSON 拐点扫描、动态 HTB bucket、可信基线和 release-only 更新。
 
-- DNS 净化在 `AUTO_MODE` 下，DoT 853 不可达时自动尝试 DoH 443，失败则降级普通 DNS 53，不再阻塞一键优化。
-- 移除未使用的 `log_warn` / `log_info` 封装；DNS 跳过/取消路径明确 `return 0` 并设置 `DNS_PURIFY_RESULT`。
+## 项目来源与许可证
 
-## v5.2.9 更新记录
+本项目延续 [ike-sh/bbrv3-lite](https://github.com/ike-sh/bbrv3-lite) 和其上游 `vps-tcp-tune` 的实用功能，并参考 [Kylin010/tcpfit](https://github.com/Kylin010/tcpfit) 的测量工作流。实现已按本项目架构重写，不将 tcpfit 的完整 sysctl 表或固定 TC 参数复制进来。
 
-- 一键全自动优化（功能 10）在 `AUTO_MODE` 下不再阻塞等待带宽测速失败确认、地区选择等交互。
-- XanMod GPG 密钥改为优先从官方 `dl.xanmod.org` 下载，镜像源仅作回退；安装与更新共用 `import_xanmod_gpg_key()`。
-- `bbr_configure_direct` 在 sysctl 验证未全部生效时返回非零，一键优化汇总能正确标记 TCP 调优失败。
-- `safe_download_script` 的 wget 分支补充 60 秒超时；`install-alias.sh` 增加与主脚本一致的项目标识校验。
-
-## v5.2.8 更新记录
-
-- shell fallback 从单行 alias 改为 `bbr()` 函数，支持 curl/wget 下载、空文件、HTML、shebang 和 `SCRIPT_VERSION` 校验。
-- 远程脚本校验增加 `SCRIPT_VERSION` 与项目标识检查，下载内容不像本项目脚本时拒绝执行。
-- 依赖安装改为区分命令存在性与包安装状态，Debian/Ubuntu 使用 `dpkg -s`，RHEL 系使用 `rpm -q`。
-- IPv6 取消永久禁用会校验备份值，只恢复 0/1；可安全识别脚本注释标记时自动恢复 `/etc/sysctl.conf`。
-- speedtest 自动安装增加 tar 可读性、路径穿越、按文件抽取和安装后版本验证；失败时继续使用默认带宽值。
-- 新增 GitHub Actions CI，并补充本地验证命令。
-
-## v5.2.7 更新记录
-
-- 修复 DNS 已配置时，一键优化汇总误显示“未执行”的问题。
-- DNS 已存在有效配置并跳过重复执行时，汇总会显示“已配置，跳过重复执行”。
-- 这是汇总文案/状态修复，不影响 DNS 净化主体逻辑。
-
-## v5.2.6 更新记录
-
-- 修复最小化系统只有 curl、没有 wget 时 speedtest 自动安装失败的问题。
-- speedtest 下载现在支持 curl/wget fallback。
-- 下载失败或缺少下载工具时，会明确提示并继续使用默认带宽值，不阻断 TCP 调优流程。
-
-## v5.2.5 更新记录
-
-- 环境预检结论现在会考虑磁盘空间、普通 BBR 支持、XanMod 候选状态，不再在 0MB 可用空间时推荐完整安装。
-- 当前 SWAP 已达到推荐值时不再重复重建 `/swapfile`。
-- 轻量优化模式下会区分“系统普通 BBR”和“XanMod / BBR v3”，避免文案误导。
-- DNS 净化在小盘空间不足时会明确提示原因并安全跳过。
-
-## v5.2.4 更新记录
-
-- 小盘机器上，如果不适合安装 XanMod / BBR v3，但系统内核支持普通 BBR，一键优化可提示继续轻量优化。
-- 统一磁盘空间检测为更稳健的 `df -Pm /` + 数字校验。
-- XanMod 安装的 3GB 空间保护仍然保留，不会被绕过。
-- IPv6 取消永久禁用时增加 `/etc/sysctl.conf` 备份提示。
-- `bbr` 快捷命令 wrapper 增强 curl/wget fallback、HTML 错误页检测和 shebang 校验。
-
-## v5.2.3 更新记录
-
-- 修复 DNS 净化安全检查磁盘空间误判为 0MB 的问题。
-- 磁盘检查改为更稳健的 `df -Pm /`。
-- 只有明确读到可用空间小于 100MB 时才阻止执行；无法读取时改为警告，不再误拦截。
-- 不影响 XanMod 内核安装的 3GB 空间保护逻辑。
-
-## v5.2.2 更新记录
-
-- 修复永久禁用 IPv6 时把脚本自身 `.ipv6-state-backup.conf` 误报为其他 `sysctl.d` 冲突项的问题。
-- 这是提示修复，不影响 IPv6 禁用/恢复核心逻辑。
-
-## v5.2.1 更新记录
-
-- 修复 `/etc/sysctl.conf` 中 `disable_ipv6=0` 覆盖永久禁用 IPv6 配置的问题。
-- IPv6 永久禁用前自动备份并注释冲突项。
-
-## v5.2.0 更新记录
-
-- 移除小众中转专项功能，进一步聚焦 BBRv3 / XanMod / TCP 调优。
-- 精简主菜单和一键优化流程。
-- 一键优化阶段 2 改为 TCP 调优、DNS 净化、IPv6 管理三步。
-- 回滚 / 卸载管理移除中转专项备份展示。
-- README 同步更新 lite 版定位。
-
-## v5.1.1 更新记录
-
-- 修复一键优化中 IPv6 禁用失败但汇总误报成功的问题。
-- 修复确认重启后脚本未立即退出导致菜单短暂重绘的问题。
-
-## v5.1.0 更新记录
-
-- 修复 XanMod 包选择逻辑，严格按 CPU 支持等级选择 x64v4/x64v3/x64v2/x64v1。
-- 新增系统兼容性矩阵与环境预检菜单。
-- 新增一键优化结果汇总。
-- 优化 DoH fallback，`dnscrypt-proxy` 自动避让 53 端口冲突。
-- 新增 `/usr/local/bin/bbr` 快捷命令安装方式。
-- 新增回滚/卸载管理入口。
-
-## 已删除内容
-
-删除了代理部署、AI 工具箱、Cloudflare Tunnel、Caddy、Sub-Store 等非调优功能。
-
-v5.2.0 起移除 Realm 相关小众中转功能，进一步聚焦 BBRv3 / XanMod / TCP 调优。
-
-本精简版不再包含 Snell、Xray、SOCKS5 代理部署、Sub-Store 多实例管理、Cloudflare Tunnel、Caddy 多域名反代、AI 代理工具箱、Open WebUI、CRS、Fuclaude、Sub2API、OpenClaw、OpenAI Responses API 转换代理、Codex Console、CLIProxyAPI、OAI2、第三方工具跳转脚本、F 佬 sing-box 脚本、科技 lion 脚本、IP 质量检测、媒体/AI 解锁检测、NQ 一键检测等非 BBRv3/TCP 调优模块。
+许可证见 [LICENSE](LICENSE)。使用前请为 VPS 创建快照；内核、sysctl、qdisc 和 DNS 修改都可能导致远程连接中断。
