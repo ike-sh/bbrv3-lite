@@ -466,6 +466,19 @@ test_measure_compare_is_temporary_and_auditable() {
         local restore_file="$TEST_ROOT/compare-restored" summary
         require_root() { :; }; acquire_lock() { :; }; tc_dependencies() { :; }; require_commands() { :; }
         peer_port_open() { :; }; detect_interface() { printf 'eth0\n'; }; qdisc_guard() { :; }
+        # This unit test exercises only the temporary/interleaved A/B state
+        # machine.  Keep route locking hermetic: a CI runner may resolve
+        # example.com to an IPv6 address even when that runner has no IPv6
+        # route, which must not make this unrelated unit test depend on the
+        # host network.  Route-lock behaviour has dedicated mocked and real
+        # integration coverage in test_measure_v721.sh.
+        measure_lock_peer() {
+            MEASURE_PEER_HOST="$1"; MEASURE_PEER_ADDRESS=203.0.113.10
+            MEASURE_PEER_SOURCE=192.0.2.10; MEASURE_PEER_FAMILY=4; MEASURE_PEER_IFACE="$2"
+            path_state_reset
+            PATH_PROFILE_SCORE=100; PATH_PROFILE_GRADE=high; PATH_DECISION=accept; PATH_RISK_FLAGS=none
+        }
+        measure_require_locked_port() { :; }
         detect_link_speed() { printf '100\n'; }; measure_set_latency_baseline() { MEASURE_IDLE_RTT_MS=10; }
         measure_begin() { MEASURE_IFACE=eth0; MEASURE_TX_START=0; MEASURE_RX_START=0; }
         measure_restore() { printf restored > "$restore_file"; MEASURE_IFACE=""; }
@@ -483,6 +496,7 @@ test_measure_compare_is_temporary_and_auditable() {
         assert_eq improved "$(summary_value "$summary" VERDICT)" "A/B summary verdict"
         assert_eq 0 "$(summary_value "$summary" PERSISTED)" "A/B unexpectedly persisted state"
         assert_eq interleaved "$(summary_value "$summary" ORDER)" "A/B execution order"
+        assert_eq 203.0.113.10 "$(summary_value "$summary" LOCKED_ADDRESS)" "A/B locked peer audit"
     )
 }
 
