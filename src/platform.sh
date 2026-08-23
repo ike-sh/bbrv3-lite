@@ -32,11 +32,205 @@ require_systemd_runtime() {
     systemctl show-environment >/dev/null 2>&1 || { die "无法连接 systemd，不能安全提交持久化配置"; return 1; }
 }
 
+route_output_interfaces() {
+    # "dev" is not at a fixed column (for example, "default dev ppp0"), and
+    # multipath output can contain more than one dev token on the same line.
+    awk '{for (i=1; i<NF; i++) if ($i=="dev") print $(i+1)}' | awk '!seen[$0]++'
+}
+
+default_route_output() {
+    local family="$1"
+    [[ "$family" == -4 || "$family" == -6 ]] || return 1
+    ip "$family" route show default 2>/dev/null || true
+}
+
+default_route_interface_for_family() {
+    local family="$1" output
+    output=$(default_route_output "$family") || return 1
+    route_output_interfaces <<< "$output" | head -n1
+}
+
 default_route_interface() {
     local iface
-    iface=$(ip -4 route show default 2>/dev/null | awk '$1=="default" {print $5; exit}')
-    [[ -n "$iface" ]] || iface=$(ip -6 route show default 2>/dev/null | awk '$1=="default" {print $5; exit}')
+    iface=$(default_route_interface_for_family -4)
+    [[ -n "$iface" ]] || iface=$(default_route_interface_for_family -6)
     printf '%s\n' "$iface"
+}
+
+default_route_count() {
+    local family="$1" output
+    output=$(default_route_output "$family") || return 1
+    awk '$1=="default" {count++} END {print count+0}' <<< "$output"
+}
+
+route_output_has_multipath() {
+    local output="$1"
+    [[ "$output" == *"nexthop"* ]] && return 0
+    awk '
+        {
+            devs=0
+            for (i=1; i<NF; i++) if ($i=="dev") devs++
+            if (devs>1) found=1
+        }
+        END {exit !found}
+    ' <<< "$output"
+}
+
+route_output_has_unresolved_nhid() {
+    local output="$1"
+    [[ "$output" =~ (^|[[:space:]])nhid([[:space:]]|$) ]]
+}
+
+default_route_has_multipath() {
+    local family="$1" output
+    output=$(default_route_output "$family") || return 1
+    route_output_has_multipath "$output"
+}
+
+resolve_route_target_addresses() {
+    local target="$1" address
+    if [[ "$target" == *:* ]]; then
+        printf '6\t%s\n' "$target"
+        return 0
+    fi
+    if [[ "$target" =~ ^[0-9]+([.][0-9]+){3}$ ]]; then
+        printf '4\t%s\n' "$target"
+        return 0
+    fi
+    command_exists getent || { die "无法解析测速目标路由：缺少 getent"; return 1; }
+    while IFS= read -r address; do
+        [[ -n "$address" ]] || continue
+        if [[ "$address" == *:* ]]; then printf '6\t%s\n' "$address"
+        elif [[ "$address" =~ ^[0-9]+([.][0-9]+){3}$ ]]; then printf '4\t%s\n' "$address"
+        fi
+    done < <(getent ahosts "$target" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++')
+}
+
+target_route_records() {
+    local target="$1" family address output fibmatch iface fib_iface dev_count fib_dev_count addresses
+    local resolved_count=0 verified_count=0
+    addresses=$(resolve_route_target_addresses "$target") || return 1
+    [[ -n "$addresses" ]] || { die "无法解析测速目标 $target 的任何路由候选地址"; return 1; }
+    while IFS=$'\t' read -r family address; do
+        [[ -n "$family" && -n "$address" ]] || continue
+        ((resolved_count+=1))
+        if ! output=$(ip "-$family" route get "$address" 2>/dev/null) || [[ -z "$output" ]]; then
+            die "测速目标 $address 无法完成 route-get；所有解析候选都必须可核验，已停止"
+            return 1
+        fi
+        if route_output_has_unresolved_nhid "$output"; then
+            die "测速目标 $address 的 route-get 包含未解析的 nexthop object (nhid)；无法证明出口唯一，已停止"
+            return 1
+        fi
+        if route_output_has_multipath "$output"; then
+            die "测速目标 $address 的 route-get 返回 ECMP/nexthop；v${SCRIPT_VERSION} 不会在多路径上自动调优"
+            return 1
+        fi
+        dev_count=$(route_output_interfaces <<< "$output" | wc -l | awk '{print $1}')
+        if ! is_uint "${dev_count:-}" || (( dev_count != 1 )); then
+            die "测速目标 $address 的 route-get 无法确定唯一出口"
+            return 1
+        fi
+        iface=$(route_output_interfaces <<< "$output" | head -n1)
+        validate_interface_name "$iface" || { die "测速目标 $address 返回非法出口网卡: $iface"; return 1; }
+
+        # `route get` can hash an ECMP route and expose only one selected dev.
+        # fibmatch returns the underlying FIB entry (including its nexthops).
+        if ! fibmatch=$(ip "-$family" route get fibmatch "$address" 2>/dev/null) || [[ -z "$fibmatch" ]]; then
+            die "当前 iproute2 无法用 fibmatch 核验测速目标 $address；不完整的 route-show fallback 不能证明策略路由出口，已停止"
+            return 1
+        fi
+        if route_output_has_unresolved_nhid "$fibmatch"; then
+            die "测速目标 $address 的 FIB 匹配包含未解析的 nexthop object (nhid)；无法证明出口唯一，已停止"
+            return 1
+        fi
+        if route_output_has_multipath "$fibmatch"; then
+            die "测速目标 $address 的 FIB 匹配包含 ECMP/nexthop；v${SCRIPT_VERSION} 不会自动选择其中一条路径"
+            return 1
+        fi
+        fib_dev_count=$(route_output_interfaces <<< "$fibmatch" | wc -l | awk '{print $1}')
+        if ! is_uint "${fib_dev_count:-}" || (( fib_dev_count != 1 )); then
+            die "测速目标 $address 的 fibmatch 无法确定唯一出口"
+            return 1
+        fi
+        fib_iface=$(route_output_interfaces <<< "$fibmatch" | head -n1)
+        validate_interface_name "$fib_iface" || { die "测速目标 $address 的 fibmatch 返回非法出口网卡: $fib_iface"; return 1; }
+        [[ "$fib_iface" == "$iface" ]] || {
+            die "测速目标 $address 的 route-get/fibmatch 出口不一致（$iface/$fib_iface）；无法证明路径稳定，已停止"
+            return 1
+        }
+        printf '%s\t%s\t%s\n' "$family" "$address" "$iface"
+        ((verified_count+=1))
+    done <<< "$addresses"
+    (( resolved_count > 0 )) || { die "无法取得测速目标 $target 的路由候选地址"; return 1; }
+    (( verified_count == resolved_count )) || {
+        die "测速目标 $target 仅核验了 ${verified_count}/${resolved_count} 个解析候选；已停止"
+        return 1
+    }
+}
+
+# Path-safety gate: inspect every resolved candidate before the formal
+# measurement freezes one literal/source/interface tuple. Ambiguous paths fail
+# closed and no route is altered.
+auto_tune_route_guard() {
+    local expected_iface="$1" target="${2:-}" family output count v4_iface v6_iface records
+    local route_family address iface first_iface=""
+    validate_interface_name "$expected_iface" || { die "自动调优选中了非法网卡: $expected_iface"; return 1; }
+
+    for family in -4 -6; do
+        output=$(default_route_output "$family") || return 1
+        count=$(awk '$1=="default" {count++} END {print count+0}' <<< "$output")
+        if route_output_has_unresolved_nhid "$output"; then
+            die "IPv${family#-} 默认路由包含未解析的 nexthop object (nhid)；无法证明出口唯一，已停止"
+            return 1
+        fi
+        if [[ "$output" == *"nexthop"* ]] || default_route_has_multipath "$family"; then
+            die "IPv${family#-} 默认路由包含 ECMP/nexthop；v${SCRIPT_VERSION} 不会自动选择其中一条路径"
+            return 1
+        fi
+        if (( count > 1 )); then
+            log WARN "检测到 ${count} 条 IPv${family#-} 默认路由；将以具体测速目标的 route-get 结果决定是否可安全继续"
+        fi
+    done
+
+    v4_iface=$(default_route_interface_for_family -4)
+    v6_iface=$(default_route_interface_for_family -6)
+    if [[ -z "$target" ]]; then
+        # There is no peer whose route can disambiguate this BBR+FQ-only run.
+        if [[ -n "$v4_iface" && -n "$v6_iface" && "$v4_iface" != "$v6_iface" ]]; then
+            die "IPv4/IPv6 默认出口分别为 $v4_iface/$v6_iface；未测速时无法证明应调优哪张网卡"
+            return 1
+        fi
+        for family in -4 -6; do
+            count=$(default_route_count "$family") || return 1
+            output=$(default_route_output "$family") || return 1
+            if (( count > 1 )) && (( $(route_output_interfaces <<< "$output" | wc -l) > 1 )); then
+                die "IPv${family#-} 存在跨网卡的多条默认路由；未提供测速目标，拒绝自动选择"
+                return 1
+            fi
+        done
+        [[ "$expected_iface" == "${v4_iface:-$v6_iface}" ]] || {
+            die "自动选择网卡 $expected_iface 与当前默认出口 ${v4_iface:-$v6_iface} 不一致"
+            return 1
+        }
+        log INFO "自动调优出口检查通过: $expected_iface（未运行测速）"
+        return 0
+    fi
+
+    records=$(target_route_records "$target") || return 1
+    while IFS=$'\t' read -r route_family address iface; do
+        [[ -n "$route_family" && -n "$iface" ]] || continue
+        if [[ -z "$first_iface" ]]; then first_iface="$iface"; fi
+        if [[ "$iface" != "$first_iface" ]]; then
+            die "测速目标 $target 的候选地址出口不一致（$first_iface/$iface）；未固定地址族时拒绝自动调优"
+            return 1
+        fi
+        if [[ "$iface" != "$expected_iface" ]]; then
+            die "测速目标 $address 实际通过 $iface，但自动调优选中 $expected_iface；拒绝在错误网卡上应用 TC"
+            return 1
+        fi
+    done <<< "$records"
+    log INFO "测速目标路由检查通过: $target -> $expected_iface"
 }
 
 interface_is_excluded() {

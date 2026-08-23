@@ -15,7 +15,7 @@ trap 'rm -rf -- "$TEST_ROOT"' EXIT
 source "$ROOT_DIR/net-tcp-tune.sh"
 
 require_commands ip tc
-has_net_admin || { echo "SKIP: CAP_NET_ADMIN required" >&2; exit 77; }
+tc qdisc show >/dev/null 2>&1 || { echo "SKIP: CAP_NET_ADMIN required" >&2; exit 77; }
 iface=$(detect_interface auto)
 qdisc_guard "$iface"
 

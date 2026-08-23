@@ -9,7 +9,27 @@ permissions:
   contents: write
 
 jobs:
+  docker-validation:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - debian:12
+          - debian:13
+          - ubuntu:22.04
+          - ubuntu:24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Full Docker validation (${{ matrix.image }})
+        env:
+          BBRV3_DOCKER_IMAGES: ${{ matrix.image }}
+        run: bash scripts/docker-validate.sh
+
   release:
+    needs: docker-validation
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

@@ -17,6 +17,8 @@ LEGACY_SYSCTL_FILE="${BBRV3_LEGACY_SYSCTL_FILE:-/etc/sysctl.d/99-bbr-ultimate.co
 LOCK_FILE="${BBRV3_LOCK_FILE:-/run/lock/bbrv3-lite.lock}"
 DNS_BACKUP_DIR="${BBRV3_DNS_BACKUP_DIR:-${STATE_DIR}/dns}"
 IPV6_BACKUP_DIR="${BBRV3_IPV6_BACKUP_DIR:-${STATE_DIR}/ipv6}"
+NIC_POLICY_DIR="${BBRV3_NIC_POLICY_DIR:-/etc/bbrv3-lite/interfaces.d}"
+NIC_STATE_DIR="${BBRV3_NIC_STATE_DIR:-${STATE_DIR}/interfaces}"
 
 COLOR_ENABLED=0
 if [[ -t 1 && "${NO_COLOR:-}" == "" ]]; then COLOR_ENABLED=1; fi
@@ -140,6 +142,10 @@ human_bytes() {
 
 cleanup_core() {
     local rc=$?
+    if [[ -n "${TC_TRIAL_IFACE:-}" && -n "${TC_TRIAL_SNAPSHOT:-}" ]] && declare -F tc_trial_transaction_rollback >/dev/null; then
+        log WARN "进程退出时仍有未提交的临时 TC 操作，正在恢复操作前 qdisc"
+        tc_trial_transaction_rollback || true
+    fi
     if [[ -n "${MEASURE_IFACE:-}" && -n "${MEASURE_SNAPSHOT:-}" ]] && declare -F measure_restore >/dev/null; then
         log WARN "进程退出时仍有测量快照，正在恢复操作前 qdisc"
         measure_restore || true

@@ -16,7 +16,16 @@ Usage:
   ${0##*/} tc trial RATE [--interface DEV]
   ${0##*/} tc enable RATE [--interface DEV] [--knee RATE] [--margin PERCENT]
   ${0##*/} tc disable|status|stats [--interface DEV]
+  ${0##*/} nic list|status
+  ${0##*/} nic plan --interface DEV [--mode fq|shape --rate MBIT]
+  ${0##*/} nic manage --interface DEV --mode fq|shape [--rate MBIT]
+                    [--knee MBIT --margin PERCENT]
+                    [--profile balanced|adaptive --role proxy|mixed|bulk]
+                    [--bandwidth MBIT --rtt MS]
+  ${0##*/} nic unmanage --interface DEV
+  ${0##*/} nic verify [--interface DEV]
   ${0##*/} measure deps
+  ${0##*/} measure path --peer HOST [--interface DEV] [--samples 7] [--no-pmtu]
   ${0##*/} measure probe --peer HOST [--port 5201] [--duration 10] [--parallel 4]
   ${0##*/} measure verify --peer HOST [--port 5201] [--duration 10]
   ${0##*/} measure compare --peer HOST --rate MBIT [--port 5201] [--duration 6] [--rounds 2]
@@ -24,8 +33,11 @@ Usage:
                          [--step MBIT] [--duration 8] [--parallel 1]
                          [--margin 3] [--loss-threshold 0.1] [--cap MBIT] [--force-scan]
   ${0##*/} kernel status|install [--track lts|main]|remove
-  ${0##*/} dns status|apply [auto|dot|plain]|restore
-  ${0##*/} ipv6 status|disable [temporary|permanent]|restore
+  ${0##*/} dns status|plan POLICY|apply POLICY|verify|restore
+             POLICY: native|strict-dot|plain (aliases: auto|dot)
+  ${0##*/} ipv6 status|plan POLICY|apply POLICY|verify|restore
+             POLICY: native|disabled-temporary|disabled-persistent
+             compatibility: ipv6 disable [temporary|permanent]
   ${0##*/} baseline info|adopt [--interface DEV]
   ${0##*/} verify
   ${0##*/} restore
@@ -76,6 +88,10 @@ parse_common_profile_options() {
         die "adaptive profile 必须同时提供非零 --bandwidth 和 --rtt"
         return 1
     fi
+    (( CLI_BANDWIDTH == 0 && CLI_RTT == 0 )) || (( CLI_BANDWIDTH > 0 && CLI_RTT > 0 )) || {
+        die "--bandwidth 与 --rtt 必须成对提供"
+        return 1
+    }
 }
 
 cmd_detect() {
@@ -141,26 +157,94 @@ cmd_tc() {
     esac
 }
 
+cmd_nic() {
+    local action="${1:-list}"; (($#)) && shift || true
+    local iface="" mode=fq rate=0 knee=0 margin=3 profile=balanced role=mixed bandwidth=0 rtt=0
+    case "$action" in
+        list|status)
+            require_no_arguments "nic $action" "$@" || return 1
+            nic_inventory
+            ;;
+        plan|manage)
+            while (($#)); do
+                case "$1" in
+                    --interface) require_option_value "$@" || return 1; iface="$2"; shift 2 ;;
+                    --mode) require_option_value "$@" || return 1; mode="$2"; shift 2 ;;
+                    --rate) require_option_value "$@" || return 1; rate="$2"; shift 2 ;;
+                    --knee) require_option_value "$@" || return 1; knee="$2"; shift 2 ;;
+                    --margin) require_option_value "$@" || return 1; margin="$2"; shift 2 ;;
+                    --profile) require_option_value "$@" || return 1; profile="$2"; shift 2 ;;
+                    --role) require_option_value "$@" || return 1; role="$2"; shift 2 ;;
+                    --bandwidth) require_option_value "$@" || return 1; bandwidth="$2"; shift 2 ;;
+                    --rtt) require_option_value "$@" || return 1; rtt="$2"; shift 2 ;;
+                    *) die "nic $action 不支持参数: $1"; return 1 ;;
+                esac
+            done
+            validate_interface_name "$iface" && [[ -n "$iface" && "$iface" != auto ]] || { die "nic $action 需要具体 --interface DEV"; return 1; }
+            [[ "$mode" == fq || "$mode" == shape ]] || { die "--mode 只支持 fq/shape"; return 1; }
+            is_uint "$rate" && is_uint "$knee" && is_uint "$margin" || { die "rate/knee/margin 必须是非负整数"; return 1; }
+            (( rate <= 1000000 && knee <= 1000000 && margin <= 25 )) || { die "rate/knee/margin 超出范围"; return 1; }
+            if [[ "$mode" == shape ]]; then (( rate > 0 && ( knee == 0 || knee >= rate ) )) || { die "shape 需要非零 --rate，且 knee 不能低于 rate"; return 1; }
+            else (( rate == 0 && knee == 0 )) || { die "fq 模式不接受 rate/knee"; return 1; }
+            fi
+            validate_config_value SYSCTL_PROFILE "$profile" && validate_config_value ROLE "$role" &&
+                validate_config_value BANDWIDTH_MBIT "$bandwidth" && validate_config_value RTT_MS "$rtt" || { die "profile/role/bandwidth/rtt 非法"; return 1; }
+            (( bandwidth == 0 && rtt == 0 )) || (( bandwidth > 0 && rtt > 0 )) || { die "--bandwidth 与 --rtt 必须成对提供"; return 1; }
+            [[ "$profile" != adaptive || ( "$bandwidth" -gt 0 && "$rtt" -gt 0 ) ]] || { die "adaptive 需要非零 --bandwidth 和 --rtt"; return 1; }
+            if [[ "$action" == plan ]]; then load_config || return 1; nic_plan "$iface" "$mode" "$rate" "$knee" "$margin" "$profile" "$role" "$bandwidth" "$rtt"
+            else nic_manage "$iface" "$mode" "$rate" "$knee" "$margin" "$profile" "$role" "$bandwidth" "$rtt"
+            fi
+            ;;
+        unmanage)
+            while (($#)); do case "$1" in --interface) require_option_value "$@" || return 1; iface="$2"; shift 2 ;; *) die "nic unmanage 不支持参数: $1"; return 1 ;; esac; done
+            validate_interface_name "$iface" && [[ -n "$iface" && "$iface" != auto ]] || { die "nic unmanage 需要具体 --interface DEV"; return 1; }
+            nic_unmanage "$iface"
+            ;;
+        verify)
+            while (($#)); do case "$1" in --interface) require_option_value "$@" || return 1; iface="$2"; shift 2 ;; *) die "nic verify 不支持参数: $1"; return 1 ;; esac; done
+            [[ -z "$iface" ]] || { validate_interface_name "$iface" && [[ "$iface" != auto ]]; } || { die "非法 --interface"; return 1; }
+            load_config || return 1
+            nic_verify_runtime_policies "$iface"
+            ;;
+        apply) require_no_arguments "nic apply" "$@" || return 1; nic_apply_command ;;
+        *) die "nic 子命令应为 list/status/plan/manage/unmanage/verify/apply" ;;
+    esac
+}
+
 cmd_measure() {
     local action="${1:-}"; shift || true
     local peer="" port=5201 iface=auto duration=10 parallel=4 nominal=0 low=0 high=0 step=0 margin=3 threshold=0.1 force=0 cap=0
-    local rate=0 rounds=2
+    local rate=0 rounds=2 samples=7 pmtu=1
     if [[ "$action" == deps ]]; then
         require_no_arguments "measure deps" "$@" || return 1
         install_measure_dependencies
         return
     fi
-    [[ "$action" == probe || "$action" == sweep || "$action" == verify || "$action" == compare ]] || { die "measure 子命令应为 deps/probe/sweep/verify/compare"; return 1; }
+    [[ "$action" == path || "$action" == probe || "$action" == sweep || "$action" == verify || "$action" == compare ]] || { die "measure 子命令应为 deps/path/probe/sweep/verify/compare"; return 1; }
     [[ "$action" == sweep ]] && { duration=8; parallel=1; }
     [[ "$action" == compare ]] && { duration=6; parallel=1; }
     while (($#)); do
         case "$1" in
             --peer) require_option_value "$@" || return 1; peer="$2"; shift 2 ;;
-            --port) require_option_value "$@" || return 1; port="$2"; shift 2 ;;
+            --port)
+                [[ "$action" != path ]] || { die "measure path 不使用 --port"; return 1; }
+                require_option_value "$@" || return 1; port="$2"; shift 2
+                ;;
             --interface) require_option_value "$@" || return 1; iface="$2"; shift 2 ;;
-            --duration) require_option_value "$@" || return 1; duration="$2"; shift 2 ;;
+            --duration)
+                [[ "$action" != path ]] || { die "measure path 使用 --samples，不接受 --duration"; return 1; }
+                require_option_value "$@" || return 1; duration="$2"; shift 2
+                ;;
+            --samples)
+                [[ "$action" == path ]] || { die "measure $action 不支持 --samples"; return 1; }
+                require_option_value "$@" || return 1; samples="$2"; shift 2
+                ;;
+            --no-pmtu)
+                [[ "$action" == path ]] || { die "measure $action 不支持 --no-pmtu"; return 1; }
+                pmtu=0; shift
+                ;;
             --parallel)
-                [[ "$action" != verify && "$action" != compare ]] || { die "measure $action 使用固定流数，不接受 --parallel"; return 1; }
+                [[ "$action" == probe || "$action" == sweep ]] || { die "measure $action 不接受 --parallel"; return 1; }
                 require_option_value "$@" || return 1; parallel="$2"; shift 2
                 ;;
             --rate|--rounds)
@@ -186,12 +270,16 @@ cmd_measure() {
         esac
     done
     [[ -n "$peer" ]] || { die "需要 --peer HOST"; return 1; }
+    if [[ "$action" == path ]]; then
+        is_uint "$samples" && (( samples >= 3 && samples <= 20 )) || { die "measure path --samples 必须是 3–20"; return 1; }
+    fi
     if [[ "$action" == compare ]]; then
         is_uint "$rate" && (( rate >= 1 && rate <= 1000000 )) || { die "measure compare 需要 --rate 1–1000000"; return 1; }
         is_uint "$rounds" && (( rounds >= 2 && rounds <= 5 )) || { die "measure compare --rounds 必须是 2–5"; return 1; }
         is_uint "$duration" && (( duration >= 3 && duration <= 30 )) || { die "measure compare --duration 必须是 3–30 秒"; return 1; }
     fi
-    if [[ "$action" == probe ]]; then measure_probe "$peer" "$port" "$iface" "$duration" "$parallel"
+    if [[ "$action" == path ]]; then measure_path_profile "$peer" "$iface" "$samples" "$pmtu"
+    elif [[ "$action" == probe ]]; then measure_probe "$peer" "$port" "$iface" "$duration" "$parallel"
     elif [[ "$action" == verify ]]; then measure_verify "$peer" "$port" "$iface" "$duration"
     elif [[ "$action" == compare ]]; then measure_compare "$peer" "$port" "$iface" "$rate" "$duration" "$rounds"
     else measure_sweep "$peer" "$port" "$iface" "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$threshold" "$force" "$cap"; fi
@@ -214,30 +302,55 @@ cmd_kernel() {
 }
 
 cmd_dns() {
-    local action="${1:-status}" mode; (($#)) && shift || true
+    local action="${1:-status}" policy; (($#)) && shift || true
     case "$action" in
-        status) require_no_arguments "dns status" "$@" || return 1; dns_status ;;
-        apply)
-            (($# <= 1)) || { die "dns apply 最多接受一个 mode"; return 1; }
-            mode="${1:-auto}"; [[ "$mode" == auto || "$mode" == dot || "$mode" == plain ]] || { die "DNS mode 只支持 auto/dot/plain"; return 1; }
-            dns_apply "$mode"
+        status) require_no_arguments "dns status" "$@" || return 1; dns_policy_status ;;
+        plan)
+            (($# <= 1)) || { die "dns plan 最多接受一个 policy"; return 1; }
+            policy="${1:-strict-dot}"; dns_policy_normalize "$policy" >/dev/null || return 1
+            dns_policy_plan "$policy"
             ;;
-        restore) require_no_arguments "dns restore" "$@" || return 1; dns_restore ;;
-        *) die "dns 子命令应为 status/apply/restore" ;;
+        apply)
+            (($# <= 1)) || { die "dns apply 最多接受一个 policy"; return 1; }
+            policy="${1:-strict-dot}"; dns_policy_normalize "$policy" >/dev/null || return 1
+            dns_policy_apply "$policy"
+            ;;
+        verify)
+            (($# <= 1)) || { die "dns verify 最多接受一个 policy"; return 1; }
+            [[ -z "${1:-}" ]] || dns_policy_normalize "$1" >/dev/null || return 1
+            dns_policy_verify "${1:-}"
+            ;;
+        restore) require_no_arguments "dns restore" "$@" || return 1; dns_policy_apply native ;;
+        *) die "dns 子命令应为 status/plan/apply/verify/restore" ;;
     esac
 }
 
 cmd_ipv6() {
-    local action="${1:-status}" mode; (($#)) && shift || true
+    local action="${1:-status}" policy; (($#)) && shift || true
     case "$action" in
-        status) require_no_arguments "ipv6 status" "$@" || return 1; ipv6_status ;;
+        status) require_no_arguments "ipv6 status" "$@" || return 1; ipv6_policy_status ;;
+        plan)
+            (($# <= 1)) || { die "ipv6 plan 最多接受一个 policy"; return 1; }
+            policy="${1:-disabled-temporary}"; ipv6_policy_normalize "$policy" >/dev/null || return 1
+            ipv6_policy_plan "$policy"
+            ;;
+        apply)
+            (($# <= 1)) || { die "ipv6 apply 最多接受一个 policy"; return 1; }
+            policy="${1:-disabled-temporary}"; ipv6_policy_normalize "$policy" >/dev/null || return 1
+            ipv6_policy_apply "$policy"
+            ;;
+        verify)
+            (($# <= 1)) || { die "ipv6 verify 最多接受一个 policy"; return 1; }
+            [[ -z "${1:-}" ]] || ipv6_policy_normalize "$1" >/dev/null || return 1
+            ipv6_policy_verify "${1:-}"
+            ;;
         disable)
             (($# <= 1)) || { die "ipv6 disable 最多接受一个 mode"; return 1; }
-            mode="${1:-temporary}"; [[ "$mode" == temporary || "$mode" == permanent ]] || { die "IPv6 mode 只支持 temporary/permanent"; return 1; }
-            ipv6_disable "$mode"
+            policy="${1:-temporary}"; [[ "$policy" == temporary || "$policy" == permanent ]] || { die "IPv6 mode 只支持 temporary/permanent"; return 1; }
+            ipv6_policy_apply "$policy"
             ;;
-        restore) require_no_arguments "ipv6 restore" "$@" || return 1; ipv6_restore ;;
-        *) die "ipv6 子命令应为 status/disable/restore" ;;
+        restore) require_no_arguments "ipv6 restore" "$@" || return 1; ipv6_policy_apply native ;;
+        *) die "ipv6 子命令应为 status/plan/apply/verify/disable/restore" ;;
     esac
 }
 
@@ -307,6 +420,9 @@ auto_measure_with_peer_failover() {
                 log WARN "切换到备用公共对端 $((index + 1))/${count}: $WIZARD_PEER:$WIZARD_PORT（$WIZARD_PEER_REGION/$WIZARD_PEER_PROVIDER，RTT ${WIZARD_PEER_RTT}ms）"
             fi
         fi
+        if (( ${WIZARD_ROUTE_GUARD_ACTIVE:-0} )); then
+            auto_tune_route_guard "$iface" "$WIZARD_PEER" || return 1
+        fi
         if (( nominal > 0 )); then
             path_rate=$((nominal * 40 / 100)); ((path_rate < 1)) && path_rate=1
             if measure_path_check "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$path_rate"; then
@@ -374,7 +490,8 @@ auto_tune_execute() {
     local iface="$1" profile="$2" role="$3" nominal="$4" tuning_rtt="$5" peer_rtt="${6:-0}"
     local summary recommend knee measured no_knee confirmed reject_reason min_efficiency baseline_loss expected_rate=0
     local role_floor rtt_source verify_summary verify_confidence_score verify_confidence_grade verify_confidence_reasons
-    prepare_auto_tuning_runtime "$iface" auto "$profile" "$role" "$nominal" "$tuning_rtt" || return 1
+    local sweep_path_fingerprint verify_path_fingerprint sweep_endpoint_fingerprint verify_endpoint_fingerprint path_rtt
+    prepare_auto_tuning_runtime "$iface" "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" || return 1
     if [[ -z "${WIZARD_PEER:-}" ]]; then
         verify_runtime_tuning "$iface" || return 1
         persist_current_tuning || return 1
@@ -384,11 +501,24 @@ auto_tune_execute() {
         return 0
     fi
     auto_measure_with_peer_failover "$iface" "$nominal" || return 1
-    if (( ${WIZARD_PUBLIC_PEER:-0} )); then
-        peer_rtt="${WIZARD_PEER_RTT:-0}"
-        tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
-    fi
     summary="$MEASURE_RUN_DIR/summary.tsv"
+    sweep_path_fingerprint=$(summary_value "$summary" PATH_ROUTE_FINGERPRINT)
+    [[ "$sweep_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+        die "扫描结果缺少合法网络路径指纹；不会持久化"
+        return 1
+    }
+    sweep_endpoint_fingerprint=$(summary_value "$summary" PATH_ENDPOINT_FINGERPRINT)
+    [[ "$sweep_endpoint_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+        die "扫描结果缺少合法测速端点指纹；不会持久化"
+        return 1
+    }
+    path_rtt=$(summary_value "$summary" PATH_RTT_P95_MS)
+    if is_decimal "$path_rtt"; then
+        peer_rtt=$(awk -v r="$path_rtt" 'BEGIN {printf "%d",r+0.5}')
+    elif (( ${WIZARD_PUBLIC_PEER:-0} )); then
+        peer_rtt="${WIZARD_PEER_RTT:-0}"
+    fi
+    tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
     recommend=$(summary_value "$summary" RECOMMEND)
     knee=$(summary_value "$summary" BROKE_AT); knee="${knee:-0}"
     measured=$(summary_value "$summary" UNSHAPED_MBIT)
@@ -398,30 +528,48 @@ auto_tune_execute() {
     min_efficiency=$(summary_value "$summary" MIN_EFFICIENCY_RATIO); min_efficiency="${min_efficiency:-0.90}"
     baseline_loss=$(summary_value "$summary" CLEAN_BASE_RETRANS_RATIO_EST_PERCENT); baseline_loss="${baseline_loss:-0}"
     role_floor=$(role_tuning_rtt_floor "$role") || return 1
-    if (( peer_rtt > role_floor )); then rtt_source="observed-peer"; else rtt_source="role-floor"; fi
-    printf 'SWEEP_PEER\t%s\nSWEEP_PORT\t%s\nPEER_RTT_MS\t%s\nTUNING_RTT_MS\t%s\nTUNING_RTT_SOURCE\t%s\nROLE\t%s\nPUBLIC_PEER_FAILOVERS\t%s\n' \
-        "${WIZARD_SWEEP_PEER:-$WIZARD_PEER}" "${WIZARD_SWEEP_PORT:-$WIZARD_PORT}" "$peer_rtt" "$tuning_rtt" "$rtt_source" "$role" "${WIZARD_FAILOVERS:-0}" >> "$summary" || return 1
+    if (( peer_rtt > role_floor )); then rtt_source="path-p95"; else rtt_source="role-floor"; fi
+    printf 'SWEEP_PEER\t%s\nSWEEP_PORT\t%s\nPEER_RTT_MS\t%s\nTUNING_RTT_MS\t%s\nTUNING_RTT_SOURCE\t%s\nROLE\t%s\nPUBLIC_PEER_FAILOVERS\t%s\nSWEEP_PATH_FINGERPRINT\t%s\nSWEEP_ENDPOINT_FINGERPRINT\t%s\n' \
+        "${WIZARD_SWEEP_PEER:-$WIZARD_PEER}" "${WIZARD_SWEEP_PORT:-$WIZARD_PORT}" "$peer_rtt" "$tuning_rtt" "$rtt_source" "$role" "${WIZARD_FAILOVERS:-0}" "$sweep_path_fingerprint" "$sweep_endpoint_fingerprint" >> "$summary" || return 1
 
     if [[ -n "$reject_reason" || ( -n "$knee" && "$knee" != 0 && "$confirmed" != 1 ) ]]; then
         die "扫描候选值未通过确认测试（${reject_reason:-unconfirmed}），不会应用或持久化"
         return 2
     fi
     if [[ -n "$measured" && "$tuning_rtt" -gt 0 ]]; then
-        SYSCTL_PROFILE=adaptive; BANDWIDTH_MBIT=$(awk -v g="$measured" 'BEGIN {printf "%d", g+0.5}'); RTT_MS="$tuning_rtt"; ROLE="$role"
+        nic_stage_candidate_global_model "$iface" adaptive "$role" "$(awk -v g="$measured" 'BEGIN {printf "%d", g+0.5}')" "$tuning_rtt" || return 1
         apply_sysctl_profile runtime || return 1
     fi
     if [[ -n "$recommend" ]]; then
-        TC_ENABLED=1; TC_INTERFACE=auto; TC_RATE_MBIT="$recommend"; TC_KNEE_MBIT="$knee"; TC_MARGIN_PERCENT=3
+        TC_ENABLED=1; TC_INTERFACE="$iface"; TC_RATE_MBIT="$recommend"; TC_KNEE_MBIT="$knee"; TC_MARGIN_PERCENT=3
         apply_shaping "$iface" "$recommend" || return 1
         expected_rate="$recommend"
     else
-        TC_ENABLED=0; TC_INTERFACE=auto; TC_RATE_MBIT=0; TC_KNEE_MBIT=0; TC_MARGIN_PERCENT=3
+        TC_ENABLED=0; TC_INTERFACE="$iface"; TC_RATE_MBIT=0; TC_KNEE_MBIT=0; TC_MARGIN_PERCENT=3
         apply_fq "$iface" || return 1
         log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
     fi
     verify_runtime_tuning "$iface" || return 1
     auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss" || return 1
     verify_summary="$MEASURE_RUN_DIR/summary.tsv"
+    verify_path_fingerprint=$(summary_value "$verify_summary" PATH_ROUTE_FINGERPRINT)
+    [[ "$verify_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+        die "最终复验缺少合法网络路径指纹；不会持久化"
+        return 1
+    }
+    verify_endpoint_fingerprint=$(summary_value "$verify_summary" PATH_ENDPOINT_FINGERPRINT)
+    [[ "$verify_endpoint_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+        die "最终复验缺少合法测速端点指纹；不会持久化"
+        return 1
+    }
+    [[ "$verify_endpoint_fingerprint" == "$sweep_endpoint_fingerprint" ]] || {
+        die "扫描与最终复验使用了不同测速端点；拒绝把跨端点结果持久化"
+        return 2
+    }
+    [[ "$verify_path_fingerprint" == "$sweep_path_fingerprint" ]] || {
+        die "扫描与最终复验经过不同网络路径；拒绝把跨路径结果持久化"
+        return 2
+    }
     verify_confidence_score=$(summary_value "$verify_summary" CONFIDENCE_SCORE); verify_confidence_score="${verify_confidence_score:-0}"
     verify_confidence_grade=$(summary_value "$verify_summary" CONFIDENCE_GRADE); verify_confidence_grade="${verify_confidence_grade:-unknown}"
     verify_confidence_reasons=$(summary_value "$verify_summary" CONFIDENCE_REASONS); verify_confidence_reasons="${verify_confidence_reasons:-unavailable}"
@@ -435,8 +583,11 @@ auto_tune_execute() {
         else verify_confidence_reasons="${verify_confidence_reasons},peer-failover"
         fi
     fi
-    printf 'FINAL_VERIFY_PEER\t%s\nFINAL_VERIFY_PORT\t%s\nTOTAL_PUBLIC_PEER_FAILOVERS\t%s\nFINAL_VERIFY_CONFIDENCE_SCORE\t%s\nFINAL_VERIFY_CONFIDENCE_GRADE\t%s\nFINAL_VERIFY_CONFIDENCE_REASONS\t%s\n' \
-        "$WIZARD_PEER" "$WIZARD_PORT" "${WIZARD_FAILOVERS:-0}" "$verify_confidence_score" "$verify_confidence_grade" "$verify_confidence_reasons" >> "$summary" || return 1
+    printf 'FINAL_VERIFY_PEER\t%s\nFINAL_VERIFY_PORT\t%s\nTOTAL_PUBLIC_PEER_FAILOVERS\t%s\nFINAL_VERIFY_CONFIDENCE_SCORE\t%s\nFINAL_VERIFY_CONFIDENCE_GRADE\t%s\nFINAL_VERIFY_CONFIDENCE_REASONS\t%s\nFINAL_VERIFY_PATH_FINGERPRINT\t%s\nFINAL_VERIFY_ENDPOINT_FINGERPRINT\t%s\n' \
+        "$WIZARD_PEER" "$WIZARD_PORT" "${WIZARD_FAILOVERS:-0}" "$verify_confidence_score" "$verify_confidence_grade" "$verify_confidence_reasons" "$verify_path_fingerprint" "$verify_endpoint_fingerprint" >> "$summary" || return 1
+    if (( ${WIZARD_ROUTE_GUARD_ACTIVE:-0} )); then
+        auto_tune_route_guard "$iface" "$WIZARD_PEER" || return 1
+    fi
     persist_current_tuning || return 1
     printf '\n'
     log OK "自动调优、复验和持久化提交完成"
@@ -451,7 +602,8 @@ auto_tune_wizard() {
     require_systemd_runtime || return 1
     [[ -t 0 ]] || { die "auto 向导需要交互终端"; return 1; }
     local bandwidth_input nominal=0 role_choice role=mixed peer_rtt=0 tuning_rtt=0 profile=balanced estimate="动态估算" iface rc rollback_rc=0
-    WIZARD_PEER=""; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PUBLIC_INDEX=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0
+    WIZARD_PEER=""; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PUBLIC_INDEX=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0; WIZARD_ROUTE_GUARD_ACTIVE=0
+    nic_auto_policy_reset
     WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SCAN_CAP=5000; WIZARD_SAMPLE_DURATION=5
     printf '\n%s v%s 自动调优\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
     printf '首次修改前会保存不可覆盖的基线：%s\n' "$BASELINE_DIR"
@@ -476,6 +628,9 @@ auto_tune_wizard() {
     case "${role_choice:-1}" in 1) role=mixed ;; 2) role=proxy ;; 3) role=bulk ;; *) die "无效用途"; return 1 ;; esac
     tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
     iface=$(detect_interface auto) || return 1
+    auto_tune_route_guard "$iface" "${WIZARD_PEER:-}" || return 1
+    shaping_target_preflight "$iface" auto auto || return 1
+    WIZARD_ROUTE_GUARD_ACTIVE=1
     WIZARD_SCAN_CAP=$(recommended_scan_cap "$iface" "$nominal") || return 1
     WIZARD_SAMPLE_DURATION=$(recommended_measure_duration "$iface" "$nominal") || return 1
     if (( nominal > 0 && tuning_rtt > 0 )); then
@@ -505,7 +660,7 @@ auto_tune_wizard() {
 
     qdisc_guard "$iface" || return 1
     BANDWIDTH_MBIT="$nominal"; network_tuning_preflight "$iface" 1 || return 1
-    action_transaction_begin "$iface" || return 1
+    action_transaction_begin_multi "$iface" || return 1
     if auto_tune_execute "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" "$peer_rtt"; then
         action_transaction_commit
         return
@@ -521,7 +676,11 @@ auto_tune_wizard() {
 menu_run() {
     local rc
     set +e
-    ( set -Eeuo pipefail; "$@" )
+    # Every menu action runs in its own shell so failed commands cannot poison
+    # the menu's errexit state. Transactions also live in that shell, so it
+    # must own an EXIT trap; the parent trap cannot see child-only variables
+    # after Ctrl-C, SIGTERM or another abrupt exit.
+    ( set -Eeuo pipefail; trap cleanup_core EXIT; "$@" )
     rc=$?
     set -e
     (( rc != 90 )) || return 90
@@ -551,8 +710,14 @@ invalid_menu_choice() {
 }
 
 measurement_action() {
-    local choice="$1" rate
+    local choice="$1" rate target
     ensure_interactive_measure_dependencies || return 1
+    if [[ "$choice" == 5 ]]; then
+        read -r -p '路径画像目标 HOST/IP: ' target || return 1
+        [[ -n "$target" ]] || { die "目标不能为空"; return 1; }
+        measure_path_profile "$target" auto 7 1
+        return
+    fi
     interactive_select_peer || return 1
     case "$choice" in
         1) measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto 0 0 0 0 5 1 3 0.1 0 0 ;;
@@ -569,10 +734,10 @@ measurement_menu() {
     local choice
     while true; do
         ui_clear
-        printf '%s\n' '测量与复验' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/硬件自适应多流复验' '4) FQ 与整形 A/B 对照' '0) 返回主菜单'
+        printf '%s\n' '测量与复验' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/硬件自适应多流复验' '4) FQ 与整形 A/B 对照' '5) 网络路径画像' '0) 返回主菜单'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
-            1|2|3|4) submenu_run measurement_action "$choice" || return 90 ;;
+            1|2|3|4|5) submenu_run measurement_action "$choice" || return 90 ;;
             0) return 0 ;;
             *) invalid_menu_choice ;;
         esac
@@ -580,16 +745,35 @@ measurement_menu() {
 }
 
 tc_menu() {
-    local choice rate
+    local choice rate iface
     while true; do
         ui_clear
-        printf '%s\n' 'TC 整形管理' '1) 状态/统计' '2) 临时试跑速率' '3) 持久启用速率' '4) 关闭整形并保留 FQ' '0) 返回主菜单'
+        printf '%s\n' '多网卡 / TC 管理' '1) 网卡清单与策略' '2) 验证全部受管网卡' '3) 新增/更新 FQ 策略' \
+            '4) 新增/更新独立整形速率' '5) 关闭指定网卡整形并保留 FQ' '6) 解除管理并恢复该网卡原始 qdisc' '7) 临时试跑速率' '0) 返回主菜单'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
-            1) submenu_run tc_status auto || return 90 ;;
-            2) read -r -p '速率 Mbit/s: ' rate; submenu_run tc_trial "$rate" auto || return 90 ;;
-            3) read -r -p '速率 Mbit/s: ' rate; submenu_run tc_enable "$rate" auto 0 3 || return 90 ;;
-            4) submenu_run tc_disable auto || return 90 ;;
+            1) submenu_run nic_inventory || return 90 ;;
+            2) submenu_run cmd_nic verify || return 90 ;;
+            3)
+                nic_inventory; read -r -p '网卡 DEV: ' iface
+                submenu_run cmd_nic manage --interface "$iface" --mode fq || return 90
+                ;;
+            4)
+                nic_inventory; read -r -p '网卡 DEV: ' iface; read -r -p '速率 Mbit/s: ' rate
+                submenu_run cmd_nic manage --interface "$iface" --mode shape --rate "$rate" || return 90
+                ;;
+            5)
+                nic_inventory; read -r -p '网卡 DEV: ' iface
+                submenu_run tc_disable "$iface" || return 90
+                ;;
+            6)
+                nic_inventory; read -r -p '网卡 DEV: ' iface
+                if confirm "解除 $iface 管理并恢复原始 qdisc？"; then submenu_run nic_unmanage "$iface" || return 90; else log INFO "已取消"; ui_pause; fi
+                ;;
+            7)
+                nic_inventory; read -r -p '网卡 DEV: ' iface; read -r -p '速率 Mbit/s: ' rate
+                submenu_run tc_trial "$rate" "$iface" || return 90
+                ;;
             0) return 0 ;;
             *) invalid_menu_choice ;;
         esac
@@ -617,12 +801,13 @@ dns_menu() {
     local choice
     while true; do
         ui_clear
-        printf '%s\n' 'DNS 管理' '1) 状态' '2) 自动选择 DoT/普通 DNS' '3) 强制 DoT' '4) 普通 DNS' '5) 恢复 DNS 基线' '0) 返回主菜单'
+        printf '%s\n' 'DNS 独立策略' '1) 状态' '2) 预览 strict-dot 计划' '3) 应用 strict-dot（失败即回滚）' '4) 应用 plain' '5) 恢复 native 基线' '0) 返回主菜单'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
-            1) submenu_run dns_status || return 90 ;; 2) submenu_run dns_apply auto || return 90 ;;
-            3) submenu_run dns_apply dot || return 90 ;; 4) submenu_run dns_apply plain || return 90 ;;
-            5) if confirm '恢复 DNS 基线？'; then submenu_run dns_restore || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            1) submenu_run dns_policy_status || return 90 ;; 2) submenu_run dns_policy_plan strict-dot || return 90 ;;
+            3) if confirm '应用严格 DoT 策略？'; then submenu_run dns_policy_apply strict-dot || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            4) if confirm '应用普通 DNS 策略？'; then submenu_run dns_policy_apply plain || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            5) if confirm '恢复 DNS native 基线？'; then submenu_run dns_policy_apply native || return 90; else log INFO "已取消"; ui_pause; fi ;;
             0) return 0 ;; *) invalid_menu_choice ;;
         esac
     done
@@ -632,12 +817,13 @@ ipv6_menu() {
     local choice
     while true; do
         ui_clear
-        printf '%s\n' 'IPv6 管理' '1) 状态' '2) 临时禁用' '3) 永久禁用' '4) 恢复 IPv6 基线' '0) 返回主菜单'
+        printf '%s\n' 'IPv6 独立策略' '1) 状态' '2) 预览临时禁用计划' '3) 应用临时禁用' '4) 应用持久禁用' '5) 恢复 native 基线' '0) 返回主菜单'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
-            1) submenu_run ipv6_status || return 90 ;; 2) submenu_run ipv6_disable temporary || return 90 ;;
-            3) submenu_run ipv6_disable permanent || return 90 ;;
-            4) if confirm '恢复 IPv6 基线？'; then submenu_run ipv6_restore || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            1) submenu_run ipv6_policy_status || return 90 ;; 2) submenu_run ipv6_policy_plan disabled-temporary || return 90 ;;
+            3) if confirm '临时禁用非回环 IPv6？'; then submenu_run ipv6_policy_apply disabled-temporary || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            4) if confirm '持久禁用非回环 IPv6？'; then submenu_run ipv6_policy_apply disabled-persistent || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            5) if confirm '恢复 IPv6 native 基线？'; then submenu_run ipv6_policy_apply native || return 90; else log INFO "已取消"; ui_pause; fi ;;
             0) return 0 ;; *) invalid_menu_choice ;;
         esac
     done
@@ -668,7 +854,7 @@ interactive_menu() {
     while true; do
         ui_clear
         printf '\n%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
-        printf '%s\n' '1) 自动调优（推荐）' '2) 安装/刷新 BBR + FQ' '3) 测量与复验' '4) TC 整形管理' \
+        printf '%s\n' '1) 自动调优（推荐）' '2) 安装/刷新 BBR + FQ' '3) 测量与复验' '4) 多网卡 / TC 管理' \
             '5) 完整状态与一致性验证' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复/更新/卸载' '0) 退出'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
@@ -701,6 +887,7 @@ main() {
         explain) cmd_explain "$@" ;;
         status) require_no_arguments "status" "$@" || return 1; show_status ;;
         tc) cmd_tc "$@" ;;
+        nic) cmd_nic "$@" ;;
         measure) cmd_measure "$@" ;;
         kernel) cmd_kernel "$@" ;;
         dns) cmd_dns "$@" ;;

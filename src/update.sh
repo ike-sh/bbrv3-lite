@@ -10,6 +10,7 @@ self_update() {
         current=$(command -v bbr 2>/dev/null || true)
         [[ -f "$current" ]] || { die "当前从临时流运行且没有已安装的 bbr 命令；请先运行 install-alias.sh"; return 1; }
     fi
+    managed_bbr_script_signature "$current" || { die "当前 bbr 命令缺少完整项目签名；拒绝自更新未知文件"; return 1; }
     latest=$(curl -fsSL --max-time 20 "https://api.github.com/repos/${PROJECT_REPO}/releases/latest" 2>/dev/null | awk -F'"' '/"tag_name"/ {print $4; exit}' || true)
     if [[ -z "$latest" ]]; then
         latest=$(curl -fsSL --max-time 20 "https://api.github.com/repos/${PROJECT_REPO}/tags?per_page=100" |
@@ -33,8 +34,8 @@ self_update() {
     actual=$(sha256sum "$tmp/net-tcp-tune.sh" | awk '{print $1}')
     [[ -n "$expected" && "$actual" == "$expected" ]] || { rm -rf "$tmp"; die "SHA256 校验失败"; return 1; }
     bash -n "$tmp/net-tcp-tune.sh" || { rm -rf "$tmp"; die "新脚本语法检查失败"; return 1; }
-    grep -Fq 'SCRIPT_NAME="bbrv3-lite"' "$tmp/net-tcp-tune.sh" || { rm -rf "$tmp"; die "新脚本缺少项目标记"; return 1; }
-    grep -q "SCRIPT_VERSION=\"${latest#v}\"" "$tmp/net-tcp-tune.sh" || { rm -rf "$tmp"; die "新脚本版本标记不匹配"; return 1; }
+    managed_bbr_script_signature "$tmp/net-tcp-tune.sh" || { rm -rf "$tmp"; die "新脚本缺少完整项目签名或签名有歧义"; return 1; }
+    grep -Fxc "SCRIPT_VERSION=\"${latest#v}\"" "$tmp/net-tcp-tune.sh" >/dev/null || { rm -rf "$tmp"; die "新脚本版本标记不匹配"; return 1; }
     target="$current"; backup="${current}.previous"
     cp -a -- "$current" "$tmp/current.before" || { rm -rf "$tmp"; die "无法备份当前脚本"; return 1; }
     atomic_install "$tmp/current.before" "$backup" 0755 || { rm -rf "$tmp"; die "无法写入上一版本备份: $backup"; return 1; }

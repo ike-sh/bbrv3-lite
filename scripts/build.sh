@@ -11,14 +11,18 @@ MODULES=(
     core.sh
     config.sh
     platform.sh
+    path.sh
     state.sh
     sysctl.sh
     tc.sh
+    nic.sh
     measure.sh
     systemd.sh
     kernel.sh
     dns.sh
+    dns-policy.sh
     ipv6.sh
+    ipv6-policy.sh
     update.sh
     cli.sh
 )

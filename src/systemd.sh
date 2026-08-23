@@ -4,6 +4,7 @@
 
 ACTION_TRANSACTION_DIR=""
 ACTION_TRANSACTION_IFACE=""
+ACTION_TRANSACTION_INTERFACES=""
 ACTION_TRANSACTION_ROLLING_BACK=0
 
 current_script_path() {
@@ -27,8 +28,8 @@ verified_download_current_script() {
         expected=$(awk '$2=="net-tcp-tune.sh" || $2=="*net-tcp-tune.sh" {print $1; exit}' "${target}.sha")
         actual=$(sha256sum "$candidate" | awk '{print $1}')
         [[ -n "$expected" && "$actual" == "$expected" ]] || continue
-        grep -Fq 'SCRIPT_NAME="bbrv3-lite"' "$candidate" || continue
-        grep -Fq "SCRIPT_VERSION=\"${SCRIPT_VERSION}\"" "$candidate" || continue
+        managed_bbr_script_signature "$candidate" || continue
+        grep -Fxc "SCRIPT_VERSION=\"${SCRIPT_VERSION}\"" "$candidate" >/dev/null || continue
         bash -n "$candidate" || continue
         mv -f -- "$candidate" "$target"
         rm -f -- "${target}.sha"
@@ -42,10 +43,15 @@ verified_download_current_script() {
 resolve_install_source() {
     local target="$1" source candidate
     source=$(current_script_path 2>/dev/null || true)
-    if [[ -n "$source" ]]; then printf '%s\n' "$source"; return 0; fi
+    if [[ -n "$source" ]] && managed_bbr_script_signature "$source" &&
+       grep -Fxc "SCRIPT_VERSION=\"${SCRIPT_VERSION}\"" "$source" >/dev/null; then
+        printf '%s\n' "$source"
+        return 0
+    fi
     for candidate in "$(command -v bbr 2>/dev/null || true)" "$PERSIST_SCRIPT"; do
         [[ -f "$candidate" ]] || continue
-        grep -Fq "SCRIPT_VERSION=\"${SCRIPT_VERSION}\"" "$candidate" || continue
+        managed_bbr_script_signature "$candidate" || continue
+        grep -Fxc "SCRIPT_VERSION=\"${SCRIPT_VERSION}\"" "$candidate" >/dev/null || continue
         printf '%s\n' "$candidate"
         return 0
     done
@@ -56,7 +62,7 @@ resolve_install_source() {
 migrate_legacy_config() {
     local file="${1:-$CONFIG_FILE}" line key value
     [[ -f "$file" ]] || return 0
-    if grep -q '^SCHEMA_VERSION=1$' "$file" && ! grep -q 'balanced-minimal' "$file"; then return 0; fi
+    if grep -Fxq 'SCHEMA_VERSION=1' "$file" && ! grep -Fxq 'SYSCTL_PROFILE=balanced-minimal' "$file"; then return 0; fi
     log INFO "迁移旧版配置: $file"
     reset_config
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -64,10 +70,12 @@ migrate_legacy_config() {
         [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=([a-zA-Z0-9_.:-]+)$ ]] || continue
         key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
         case "$key" in
-            BBR_ENABLED|TC_ENABLED|TC_INTERFACE|TC_RATE_MBIT|TC_BASELINE_MBIT|TC_PERCENT|INITCWND|INITRWND)
+            BBR_ENABLED|TC_ENABLED|TC_INTERFACE|TC_RATE_MBIT|TC_BASELINE_MBIT|TC_PERCENT|INITCWND|INITRWND|MULTI_NIC_ENABLED)
                 case "$key" in
                     TC_BASELINE_MBIT) BANDWIDTH_MBIT="$value" ;;
-                    TC_PERCENT) TC_MARGIN_PERCENT=$((100-value)); ((TC_MARGIN_PERCENT<0)) && TC_MARGIN_PERCENT=3 ;;
+                    TC_PERCENT)
+                        if is_uint "$value" && (( value <= 100 )); then TC_MARGIN_PERCENT=$((100-value)); fi
+                        ;;
                     *) validate_config_value "$key" "$value" 2>/dev/null && printf -v "$key" '%s' "$value" ;;
                 esac
                 ;;
@@ -77,11 +85,40 @@ migrate_legacy_config() {
     save_config "$file"
 }
 
+retire_legacy_sysctl() {
+    [[ "$LEGACY_SYSCTL_FILE" != "$SYSCTL_FILE" ]] || return 0
+    [[ -e "$LEGACY_SYSCTL_FILE" || -L "$LEGACY_SYSCTL_FILE" ]] || return 0
+    if [[ -d "$LEGACY_SYSCTL_FILE" && ! -L "$LEGACY_SYSCTL_FILE" ]]; then
+        die "旧版 sysctl 路径不是文件，拒绝删除: $LEGACY_SYSCTL_FILE"
+        return 1
+    fi
+    [[ -n "$ACTION_TRANSACTION_DIR" && -f "$ACTION_TRANSACTION_DIR/legacy-sysctl.state" ]] || {
+        die "旧版 sysctl 尚未进入本次事务回滚点，拒绝删除: $LEGACY_SYSCTL_FILE"
+        return 1
+    }
+    tcp_baseline_validate "$BASELINE_DIR" >/dev/null 2>&1 || {
+        die "首次可信基线缺失或损坏，拒绝退役旧版 sysctl: $LEGACY_SYSCTL_FILE"
+        return 1
+    }
+    rm -f -- "$LEGACY_SYSCTL_FILE" || {
+        die "无法退役旧版 sysctl: $LEGACY_SYSCTL_FILE"
+        return 1
+    }
+    log INFO "已在事务内退役旧版 sysctl（首次可信基线仍可恢复）: $LEGACY_SYSCTL_FILE"
+}
+
 install_persistence() {
     require_root || return 1; require_commands systemctl install || return 1
     local source temp_unit source_temp
+    retire_legacy_sysctl || return 1
     source_temp=$(mktemp) || return 1
     source=$(resolve_install_source "$source_temp") || { rm -f -- "$source_temp"; return 1; }
+    managed_bbr_script_signature "$source" &&
+        grep -Fxc "SCRIPT_VERSION=\"${SCRIPT_VERSION}\"" "$source" >/dev/null || {
+        rm -f -- "$source_temp"
+        die "持久化来源缺少完整项目签名或版本不匹配"
+        return 1
+    }
     mkdir -p -- "$PERSIST_DIR"
     atomic_install "$source" "$PERSIST_SCRIPT" 0755 || { rm -f -- "$source_temp"; die "安装持久化脚本失败"; return 1; }
     rm -f -- "$source_temp"
@@ -142,32 +179,271 @@ remove_persistence() {
     command_exists systemctl && systemctl daemon-reload || true
 }
 
+query_unit_enabled_state() {
+    local unit="$1" state="" query_rc=0 printable
+    if state=$(systemctl is-enabled "$unit" 2>&1); then
+        query_rc=0
+    else
+        query_rc=$?
+    fi
+    # A non-zero status is normal for disabled/masked/not-found units.  The
+    # state token, rather than the command status alone, distinguishes those
+    # states from a failed manager/D-Bus query (which has no known token).
+    case "$state" in
+        enabled|enabled-runtime|disabled|masked|masked-runtime|linked|linked-runtime|alias|static|indirect|generated|transient|not-found)
+            printf '%s\n' "$state"
+            return 0
+            ;;
+    esac
+    printable=${state//$'\n'/'; '}
+    log WARN "无法读取 systemd unit-file 状态: $unit (exit=$query_rc, output=${printable:-empty})"
+    return 1
+}
+
+query_unit_active_state() {
+    local unit="$1" state="" query_rc=0 printable
+    if state=$(systemctl is-active "$unit" 2>&1); then
+        query_rc=0
+    else
+        query_rc=$?
+    fi
+    # Only stable states can be recreated by start/stop.  Treat failed and
+    # transitional states as non-restorable instead of silently recording
+    # them as inactive.
+    case "$state" in
+        active|inactive)
+            printf '%s\n' "$state"
+            return 0
+            ;;
+    esac
+    printable=${state//$'\n'/'; '}
+    log WARN "无法读取可恢复的 systemd active 状态: $unit (exit=$query_rc, output=${printable:-empty})"
+    return 1
+}
+
+unit_enabled_state_is_mutable() {
+    case "$1" in
+        enabled|enabled-runtime|disabled|masked|masked-runtime) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 capture_unit_state() {
     local unit="$1" file="$2" enabled active
-    if ! command_exists systemctl; then
-        printf 'unavailable\tunavailable\n' > "$file"
-        return
-    fi
-    enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
-    active=$(systemctl is-active "$unit" 2>/dev/null || true)
-    printf '%s\t%s\n' "${enabled:-not-found}" "${active:-inactive}" > "$file"
+    command_exists systemctl || { log WARN "无法捕获 systemd unit 状态（systemctl 不可用）: $unit"; return 1; }
+    enabled=$(query_unit_enabled_state "$unit") || return 1
+    active=$(query_unit_active_state "$unit") || return 1
+    printf '%s\t%s\n' "$enabled" "$active" > "$file"
 }
 
 restore_unit_state() {
-    local unit="$1" file="$2" enabled active rc=0
+    local unit="$1" file="$2" line enabled active current_enabled current_active
+    local actual_enabled actual_active rc=0 remask=0
+    local -a state_lines=()
     [[ -f "$file" ]] || return 0
-    IFS=$'\t' read -r enabled active < "$file" || return 1
-    [[ "$enabled" != unavailable ]] || return 0
-    command_exists systemctl || { log WARN "无法恢复 systemd unit 状态: $unit"; return 1; }
+    mapfile -t state_lines < "$file" || return 1
+    if (( ${#state_lines[@]} != 1 )); then
+        log ERR "systemd unit 状态快照格式损坏: $file"
+        return 1
+    fi
+    line="${state_lines[0]}"
+    if [[ "$line" != *$'\t'* || "${line#*$'\t'}" == *$'\t'* ]]; then
+        log ERR "systemd unit 状态快照字段无效: $file"
+        return 1
+    fi
+    enabled="${line%%$'\t'*}"
+    active="${line#*$'\t'}"
     case "$enabled" in
-        enabled|enabled-runtime|linked|linked-runtime|alias) systemctl enable "$unit" >/dev/null 2>&1 || rc=1 ;;
-        masked|masked-runtime) systemctl mask "$unit" >/dev/null 2>&1 || rc=1 ;;
-        *) systemctl disable "$unit" >/dev/null 2>&1 || true ;;
+        enabled|enabled-runtime|disabled|masked|masked-runtime|linked|linked-runtime|alias|static|indirect|generated|transient|not-found) ;;
+        *) log ERR "systemd unit 状态快照包含未知 unit-file 状态: ${enabled:-empty}"; return 1 ;;
     esac
     case "$active" in
-        active|activating|reloading) systemctl start "$unit" >/dev/null 2>&1 || rc=1 ;;
-        *) systemctl stop "$unit" >/dev/null 2>&1 || true ;;
+        active|inactive) ;;
+        *) log ERR "systemd unit 状态快照包含不可恢复的 active 状态: ${active:-empty}"; return 1 ;;
     esac
+    command_exists systemctl || { log WARN "无法恢复 systemd unit 状态（systemctl 不可用）: $unit"; return 1; }
+    current_enabled=$(query_unit_enabled_state "$unit") || return 1
+    current_active=$(query_unit_active_state "$unit") || return 1
+
+    # linked/alias/static/indirect/generated/transient/not-found describe how
+    # the unit was supplied, not a state that `systemctl enable` can safely
+    # reconstruct.  The restored unit files must already reproduce it.
+    if ! unit_enabled_state_is_mutable "$enabled"; then
+        if [[ "$current_enabled" != "$enabled" ]]; then
+            log ERR "不能安全合成 systemd unit-file 状态 '$enabled': $unit (current=$current_enabled)"
+            return 1
+        fi
+    elif [[ "$enabled" != masked && "$enabled" != masked-runtime ]] &&
+         ! unit_enabled_state_is_mutable "$current_enabled"; then
+        log ERR "拒绝把不可合成的 systemd unit-file 状态 '$current_enabled' 改写为 '$enabled': $unit"
+        return 1
+    fi
+
+    case "$enabled" in
+        masked|masked-runtime)
+            # A masked service must be temporarily unmasked before it can be
+            # started.  Changing permanent/runtime mask scope also requires
+            # removing the old mask first.  Masking is deliberately done last.
+            if [[ "$current_enabled" == masked || "$current_enabled" == masked-runtime ]]; then
+                if [[ "$current_enabled" != "$enabled" || ( "$active" == active && "$current_active" != active ) ]]; then
+                    case "$current_enabled" in
+                        masked)
+                            if ! systemctl unmask "$unit" >/dev/null 2>&1; then
+                                log WARN "移除 systemd 永久 mask 失败: $unit"
+                                rc=1
+                            fi
+                            ;;
+                        masked-runtime)
+                            if ! systemctl unmask --runtime "$unit" >/dev/null 2>&1; then
+                                log WARN "移除 systemd runtime mask 失败: $unit"
+                                rc=1
+                            fi
+                            ;;
+                    esac
+                    current_enabled=$(query_unit_enabled_state "$unit") || return 1
+                    remask=1
+                fi
+            elif [[ "$current_enabled" != "$enabled" ]]; then
+                remask=1
+            fi
+
+            if [[ "$active" == active && "$current_active" != active ]]; then
+                if ! systemctl start "$unit" >/dev/null 2>&1; then
+                    log WARN "启动 systemd unit 失败: $unit"
+                    rc=1
+                fi
+            elif [[ "$active" == inactive && "$current_active" != inactive ]]; then
+                if ! systemctl stop "$unit" >/dev/null 2>&1; then
+                    log WARN "停止 systemd unit 失败: $unit"
+                    rc=1
+                fi
+            fi
+
+            if (( remask )); then
+                if [[ "$enabled" == masked-runtime ]]; then
+                    if ! systemctl mask --runtime "$unit" >/dev/null 2>&1; then
+                        log WARN "恢复 systemd runtime mask 失败: $unit"
+                        rc=1
+                    fi
+                elif ! systemctl mask "$unit" >/dev/null 2>&1; then
+                    log WARN "恢复 systemd 永久 mask 失败: $unit"
+                    rc=1
+                fi
+            fi
+            ;;
+        enabled|enabled-runtime|disabled)
+            case "$current_enabled" in
+                masked)
+                    if ! systemctl unmask "$unit" >/dev/null 2>&1; then
+                        log WARN "移除 systemd 永久 mask 失败: $unit"
+                        rc=1
+                    fi
+                    current_enabled=$(query_unit_enabled_state "$unit") || return 1
+                    ;;
+                masked-runtime)
+                    if ! systemctl unmask --runtime "$unit" >/dev/null 2>&1; then
+                        log WARN "移除 systemd runtime mask 失败: $unit"
+                        rc=1
+                    fi
+                    current_enabled=$(query_unit_enabled_state "$unit") || return 1
+                    ;;
+            esac
+            if ! unit_enabled_state_is_mutable "$current_enabled"; then
+                log ERR "解除 mask 后得到不可安全改写的 unit-file 状态 '$current_enabled': $unit"
+                return 1
+            fi
+
+            case "$enabled:$current_enabled" in
+                enabled:enabled|enabled-runtime:enabled-runtime|disabled:disabled) ;;
+                enabled:enabled-runtime)
+                    if ! systemctl disable --runtime "$unit" >/dev/null 2>&1; then
+                        log WARN "移除 systemd runtime enable 失败: $unit"
+                        rc=1
+                    fi
+                    if ! systemctl enable "$unit" >/dev/null 2>&1; then
+                        log WARN "恢复 systemd 永久 enable 失败: $unit"
+                        rc=1
+                    fi
+                    ;;
+                enabled:disabled)
+                    if ! systemctl enable "$unit" >/dev/null 2>&1; then
+                        log WARN "恢复 systemd 永久 enable 失败: $unit"
+                        rc=1
+                    fi
+                    ;;
+                enabled-runtime:enabled)
+                    if ! systemctl disable "$unit" >/dev/null 2>&1; then
+                        log WARN "移除 systemd 永久 enable 失败: $unit"
+                        rc=1
+                    fi
+                    if ! systemctl enable --runtime "$unit" >/dev/null 2>&1; then
+                        log WARN "恢复 systemd runtime enable 失败: $unit"
+                        rc=1
+                    fi
+                    ;;
+                enabled-runtime:disabled)
+                    if ! systemctl enable --runtime "$unit" >/dev/null 2>&1; then
+                        log WARN "恢复 systemd runtime enable 失败: $unit"
+                        rc=1
+                    fi
+                    ;;
+                disabled:enabled)
+                    if ! systemctl disable "$unit" >/dev/null 2>&1; then
+                        log WARN "恢复 systemd disabled 状态失败: $unit"
+                        rc=1
+                    fi
+                    ;;
+                disabled:enabled-runtime)
+                    if ! systemctl disable --runtime "$unit" >/dev/null 2>&1; then
+                        log WARN "移除 systemd runtime enable 失败: $unit"
+                        rc=1
+                    fi
+                    ;;
+                *)
+                    log ERR "不支持的 systemd unit-file 状态转换: $current_enabled -> $enabled ($unit)"
+                    rc=1
+                    ;;
+            esac
+
+            if [[ "$active" == active && "$current_active" != active ]]; then
+                if ! systemctl start "$unit" >/dev/null 2>&1; then
+                    log WARN "启动 systemd unit 失败: $unit"
+                    rc=1
+                fi
+            elif [[ "$active" == inactive && "$current_active" != inactive ]]; then
+                if ! systemctl stop "$unit" >/dev/null 2>&1; then
+                    log WARN "停止 systemd unit 失败: $unit"
+                    rc=1
+                fi
+            fi
+            ;;
+        *)
+            # Non-synthesizable unit-file states were checked for equality
+            # above; start/stop is still safe for their runtime state.
+            if [[ "$active" == active && "$current_active" != active ]]; then
+                if ! systemctl start "$unit" >/dev/null 2>&1; then
+                    log WARN "启动 systemd unit 失败: $unit"
+                    rc=1
+                fi
+            elif [[ "$active" == inactive && "$current_active" != inactive ]]; then
+                if ! systemctl stop "$unit" >/dev/null 2>&1; then
+                    log WARN "停止 systemd unit 失败: $unit"
+                    rc=1
+                fi
+            fi
+            ;;
+    esac
+
+    actual_enabled=$(query_unit_enabled_state "$unit") || actual_enabled=query-failed
+    actual_active=$(query_unit_active_state "$unit") || actual_active=query-failed
+    if [[ "$actual_enabled" != "$enabled" ]]; then
+        log ERR "systemd unit-file 恢复验证失败: $unit expected=$enabled actual=$actual_enabled"
+        rc=1
+    fi
+    if [[ "$actual_active" != "$active" ]]; then
+        log ERR "systemd active 恢复验证失败: $unit expected=$active actual=$actual_active"
+        rc=1
+    fi
     return "$rc"
 }
 
@@ -191,6 +467,29 @@ action_transaction_restore_path() {
     fi
 }
 
+action_transaction_snapshot_tree() {
+    local source="$1" name="$2"
+    if [[ -e "$source" || -L "$source" ]]; then
+        [[ -d "$source" && ! -L "$source" ]] || { die "事务目录快照目标类型不安全: $source"; return 1; }
+        cp -a -- "$source" "$ACTION_TRANSACTION_DIR/files/$name" || return 1
+        printf 'present\n' > "$ACTION_TRANSACTION_DIR/${name}.state"
+    else
+        printf 'absent\n' > "$ACTION_TRANSACTION_DIR/${name}.state"
+    fi
+}
+
+action_transaction_restore_tree() {
+    local target="$1" name="$2" state parent
+    state=$(<"$ACTION_TRANSACTION_DIR/${name}.state") || return 1
+    parent=$(dirname "$target")
+    if [[ -e "$target" || -L "$target" ]]; then remove_tree_within "$target" "$parent" || return 1; fi
+    if [[ "$state" == present ]]; then
+        mkdir -p -- "$parent" || return 1
+        cp -a -- "$ACTION_TRANSACTION_DIR/files/$name" "$target" || return 1
+    elif [[ "$state" != absent ]]; then return 1
+    fi
+}
+
 action_transaction_capture_unit() {
     capture_unit_state "$1" "$ACTION_TRANSACTION_DIR/$2.unit"
 }
@@ -200,67 +499,121 @@ action_transaction_restore_unit() {
 }
 
 action_transaction_restore_routes() {
-    local family file baseline current token i rc=0
-    local -a route=() clean=()
-    for family in -4 -6; do
-        file="$ACTION_TRANSACTION_DIR/default-route-v${family#-}.txt"
-        [[ -s "$file" ]] || continue
-        baseline=$(head -n1 "$file")
-        current=$(ip "$family" route show default 2>/dev/null | head -n1 || true)
-        [[ "$baseline$current" == *initcwnd* || "$baseline$current" == *initrwnd* ]] || continue
-        [[ -n "$current" ]] || continue
-        read -r -a route <<< "$current"; clean=()
-        for ((i=0; i<${#route[@]}; i++)); do
-            token="${route[$i]}"
-            if [[ "$token" == initcwnd || "$token" == initrwnd ]]; then ((i+=1)); continue; fi
-            clean+=("$token")
-        done
-        if [[ "$baseline" =~ (^|[[:space:]])initcwnd[[:space:]]+([0-9]+) ]]; then clean+=(initcwnd "${BASH_REMATCH[2]}"); fi
-        if [[ "$baseline" =~ (^|[[:space:]])initrwnd[[:space:]]+([0-9]+) ]]; then clean+=(initrwnd "${BASH_REMATCH[2]}"); fi
-        ip "$family" route replace "${clean[@]}" || rc=1
-    done
-    return "$rc"
+    restore_default_route_windows_snapshot "$ACTION_TRANSACTION_DIR"
 }
 
 action_transaction_begin() {
-    local iface="$1" dir
+    local iface="$1" dir path stale=""
     [[ -z "$ACTION_TRANSACTION_DIR" ]] || { die "已有未提交的系统配置事务"; return 1; }
+    for path in "$STATE_DIR"/.transaction.*; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        stale+="${stale:+, }$path"
+    done
+    if [[ -n "$stale" ]]; then
+        die "发现上次中断遗留的系统配置事务，拒绝叠加新修改: $stale。请先核验并人工恢复该快照"
+        return 1
+    fi
     ensure_state_layout || return 1
     dir=$(mktemp -d "${STATE_DIR}/.transaction.XXXXXX") || return 1
-    ACTION_TRANSACTION_DIR="$dir"; ACTION_TRANSACTION_IFACE="$iface"
-    mkdir -p "$dir/files" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; return 1; }
-    action_qdisc_snapshot "$iface" "$dir/qdisc.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; return 1; }
+    ACTION_TRANSACTION_DIR="$dir"; ACTION_TRANSACTION_IFACE="$iface"; ACTION_TRANSACTION_INTERFACES="$iface"
+    mkdir -p "$dir/files" "$dir/qdiscs" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
+    action_qdisc_snapshot "$iface" "$dir/qdisc.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
+    cp -- "$dir/qdisc.snapshot" "$dir/qdiscs/$iface.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
     capture_runtime_sysctls > "$dir/sysctl.tsv" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; return 1; }
     ip -4 route show default > "$dir/default-route-v4.txt" 2>/dev/null || true
     ip -6 route show default > "$dir/default-route-v6.txt" 2>/dev/null || true
     if ! action_transaction_snapshot_path "$CONFIG_FILE" config ||
        ! action_transaction_snapshot_path "$SYSCTL_FILE" sysctl ||
+       ! action_transaction_snapshot_path "$LEGACY_SYSCTL_FILE" legacy-sysctl ||
        ! action_transaction_snapshot_path "$SERVICE_FILE" service ||
        ! action_transaction_snapshot_path "$LEGACY_SERVICE_FILE" legacy-service ||
-       ! action_transaction_snapshot_path "$PERSIST_SCRIPT" persist-script; then
+       ! action_transaction_snapshot_path "$PERSIST_SCRIPT" persist-script ||
+       ! action_transaction_snapshot_tree "$NIC_POLICY_DIR" nic-policy-dir; then
         remove_tree_within "$dir" "$STATE_DIR" || true
-        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
         return 1
     fi
     if ! action_transaction_capture_unit "$SERVICE_NAME" service ||
        ! action_transaction_capture_unit bbr-optimize-persist.service legacy-service ||
        ! chmod -R go-rwx "$dir"; then
         remove_tree_within "$dir" "$STATE_DIR" || true
-        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
         return 1
     fi
     log INFO "已创建本次操作回滚点: $dir"
 }
 
+action_transaction_add_interface() {
+    local iface="$1"
+    [[ -n "$ACTION_TRANSACTION_DIR" ]] || return 1
+    validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
+    grep -Fqx -- "$iface" <<< "$ACTION_TRANSACTION_INTERFACES" && return 0
+    action_qdisc_snapshot "$iface" "$ACTION_TRANSACTION_DIR/qdiscs/$iface.snapshot" || return 1
+    ACTION_TRANSACTION_INTERFACES+=$'\n'"$iface"
+}
+
+action_transaction_discard_snapshot() {
+    local dir="$ACTION_TRANSACTION_DIR"
+    ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+    [[ -z "$dir" ]] || remove_tree_within "$dir" "$STATE_DIR"
+}
+
+action_transaction_begin_multi() {
+    local primary="$1" iface
+    action_transaction_begin "$primary" || return 1
+    if [[ "$(nic_policy_layout_state 2>/dev/null || true)" == managed ]]; then
+        if ! nic_policy_set_validate; then action_transaction_discard_snapshot || true; return 1; fi
+        while IFS= read -r iface; do
+            [[ -n "$iface" ]] || continue
+            if ! action_transaction_add_interface "$iface"; then action_transaction_discard_snapshot || true; return 1; fi
+        done < <(nic_policy_interface_list)
+    fi
+    if (( ${MULTI_NIC_ENABLED:-0} == 0 )) && [[ "${TC_INTERFACE:-auto}" != auto ]]; then
+        if ! action_transaction_add_interface "$TC_INTERFACE"; then action_transaction_discard_snapshot || true; return 1; fi
+    fi
+}
+
+configured_state_target_preflight() {
+    local target="$1" interfaces other
+    interfaces=$(managed_htb_interfaces_strict) || return 1
+    while IFS= read -r other; do
+        [[ -n "$other" ]] || continue
+        if [[ "$other" != "$target" ]]; then
+            die "检测到另一张网卡 $other 上仍有受管 HTB；拒绝在 $target 应用持久化状态。请先执行 ${0##*/} tc disable --interface $other"
+            return 1
+        fi
+    done <<< "$interfaces"
+    qdisc_guard "$target"
+}
+
+tcp_restore_runtime_preflight() {
+    local iface="$1" net_root="${BBRV3_SYS_CLASS_NET_ROOT:-/sys/class/net}" key
+    validate_interface_name "$iface" && [[ "$iface" != auto && -e "$net_root/$iface" ]] || {
+        die "基线绑定的网卡不存在或名称非法: $iface"
+        return 1
+    }
+    tc qdisc show dev "$iface" >/dev/null 2>&1 || { die "无法读取 $iface 的 qdisc；恢复尚未开始"; return 1; }
+    tc class show dev "$iface" >/dev/null 2>&1 || { die "无法读取 $iface 的 class；恢复尚未开始"; return 1; }
+    while IFS= read -r key; do
+        sysctl -n "$key" >/dev/null 2>&1 || { die "无法读取恢复目标 sysctl: $key"; return 1; }
+    done < <(tcp_baseline_sysctl_keys)
+    ip -4 route show default >/dev/null 2>&1 || { die "无法读取 IPv4 默认路由；恢复尚未开始"; return 1; }
+    ip -6 route show default >/dev/null 2>&1 || { die "无法读取 IPv6 默认路由；恢复尚未开始"; return 1; }
+    query_unit_enabled_state "$SERVICE_NAME" >/dev/null || return 1
+    query_unit_active_state "$SERVICE_NAME" >/dev/null || return 1
+    query_unit_enabled_state bbr-optimize-persist.service >/dev/null || return 1
+    query_unit_active_state bbr-optimize-persist.service >/dev/null || return 1
+}
+
 action_transaction_commit() {
     local dir="$ACTION_TRANSACTION_DIR"
     [[ -n "$dir" ]] || return 0
-    ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""
+    ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
     remove_tree_within "$dir" "$STATE_DIR" || log WARN "操作已提交，但无法删除临时事务快照: $dir"
 }
 
 action_transaction_rollback() {
-    local dir="$ACTION_TRANSACTION_DIR" iface="$ACTION_TRANSACTION_IFACE" key value rc=0 had_lock="$LOCK_HELD"
+    local dir="$ACTION_TRANSACTION_DIR" iface="$ACTION_TRANSACTION_IFACE" file key value rc=0 had_lock="$LOCK_HELD"
     [[ -n "$dir" ]] || return 0
     (( ACTION_TRANSACTION_ROLLING_BACK == 0 )) || return 1
     ACTION_TRANSACTION_ROLLING_BACK=1
@@ -268,16 +621,27 @@ action_transaction_rollback() {
     systemctl disable --now bbr-optimize-persist.service >/dev/null 2>&1 || true
     action_transaction_restore_path "$CONFIG_FILE" config || rc=1
     action_transaction_restore_path "$SYSCTL_FILE" sysctl || rc=1
+    action_transaction_restore_path "$LEGACY_SYSCTL_FILE" legacy-sysctl || rc=1
     action_transaction_restore_path "$SERVICE_FILE" service || rc=1
     action_transaction_restore_path "$LEGACY_SERVICE_FILE" legacy-service || rc=1
     action_transaction_restore_path "$PERSIST_SCRIPT" persist-script || rc=1
+    action_transaction_restore_tree "$NIC_POLICY_DIR" nic-policy-dir || rc=1
     rmdir "$PERSIST_DIR" 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1 || rc=1
     while IFS=$'\t' read -r key value; do
         if [[ -n "$key" ]] && ! sysctl -q -w "$key=$value"; then rc=1; fi
     done < "$dir/sysctl.tsv"
     action_transaction_restore_routes || rc=1
-    restore_action_qdisc "$iface" "$dir/qdisc.snapshot" || rc=1
+    if [[ -d "$dir/qdiscs" ]]; then
+        for file in "$dir/qdiscs"/*.snapshot; do
+            [[ -f "$file" ]] || continue
+            iface="${file##*/}"; iface="${iface%.snapshot}"
+            validate_interface_name "$iface" && [[ "$iface" != auto ]] || { rc=1; continue; }
+            restore_action_qdisc "$iface" "$file" || rc=1
+        done
+    else
+        restore_action_qdisc "$iface" "$dir/qdisc.snapshot" || rc=1
+    fi
     (( had_lock == 0 )) || release_lock
     action_transaction_restore_unit "$SERVICE_NAME" service || rc=1
     action_transaction_restore_unit bbr-optimize-persist.service legacy-service || rc=1
@@ -286,7 +650,7 @@ action_transaction_rollback() {
         remove_tree_within "$dir" "$STATE_DIR" || rc=1
     fi
     if (( rc == 0 )); then
-        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
         log OK "已恢复本次操作前的 qdisc、sysctl、配置和服务状态"
     else
         log ERR "自动回滚未完全成功；事务快照保留在 $dir"
@@ -295,9 +659,9 @@ action_transaction_rollback() {
     return "$rc"
 }
 
-run_action_transaction() {
+run_action_transaction_multi() {
     local iface="$1" rc rollback_rc=0; shift
-    action_transaction_begin "$iface" || return 1
+    action_transaction_begin_multi "$iface" || return 1
     if "$@"; then
         action_transaction_commit
         return
@@ -310,14 +674,30 @@ run_action_transaction() {
 }
 
 apply_configured_state() {
-    require_root || return 1; acquire_lock 30 || return 1
+    require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
+    require_commands ip tc sysctl systemctl modprobe || return 1; acquire_lock 30 || return 1
     load_config || return 1
     (( BBR_ENABLED == 1 )) || return 0
-    apply_sysctl_profile || return 1
+    if (( MULTI_NIC_ENABLED == 1 )); then
+        nic_apply_runtime_policies
+        return
+    fi
+    if (( TC_ENABLED == 1 )) && [[ "$TC_INTERFACE" == auto ]]; then
+        die "检测到旧版 auto 整形配置；为避免默认路由变化后把 ${TC_RATE_MBIT} Mbit 迁移到另一网卡，本次拒绝应用。请重新运行自动调优或显式执行 tc enable RATE --interface DEV"
+        return 1
+    fi
     local iface
     iface=$(detect_interface "$TC_INTERFACE") || return 1
+    configured_state_target_preflight "$iface" || return 1
     if (( TC_ENABLED == 1 )); then
+        [[ "$TC_INTERFACE" == "$iface" ]] || { die "整形配置与解析后的目标网卡不一致"; return 1; }
         (( TC_RATE_MBIT > 0 )) || { die "TC_ENABLED=1 但 TC_RATE_MBIT=0"; return 1; }
+    fi
+    network_tuning_preflight "$iface" "$TC_ENABLED" || return 1
+    # All dependency, interface, ownership and qdisc checks above are
+    # deliberately read-only.  No sysctl is written until every gate passes.
+    apply_sysctl_profile || return 1
+    if (( TC_ENABLED == 1 )); then
         apply_shaping "$iface" "$TC_RATE_MBIT" || return 1
     else
         apply_fq "$iface" || return 1
@@ -326,20 +706,28 @@ apply_configured_state() {
 }
 
 install_base_tuning_steps() {
-    local iface="$1" requested="$2" profile="$3" role="$4" bandwidth="$5" rtt="$6"
+    local iface="$1" profile="$3" role="$4" bandwidth="$5" rtt="$6" mode=fq rate=0 knee=0 margin=3
     capture_baseline "$iface" || return 1
     migrate_legacy_config || return 1
+    retire_legacy_sysctl || return 1
     load_config || return 1
-    SYSCTL_PROFILE="$profile"; ROLE="$role"; BANDWIDTH_MBIT="$bandwidth"; RTT_MS="$rtt"
-    BBR_ENABLED=1; TC_INTERFACE="$requested"
-    validate_config_value SYSCTL_PROFILE "$SYSCTL_PROFILE" && validate_config_value ROLE "$ROLE" || { die "非法 profile/role"; return 1; }
+    nic_migrate_legacy_policy || return 1
+    nic_baseline_capture "$iface" || return 1
+    if nic_policy_exists "$iface"; then
+        nic_policy_load_file "$(nic_policy_path "$iface")" || return 1
+        mode="$NIC_POLICY_MODE"; rate="$NIC_POLICY_RATE_MBIT"; knee="$NIC_POLICY_KNEE_MBIT"; margin="$NIC_POLICY_MARGIN_PERCENT"
+    fi
+    validate_config_value SYSCTL_PROFILE "$profile" && validate_config_value ROLE "$role" || { die "非法 profile/role"; return 1; }
+    if [[ "$mode" == shape ]]; then apply_shaping "$iface" "$rate" || return 1; else apply_fq "$iface" || return 1; fi
+    nic_policy_write "$iface" "$mode" "$rate" "$knee" "$margin" "$profile" "$role" "$bandwidth" "$rtt" || return 1
+    nic_finalize_multi_config || return 1
+    BBR_ENABLED=1
     apply_sysctl_profile || return 1
-    if (( TC_ENABLED == 1 && TC_RATE_MBIT > 0 )); then apply_shaping "$iface" "$TC_RATE_MBIT" || return 1; else apply_fq "$iface" || return 1; fi
     apply_initial_windows || return 1
     save_config || { die "运行时已生效，但配置保存失败；未报告安装成功"; return 1; }
     install_persistence || { die "运行时已生效，但持久化安装失败；请修复后重试 install"; return 1; }
     restart_and_verify_persistence || { die "运行时已生效，但开机持久化验证失败"; return 1; }
-    log OK "基础调优已安装: BBR + ${SYSCTL_PROFILE} + $( ((TC_ENABLED)) && echo 'HTB/FQ' || echo 'FQ' )"
+    log OK "基础调优已安装: BBR + ${SYSCTL_PROFILE} + $([[ "$mode" == shape ]] && echo 'HTB/FQ' || echo 'FQ')（$iface）"
 }
 
 install_base_tuning() {
@@ -347,18 +735,25 @@ install_base_tuning() {
     acquire_lock || return 1; require_commands ip tc sysctl modprobe systemctl || return 1
     local requested="$1" profile="$2" role="$3" bandwidth="$4" rtt="$5" iface
     iface=$(detect_interface "$requested") || return 1
+    [[ "$requested" != auto ]] || auto_tune_route_guard "$iface" "" || return 1
+    load_config || return 1
+    nic_policy_ownership_preflight "$iface" || return 1
     qdisc_guard "$iface" || return 1
     BANDWIDTH_MBIT="$bandwidth"; network_tuning_preflight "$iface" 1 || return 1
-    run_action_transaction "$iface" install_base_tuning_steps "$iface" "$requested" "$profile" "$role" "$bandwidth" "$rtt"
+    run_action_transaction_multi "$iface" install_base_tuning_steps "$iface" "$requested" "$profile" "$role" "$bandwidth" "$rtt"
 }
 
 prepare_auto_tuning_runtime() {
     local iface="$1" requested="$2" profile="$3" role="$4" bandwidth="$5" rtt="$6"
+    shaping_target_preflight "$iface" auto "$requested" || return 1
     capture_baseline "$iface" || return 1
     migrate_legacy_config || return 1
+    retire_legacy_sysctl || return 1
     load_config || return 1
-    SYSCTL_PROFILE="$profile"; ROLE="$role"; BANDWIDTH_MBIT="$bandwidth"; RTT_MS="$rtt"
-    BBR_ENABLED=1; TC_INTERFACE="$requested"; TC_ENABLED=0; TC_RATE_MBIT=0; TC_KNEE_MBIT=0; TC_MARGIN_PERCENT=3
+    nic_migrate_legacy_policy || return 1
+    nic_baseline_capture "$iface" || return 1
+    nic_stage_candidate_global_model "$iface" "$profile" "$role" "$bandwidth" "$rtt" || return 1
+    BBR_ENABLED=1; TC_INTERFACE="$iface"; TC_ENABLED=0; TC_RATE_MBIT=0; TC_KNEE_MBIT=0; TC_MARGIN_PERCENT=3
     validate_config_value SYSCTL_PROFILE "$SYSCTL_PROFILE" && validate_config_value ROLE "$ROLE" || { die "非法 profile/role"; return 1; }
     apply_sysctl_profile runtime || return 1
     apply_fq "$iface" || return 1
@@ -377,6 +772,24 @@ verify_runtime_tuning() {
 }
 
 persist_current_tuning() {
+    local iface="$TC_INTERFACE" mode=fq rate=0 knee=0 margin="$TC_MARGIN_PERCENT"
+    local profile role bandwidth rtt expected actual
+    validate_interface_name "$iface" && [[ "$iface" != auto ]] || { die "自动调优没有绑定具体网卡，拒绝持久化"; return 1; }
+    [[ "${AUTO_POLICY_INTERFACE:-}" == "$iface" && -n "${AUTO_POLICY_PROFILE:-}" && -n "${AUTO_POLICY_ROLE:-}" ]] || {
+        die "自动调优目标模型缺失或与运行网卡不一致，拒绝持久化"
+        return 1
+    }
+    profile="$AUTO_POLICY_PROFILE"; role="$AUTO_POLICY_ROLE"
+    bandwidth="$AUTO_POLICY_BANDWIDTH_MBIT"; rtt="$AUTO_POLICY_RTT_MS"
+    expected=$(nic_policy_candidate_global_model "$iface" "$profile" "$role" "$bandwidth" "$rtt") || return 1
+    actual="${SYSCTL_PROFILE}"$'\t'"${ROLE}"$'\t'"${BANDWIDTH_MBIT}"$'\t'"${RTT_MS}"$'\t'"${NIC_MODEL_INTERFACE}"
+    [[ "$actual" == "$expected" ]] || {
+        die "临时全局 TCP 模型已漂移，拒绝把自动调优结果持久化"
+        return 1
+    }
+    if (( TC_ENABLED == 1 )); then mode=shape; rate="$TC_RATE_MBIT"; knee="$TC_KNEE_MBIT"; fi
+    nic_policy_write "$iface" "$mode" "$rate" "$knee" "$margin" "$profile" "$role" "$bandwidth" "$rtt" || return 1
+    nic_finalize_multi_config || return 1
     apply_sysctl_profile persistent || return 1
     save_config || { die "配置提交失败"; return 1; }
     install_persistence || { die "持久化安装失败"; return 1; }
@@ -386,8 +799,9 @@ persist_current_tuning() {
 
 restore_baseline_qdisc() {
     local iface kind
-    iface=$(awk -F'\t' '$1=="INTERFACE" {print $2}' "$BASELINE_DIR/manifest" 2>/dev/null)
-    [[ -n "$iface" && -e "/sys/class/net/$iface" ]] || return 0
+    iface="$TCP_BASELINE_VALIDATED_INTERFACE"
+    [[ -n "$iface" ]] || { die "内部错误：恢复 qdisc 前没有已验证的基线网卡"; return 1; }
+    [[ -e "${BBRV3_SYS_CLASS_NET_ROOT:-/sys/class/net}/$iface" ]] || { die "基线网卡已消失: $iface"; return 1; }
     kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$BASELINE_DIR/qdisc.txt" 2>/dev/null)
     if ! restore_qdisc_text_snapshot "$iface" "$BASELINE_DIR/qdisc.txt"; then
         log WARN "基线 root qdisc 为 '$kind'，文本快照无法无损重放；已保留快照供人工恢复"
@@ -396,43 +810,36 @@ restore_baseline_qdisc() {
 }
 
 restore_baseline_route_windows() {
-    local family file baseline current token i rc=0
-    local -a route=() clean=()
-    for family in -4 -6; do
-        file="$BASELINE_DIR/default-route-v${family#-}.txt"
-        [[ -s "$file" ]] || continue
-        baseline=$(head -n1 "$file")
-        current=$(ip "$family" route show default 2>/dev/null | head -n1 || true)
-        [[ "$baseline$current" == *initcwnd* || "$baseline$current" == *initrwnd* ]] || continue
-        [[ -n "$current" ]] || continue
-        read -r -a route <<< "$current"; clean=()
-        for ((i=0; i<${#route[@]}; i++)); do
-            token="${route[$i]}"
-            if [[ "$token" == initcwnd || "$token" == initrwnd ]]; then ((i+=1)); continue; fi
-            clean+=("$token")
-        done
-        if [[ "$baseline" =~ (^|[[:space:]])initcwnd[[:space:]]+([0-9]+) ]]; then clean+=(initcwnd "${BASH_REMATCH[2]}"); fi
-        if [[ "$baseline" =~ (^|[[:space:]])initrwnd[[:space:]]+([0-9]+) ]]; then clean+=(initrwnd "${BASH_REMATCH[2]}"); fi
-        ip "$family" route replace "${clean[@]}" || { log WARN "未能恢复 IPv${family#-} 默认路由窗口参数"; rc=1; }
-    done
-    return "$rc"
+    restore_default_route_windows_snapshot "$BASELINE_DIR" || {
+        log WARN "未能完整恢复默认路由窗口参数"
+        return 1
+    }
 }
 
 restore_baseline() {
-    require_root || return 1; acquire_lock || return 1
-    local rc=0
-    [[ -f "$BASELINE_DIR/manifest" ]] || { die "没有可恢复的基线"; return 1; }
-    if [[ "$(baseline_provenance)" == legacy-reference ]]; then
-        [[ -x "$BASELINE_DIR/legacy-tool.sh" ]] || { die "旧版恢复工具缺失，不能自动恢复"; return 1; }
+    require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
+    require_commands ip tc sysctl systemctl || return 1; acquire_lock || return 1
+    local rc=0 provenance iface
+    [[ -e "$BASELINE_DIR" || -L "$BASELINE_DIR" ]] || { die "没有可恢复的基线"; return 1; }
+    tcp_baseline_validate "$BASELINE_DIR" || { die "TCP 基线校验失败；未修改运行配置"; return 1; }
+    provenance="$TCP_BASELINE_VALIDATED_PROVENANCE"
+    iface="$TCP_BASELINE_VALIDATED_INTERFACE"
+    log INFO "TCP 基线校验通过: $TCP_BASELINE_VALIDATED_GENERATION / $provenance / $iface"
+    tcp_restore_runtime_preflight "$iface" || return 1
+    nic_restore_preflight || return 1
+    if [[ "$provenance" == legacy-reference ]]; then
         remove_persistence
+        nic_restore_secondary_baselines || { die "旧版委托恢复前，逐网卡 qdisc 恢复失败；策略和基线均已保留"; return 1; }
         release_lock
         log INFO "将恢复操作交给迁移时保存的旧版本工具"
         bash "$BASELINE_DIR/legacy-tool.sh" restore || { die "旧版本恢复失败；旧备份仍在 $LEGACY_BACKUP_DIR"; return 1; }
+        acquire_lock 30 || { die "旧版恢复完成，但无法重新取得管理锁"; return 1; }
+        nic_policy_remove_tree || { die "旧版基线已恢复，但无法删除 v8 多网卡策略目录"; return 1; }
         log OK "旧版可信基线恢复完成"
         return 0
     fi
     remove_persistence
-    rm -f -- "$CONFIG_FILE" "$SYSCTL_FILE"
+    nic_restore_secondary_baselines || rc=1
     restore_backed_path "$CONFIG_FILE" config || rc=1
     restore_backed_path "$SYSCTL_FILE" sysctl || rc=1
     restore_backed_path "$LEGACY_SYSCTL_FILE" legacy-sysctl || rc=1
@@ -442,7 +849,8 @@ restore_baseline() {
     restore_runtime_sysctls || rc=1
     restore_baseline_route_windows || rc=1
     restore_baseline_qdisc || rc=1
-    systemctl daemon-reload 2>/dev/null || true
+    nic_policy_remove_tree || rc=1
+    systemctl daemon-reload 2>/dev/null || rc=1
     restore_unit_state "$SERVICE_NAME" "$BASELINE_DIR/service.unit" || rc=1
     restore_unit_state bbr-optimize-persist.service "$BASELINE_DIR/legacy-service.unit" || rc=1
     if (( rc == 0 )); then log OK "已恢复首次可信基线；基线和测量历史仍保留在 $STATE_DIR"
@@ -452,21 +860,51 @@ restore_baseline() {
 managed_bbr_command() {
     local file="$1"
     [[ -f "$file" || -L "$file" ]] || return 1
-    grep -Eq 'SCRIPT_NAME="bbrv3-lite"|github[.]com/ike-sh/bbrv3-lite' "$file" 2>/dev/null
+    managed_bbr_script_signature "$file"
+}
+
+LEGACY_SHELL_START='# ================ net-tcp-tune 快捷别名 ================'
+LEGACY_SHELL_END='# ================ net-tcp-tune 快捷别名结束 ================'
+
+legacy_shell_block_valid() {
+    local file="$1" start_count end_count start_line end_line
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    start_count=$(grep -Fxc "$LEGACY_SHELL_START" "$file" 2>/dev/null || true)
+    end_count=$(grep -Fxc "$LEGACY_SHELL_END" "$file" 2>/dev/null || true)
+    [[ "$start_count" == 1 && "$end_count" == 1 ]] || return 1
+    start_line=$(grep -Fxn "$LEGACY_SHELL_START" "$file" | cut -d: -f1)
+    end_line=$(grep -Fxn "$LEGACY_SHELL_END" "$file" | cut -d: -f1)
+    [[ "$start_line" =~ ^[0-9]+$ && "$end_line" =~ ^[0-9]+$ && "$start_line" -lt "$end_line" ]]
+}
+
+legacy_shell_commands_preflight() {
+    local rc_file start_count end_count
+    for rc_file in "${HOME:-/root}/.bashrc" "${HOME:-/root}/.bash_profile" "${HOME:-/root}/.zshrc"; do
+        [[ -e "$rc_file" || -L "$rc_file" ]] || continue
+        [[ -f "$rc_file" ]] || { die "shell 配置不是常规文件: $rc_file"; return 1; }
+        start_count=$(grep -Fxc "$LEGACY_SHELL_START" "$rc_file" 2>/dev/null || true)
+        end_count=$(grep -Fxc "$LEGACY_SHELL_END" "$rc_file" 2>/dev/null || true)
+        if (( start_count == 0 && end_count == 0 )); then continue; fi
+        legacy_shell_block_valid "$rc_file" || {
+            die "旧版 bbr shell function 标记缺失、重复、倒置或位于符号链接中；拒绝编辑: $rc_file"
+            return 1
+        }
+    done
 }
 
 remove_legacy_shell_commands() {
     local rc_file temp changed=0
+    legacy_shell_commands_preflight || return 1
     for rc_file in "${HOME:-/root}/.bashrc" "${HOME:-/root}/.bash_profile" "${HOME:-/root}/.zshrc"; do
         [[ -f "$rc_file" ]] || continue
-        grep -Fq '# ================ net-tcp-tune 快捷别名 ================' "$rc_file" || continue
+        grep -Fqx "$LEGACY_SHELL_START" "$rc_file" || continue
         temp=$(mktemp "${rc_file}.bbrv3-lite.XXXXXX") || return 1
         if ! sed '/^# ================ net-tcp-tune 快捷别名 ================/,/^# ================ net-tcp-tune 快捷别名结束 ================/d' "$rc_file" > "$temp"; then
             rm -f -- "$temp"; return 1
         fi
-        chmod --reference="$rc_file" "$temp" 2>/dev/null || true
-        [[ "${EUID:-$(id -u)}" -ne 0 ]] || chown --reference="$rc_file" "$temp" 2>/dev/null || true
-        mv -f -- "$temp" "$rc_file" || return 1
+        chmod --reference="$rc_file" "$temp" || { rm -f -- "$temp"; die "无法保留 $rc_file 的权限"; return 1; }
+        chown --reference="$rc_file" "$temp" || { rm -f -- "$temp"; die "无法保留 $rc_file 的所有者"; return 1; }
+        mv -f -- "$temp" "$rc_file" || { rm -f -- "$temp"; return 1; }
         log OK "已从 $rc_file 删除旧版 bbr shell function"
         ((changed+=1))
     done
@@ -476,6 +914,7 @@ remove_legacy_shell_commands() {
 remove_cli_command() {
     local current="" candidate resolved removed=0
     local -A seen=()
+    legacy_shell_commands_preflight || return 1
     current=$(current_script_path 2>/dev/null || true)
     for candidate in "${BBRV3_CLI_PATH:-}" "$current" "/usr/local/bin/bbr" "${HOME:-/root}/.local/bin/bbr"; do
         [[ -n "$candidate" ]] || continue
@@ -495,28 +934,56 @@ remove_cli_command() {
 }
 
 uninstall_managed() {
-    require_root || return 1; acquire_lock || return 1
-    local purge="${1:-0}" iface="" resolved_state restored_tcp=0 restored_dns=0 restored_ipv6=0
+    require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
+    require_commands ip tc sysctl systemctl readlink grep cut sed mktemp mv rm chmod chown || return 1
+    local purge="${1:-0}" resolved_state restored_tcp=0 restored_dns=0 restored_ipv6=0 interfaces other
+
+    case "$purge" in 0|1) ;; *) die "非法卸载清理模式: $purge"; return 1 ;; esac
+    if (( purge )); then
+        resolved_state=$(readlink -m -- "$STATE_DIR") || { die "无法解析状态目录: $STATE_DIR"; return 1; }
+        [[ "$resolved_state" == /var/lib/bbrv3-lite || "$resolved_state" == /tmp/bbrv3-lite-test-* ]] || {
+            die "拒绝清理非标准状态目录: $resolved_state"
+            return 1
+        }
+    fi
+    legacy_shell_commands_preflight || return 1
+    acquire_lock || return 1
 
     # Restore before deleting either the executable or the only recovery data.
-    if [[ -f "$BASELINE_DIR/manifest" ]]; then
+    if [[ -e "$BASELINE_DIR" || -L "$BASELINE_DIR" ]]; then
+        tcp_baseline_validate "$BASELINE_DIR" || { die "TCP 基线损坏；为保留恢复能力，本次不会卸载任何管理组件"; return 1; }
         restore_baseline || return 1
         restored_tcp=1
     else
-        load_config || true
-        iface=$(detect_interface "${TC_INTERFACE:-auto}" 2>/dev/null || true)
-        if [[ -n "$iface" ]] && managed_htb "$iface"; then apply_fq "$iface" || return 1; fi
+        if [[ -e "$NIC_POLICY_DIR" || -L "$NIC_POLICY_DIR" ]]; then
+            die "存在多网卡策略但没有可信 TCP 基线；为避免丢失逐网卡恢复信息，本次不会卸载"
+            return 1
+        fi
+        interfaces=$(managed_htb_interfaces_strict) || return 1
+        if [[ -n "$interfaces" ]]; then
+            while IFS= read -r other; do
+                [[ -n "$other" ]] && log ERR "仍有受管 HTB: $other；请先执行 ${0##*/} tc disable --interface $other"
+            done <<< "$interfaces"
+            die "没有可信 TCP 基线且仍有受管 HTB；已保留配置、服务和 bbr 命令"
+            return 1
+        fi
         remove_persistence
         rm -f -- "$CONFIG_FILE" "$SYSCTL_FILE"
-        log WARN "没有 TCP 基线：已移除管理文件和 HTB，但无法精确恢复修改前的运行时 sysctl/qdisc"
+        log WARN "没有 TCP 基线：未发现任何受管 HTB，已移除管理文件；无法精确恢复修改前的运行时 sysctl/qdisc"
+    fi
+    interfaces=$(managed_htb_interfaces_strict) || return 1
+    if [[ -n "$interfaces" ]]; then
+        while IFS= read -r other; do
+            [[ -n "$other" ]] && log ERR "恢复后仍有受管 HTB: $other；请执行 ${0##*/} tc disable --interface $other"
+        done <<< "$interfaces"
+        die "为避免遗留整形失去管理入口，已保留 bbr 命令与状态"
+        return 1
     fi
     if [[ -f "$DNS_BACKUP_DIR/baseline/manifest" ]]; then dns_restore || return 1; restored_dns=1; fi
     if [[ -f "$IPV6_BACKUP_DIR/baseline/sysctl.tsv" ]]; then ipv6_restore || return 1; restored_ipv6=1; fi
 
     remove_cli_command || return 1
     if (( purge )); then
-        resolved_state=$(readlink -m "$STATE_DIR")
-        [[ "$resolved_state" == /var/lib/bbrv3-lite || "$resolved_state" == /tmp/bbrv3-lite-test-* ]] || { die "拒绝清理非标准状态目录: $resolved_state"; return 1; }
         [[ ! -e "$resolved_state" ]] || rm -rf -- "$resolved_state"
         log WARN "已完整卸载并永久删除状态目录"
     elif [[ -d "$STATE_DIR" ]]; then
@@ -531,7 +998,7 @@ uninstall_managed() {
 persistence_script_state() {
     local version current
     [[ -f "$PERSIST_SCRIPT" ]] || { printf 'absent\n'; return; }
-    grep -Fq 'SCRIPT_NAME="bbrv3-lite"' "$PERSIST_SCRIPT" 2>/dev/null || { printf 'foreign/unrecognized\n'; return; }
+    managed_bbr_script_signature "$PERSIST_SCRIPT" || { printf 'foreign/unrecognized\n'; return; }
     version=$(awk -F'"' '$1=="SCRIPT_VERSION=" {print $2; exit}' "$PERSIST_SCRIPT" 2>/dev/null)
     [[ -x "$PERSIST_SCRIPT" ]] || { printf 'v%s / not executable\n' "${version:-unknown}"; return; }
     current=$(current_script_path 2>/dev/null || true)
@@ -549,7 +1016,12 @@ persistence_script_state() {
 verify_persistence_artifacts() {
     local rc=0 version current
     [[ -f "$CONFIG_FILE" ]] || { log ERR "运行配置缺失: $CONFIG_FILE"; rc=1; }
+    if (( ${MULTI_NIC_ENABLED:-0} == 1 )); then nic_policy_set_validate || rc=1; fi
     verify_sysctl_profile_file || rc=1
+    if [[ "$LEGACY_SYSCTL_FILE" != "$SYSCTL_FILE" && ( -e "$LEGACY_SYSCTL_FILE" || -L "$LEGACY_SYSCTL_FILE" ) ]]; then
+        log ERR "检测到旧版 sysctl 仍会与当前配置同时加载: $LEGACY_SYSCTL_FILE"
+        rc=1
+    fi
     [[ -f "$SERVICE_FILE" ]] || { log ERR "systemd unit 缺失: $SERVICE_FILE"; rc=1; }
     if [[ -f "$SERVICE_FILE" ]] && ! grep -Fqx "ExecStart=${PERSIST_SCRIPT} apply" "$SERVICE_FILE"; then
         log ERR "systemd unit 的 ExecStart 与受管脚本路径不一致"
@@ -558,7 +1030,7 @@ verify_persistence_artifacts() {
     if [[ ! -x "$PERSIST_SCRIPT" ]]; then
         log ERR "持久化脚本缺失或不可执行: $PERSIST_SCRIPT"
         rc=1
-    elif ! grep -Fq 'SCRIPT_NAME="bbrv3-lite"' "$PERSIST_SCRIPT"; then
+    elif ! managed_bbr_script_signature "$PERSIST_SCRIPT"; then
         log ERR "持久化脚本不属于本项目: $PERSIST_SCRIPT"
         rc=1
     else
@@ -580,9 +1052,17 @@ verify_persistence_artifacts() {
 
 show_status() {
     local iface="" cc available profile_state service_state service_active shaping=off config_state baseline_state buffer_state="unavailable" script_state
-    local hardware_state="unavailable" queue_state="unavailable" backlog_state="unavailable" scaling_state="unavailable"
+    local hardware_state="unavailable" queue_state="unavailable" backlog_state="unavailable" scaling_state="unavailable" path_state="none"
+    local nic_policy_state=single status_rc=0
     load_config || return 1
-    iface=$(detect_interface "$TC_INTERFACE" 2>/dev/null || true)
+    if (( MULTI_NIC_ENABLED == 1 )); then
+        nic_policy_state=valid
+        if ! nic_global_model_verify; then nic_policy_state=invalid; status_rc=1; fi
+        iface="${NIC_MODEL_INTERFACE:-}"
+        [[ "$iface" != auto ]] || iface=""
+    else
+        iface=$(detect_interface "$TC_INTERFACE" 2>/dev/null || true)
+    fi
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
     available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)
     profile_state=$([[ -f "$SYSCTL_FILE" ]] && echo installed || echo absent)
@@ -600,6 +1080,7 @@ show_status() {
         scaling_state=$(hardware_scaling_note)
     fi
     script_state=$(persistence_script_state)
+    path_state=$(latest_path_brief 2>/dev/null || printf 'none\n')
     printf '%-20s %s\n' "Version" "v${SCRIPT_VERSION}"
     printf '%-20s %s\n' "Kernel" "$(uname -r)"
     printf '%-20s %s\n' "Congestion control" "$cc (available: $available)"
@@ -618,6 +1099,12 @@ show_status() {
     printf '%-20s %s\n' "Persistence script" "$script_state"
     printf '%-20s %s\n' "Config" "$config_state ($CONFIG_FILE)"
     printf '%-20s %s\n' "Baseline" "$baseline_state"
+    printf '%-20s %s\n' "Latest path" "$path_state"
+    if (( MULTI_NIC_ENABLED == 1 )); then
+        printf '%-20s %s\n' "NIC policy mode" "multi / $nic_policy_state / $(nic_policy_interface_list 2>/dev/null | grep -c . || true) managed"
+        nic_inventory || status_rc=1
+        return "$status_rc"
+    fi
     if [[ -n "$iface" ]]; then
         if managed_htb "$iface"; then shaping="$(managed_rate_mbit "$iface") Mbit"; fi
         printf '%-20s %s\n' "Interface" "$iface"
@@ -643,6 +1130,20 @@ bbr_generation_status() {
 verify_system_state() {
     local rc=0 iface
     load_config || return 1
+    if (( MULTI_NIC_ENABLED == 1 )); then
+        nic_global_model_verify || rc=1
+        verify_sysctl_profile_runtime || rc=1
+        verify_persistence_artifacts || rc=1
+        systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未启用"; rc=1; }
+        systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未运行"; rc=1; }
+        nic_verify_runtime_policies || rc=1
+        if (( rc == 0 )); then log OK "全部网卡运行时与持久化状态一致"; else die "多网卡验证发现不一致"; fi
+        return "$rc"
+    fi
+    if (( TC_ENABLED == 1 )) && [[ "$TC_INTERFACE" == auto ]]; then
+        die "旧版 auto 整形配置未固化实际网卡；持久化应用已暂停，请重新调优或显式指定接口"
+        return 1
+    fi
     iface=$(detect_interface "$TC_INTERFACE") || return 1
     verify_sysctl_profile_runtime || rc=1
     verify_persistence_artifacts || rc=1

@@ -9,6 +9,11 @@ MEASURE_RX_START=0
 MEASURE_RESULT_FILE=""
 MEASURE_RUN_DIR=""
 MEASURE_IDLE_RTT_MS="na"
+MEASURE_PEER_HOST=""
+MEASURE_PEER_ADDRESS=""
+MEASURE_PEER_SOURCE=""
+MEASURE_PEER_FAMILY=""
+MEASURE_PEER_IFACE=""
 IPERF_DATA_RC=65
 IPERF_CONTAMINATED_RC=66
 IPERF_UNSTABLE_RC=67
@@ -58,10 +63,6 @@ public_peer_ports() {
         fi
     done
     (( found > 0 ))
-}
-
-public_peer_port() {
-    public_peer_ports "$1" 1
 }
 
 auto_pick_peer() {
@@ -130,11 +131,29 @@ auto_pick_peer() {
 interface_counter() { cat "/sys/class/net/$1/statistics/$2" 2>/dev/null || printf '0\n'; }
 
 measure_set_latency_baseline() {
-    local peer="$1" value=""
+    local peer="$1" path_samples="${2:-${BBRV3_PATH_SAMPLES:-7}}" path_pmtu="${3:-${BBRV3_PATH_PMTU:-1}}"
+    local value="" target family="auto" guarded=0
+    target="$peer"
     MEASURE_IDLE_RTT_MS="na"
     [[ "$(uname -s 2>/dev/null || true)" == Linux ]] || return 0
     command_exists ping || return 0
-    value=$(median_ping_ms "$peer" 2>/dev/null || true)
+    if [[ -n "$MEASURE_PEER_ADDRESS" && ( "$peer" == "$MEASURE_PEER_HOST" || "$peer" == "$MEASURE_PEER_ADDRESS" ) ]]; then
+        target="$MEASURE_PEER_ADDRESS"
+        family="$MEASURE_PEER_FAMILY"
+        measure_peer_route_guard || return 1
+        guarded=1
+    elif [[ "$peer" == *:* ]]; then
+        family=6
+    elif [[ "$peer" =~ ^[0-9]+([.][0-9]+){3}$ ]]; then
+        family=4
+    fi
+    if (( guarded )); then
+        path_profile_capture "$path_samples" "$path_pmtu" || return 1
+        value="$PATH_RTT_MEDIAN_MS"
+    else
+        value=$(median_ping_ms "$target" "$family" 2>/dev/null || true)
+    fi
+    (( guarded == 0 )) || measure_peer_route_guard || return 1
     if is_decimal "$value"; then
         MEASURE_IDLE_RTT_MS="$value"
         log INFO "空闲 RTT 基线: ${value} ms"
@@ -144,27 +163,43 @@ measure_set_latency_baseline() {
 }
 
 measure_begin() {
-    local iface="$1"
-    MEASURE_IFACE="$iface"
-    MEASURE_SNAPSHOT=$(mktemp) || return 1
-    action_qdisc_snapshot "$iface" "$MEASURE_SNAPSHOT" || {
-        rm -f -- "$MEASURE_SNAPSHOT"
-        MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+    local iface="$1" snapshot
+    [[ -z "$MEASURE_SNAPSHOT" ]] || {
+        die "已有未恢复的测量 qdisc 快照: $MEASURE_SNAPSHOT"
         return 1
     }
+    snapshot=$(mktemp) || return 1
+    action_qdisc_snapshot "$iface" "$snapshot" || {
+        rm -f -- "$snapshot"
+        return 1
+    }
+    MEASURE_IFACE="$iface"
+    MEASURE_SNAPSHOT="$snapshot"
     MEASURE_TX_START=$(interface_counter "$iface" tx_bytes)
     MEASURE_RX_START=$(interface_counter "$iface" rx_bytes)
     trap 'measure_abort 130' INT TERM HUP
 }
 
 measure_restore() {
-    local rc=0
-    if [[ -n "$MEASURE_IFACE" && -n "$MEASURE_SNAPSHOT" && -f "$MEASURE_SNAPSHOT" ]]; then
-        restore_action_qdisc "$MEASURE_IFACE" "$MEASURE_SNAPSHOT" || rc=$?
-        rm -f -- "$MEASURE_SNAPSHOT"
+    local rc=0 iface="$MEASURE_IFACE" snapshot="$MEASURE_SNAPSHOT"
+    if [[ -z "$iface" && -z "$snapshot" ]]; then
+        trap - INT TERM HUP
+        measure_clear_peer_lock
+        return 0
     fi
+    if [[ -z "$iface" || -z "$snapshot" || ! -f "$snapshot" ]]; then
+        log ERR "测量 qdisc 回滚状态不完整；保留现场以便人工恢复（iface=${iface:-missing}, snapshot=${snapshot:-missing}）"
+        return 1
+    fi
+    restore_action_qdisc "$iface" "$snapshot" || rc=$?
+    if (( rc != 0 )); then
+        log ERR "测量 qdisc 回滚失败；快照保留在 $snapshot，退出清理将再次尝试"
+        return "$rc"
+    fi
+    rm -f -- "$snapshot"
     trap - INT TERM HUP
     MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+    measure_clear_peer_lock
     return "$rc"
 }
 
@@ -187,6 +222,220 @@ traffic_report() {
 validate_peer() {
     [[ "$1" != -* && "$1" =~ ^[a-zA-Z0-9._:-]{1,253}$ ]] || { die "非法 peer: $1"; return 1; }
     is_uint "$2" && (( $2 >= 1 && $2 <= 65535 )) || { die "非法端口: $2"; return 1; }
+}
+
+measure_clear_peer_lock() {
+    MEASURE_PEER_HOST=""
+    MEASURE_PEER_ADDRESS=""
+    MEASURE_PEER_SOURCE=""
+    MEASURE_PEER_FAMILY=""
+    MEASURE_PEER_IFACE=""
+    path_state_reset
+}
+
+measure_route_output_sources() {
+    awk '{for (i=1; i<NF; i++) if ($i=="src") print $(i+1)}' | awk '!seen[$0]++'
+}
+
+measure_source_address_is_valid() {
+    local family="$1" source="$2" octet
+    local -a octets=()
+    [[ -n "$source" && "$source" != -* && "$source" != *[[:space:]]* ]] || return 1
+    case "$family" in
+        4)
+            [[ "$source" =~ ^[0-9]+([.][0-9]+){3}$ ]] || return 1
+            IFS=. read -r -a octets <<< "$source"
+            ((${#octets[@]} == 4)) || return 1
+            for octet in "${octets[@]}"; do
+                [[ "$octet" =~ ^[0-9]{1,3}$ ]] && (( 10#$octet <= 255 )) || return 1
+            done
+            [[ "$source" != 0.0.0.0 ]]
+            ;;
+        6)
+            [[ "$source" == *:* && "$source" =~ ^[0-9A-Fa-f:.]+$ && "$source" != :: ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+measure_unique_route_iface() {
+    local output="$1" context="$2" iface count
+    if route_output_has_unresolved_nhid "$output"; then
+        die "$context 包含未解析的 nexthop object (nhid)；测速路径不再唯一"
+        return 1
+    fi
+    if route_output_has_multipath "$output"; then
+        die "$context 包含 ECMP/nexthop；测速路径不再唯一"
+        return 1
+    fi
+    count=$(route_output_interfaces <<< "$output" | awk 'END {print NR+0}')
+    if ! is_uint "${count:-}" || (( count != 1 )); then
+        die "$context 无法确定唯一出口网卡"
+        return 1
+    fi
+    iface=$(route_output_interfaces <<< "$output" | head -n1)
+    validate_interface_name "$iface" || { die "$context 返回非法出口网卡: $iface"; return 1; }
+    printf '%s\n' "$iface"
+}
+
+# Revalidate one already-resolved literal through the platform's strict
+# route-get/fibmatch gate, then prove that binding the selected source address
+# does not select another policy-routing path.
+measure_capture_route_state() {
+    local family="$1" address="$2" expected_iface="$3" expected_source="${4:-}"
+    local records record_count record_family record_address record_iface output iface sources source source_count
+    local bound_output bound_iface bound_fibmatch bound_fib_iface
+    records=$(target_route_records "$address") || return 1
+    record_count=$(awk 'NF {count++} END {print count+0}' <<< "$records")
+    if ! is_uint "${record_count:-}" || (( record_count != 1 )); then
+        die "测速地址 $address 的严格路由核验没有返回唯一记录"
+        return 1
+    fi
+    IFS=$'\t' read -r record_family record_address record_iface <<< "$records"
+    [[ "$record_family" == "$family" && "$record_address" == "$address" && "$record_iface" == "$expected_iface" ]] || {
+        die "测速地址 $address 的冻结路由与预期不一致（IPv${record_family:-?}/${record_iface:-?}，预期 IPv${family}/$expected_iface）"
+        return 1
+    }
+
+    if ! output=$(ip "-$family" route get "$address" 2>/dev/null) || [[ -z "$output" ]]; then
+        die "测速地址 $address 无法取得 route-get 来源地址"
+        return 1
+    fi
+    iface=$(measure_unique_route_iface "$output" "测速地址 $address 的 route-get") || return 1
+    [[ "$iface" == "$expected_iface" ]] || {
+        die "测速地址 $address 的出口已从 $expected_iface 漂移到 $iface"
+        return 1
+    }
+    sources=$(measure_route_output_sources <<< "$output")
+    source_count=$(awk 'NF {count++} END {print count+0}' <<< "$sources")
+    if ! is_uint "${source_count:-}" || (( source_count != 1 )); then
+        die "测速地址 $address 的 route-get 无法确定唯一来源地址"
+        return 1
+    fi
+    source=$(head -n1 <<< "$sources")
+    measure_source_address_is_valid "$family" "$source" || {
+        die "测速地址 $address 返回非法 IPv${family} 来源地址: $source"
+        return 1
+    }
+    if [[ -n "$expected_source" && "$source" != "$expected_source" ]]; then
+        die "测速地址 $address 的来源地址已从 $expected_source 漂移到 $source"
+        return 1
+    fi
+
+    if ! bound_output=$(ip "-$family" route get "$address" from "$source" 2>/dev/null) || [[ -z "$bound_output" ]]; then
+        die "测速地址 $address 无法用冻结来源地址 $source 完成 route-get"
+        return 1
+    fi
+    bound_iface=$(measure_unique_route_iface "$bound_output" "测速地址 $address 的来源绑定 route-get") || return 1
+    [[ "$bound_iface" == "$expected_iface" ]] || {
+        die "绑定来源地址 $source 后，测速出口从 $expected_iface 变为 $bound_iface"
+        return 1
+    }
+    if ! bound_fibmatch=$(ip "-$family" route get fibmatch "$address" from "$source" 2>/dev/null) || [[ -z "$bound_fibmatch" ]]; then
+        die "无法用 fibmatch 核验测速地址 $address 的来源绑定路径"
+        return 1
+    fi
+    bound_fib_iface=$(measure_unique_route_iface "$bound_fibmatch" "测速地址 $address 的来源绑定 fibmatch") || return 1
+    [[ "$bound_fib_iface" == "$expected_iface" ]] || {
+        die "绑定来源地址 $source 后，测速 fibmatch 出口从 $expected_iface 变为 $bound_fib_iface"
+        return 1
+    }
+    printf '%s\t%s\n' "$iface" "$source"
+}
+
+# Resolve exactly once, validate every candidate through the strict platform
+# API, and freeze one literal address for the complete formal operation.
+measure_lock_peer() {
+    local peer="$1" expected_iface="$2" addresses family address state iface source
+    local first_family="" first_address="" first_source="" resolved_count=0
+    validate_interface_name "$expected_iface" || { die "非法测速出口网卡: $expected_iface"; return 1; }
+    measure_clear_peer_lock
+    addresses=$(resolve_route_target_addresses "$peer") || return 1
+    if [[ -z "$addresses" ]]; then
+        die "无法解析测速对端 $peer"
+        return "$IPERF_UNAVAILABLE_RC"
+    fi
+    while IFS=$'\t' read -r family address; do
+        [[ "$family" == 4 || "$family" == 6 ]] || { die "测速对端 $peer 返回非法地址族"; return 1; }
+        [[ -n "$address" ]] || { die "测速对端 $peer 返回空地址"; return 1; }
+        ((resolved_count+=1))
+        state=$(measure_capture_route_state "$family" "$address" "$expected_iface") || return 1
+        IFS=$'\t' read -r iface source <<< "$state"
+        if [[ -z "$first_address" ]]; then
+            first_family="$family"
+            first_address="$address"
+            first_source="$source"
+        fi
+    done <<< "$addresses"
+    (( resolved_count > 0 )) || { die "无法冻结测速对端 $peer 的地址"; return "$IPERF_UNAVAILABLE_RC"; }
+    MEASURE_PEER_HOST="$peer"
+    MEASURE_PEER_ADDRESS="$first_address"
+    MEASURE_PEER_SOURCE="$first_source"
+    MEASURE_PEER_FAMILY="$first_family"
+    MEASURE_PEER_IFACE="$expected_iface"
+    if ! path_lock_route_identity; then
+        measure_clear_peer_lock
+        return 1
+    fi
+    log INFO "已冻结测速路径: $peer -> $MEASURE_PEER_ADDRESS（IPv${MEASURE_PEER_FAMILY}, src $MEASURE_PEER_SOURCE, dev $MEASURE_PEER_IFACE, path ${PATH_ROUTE_FINGERPRINT:0:12}）"
+}
+
+measure_peer_route_guard() {
+    local state iface source
+    [[ -n "$MEASURE_PEER_ADDRESS" && -n "$MEASURE_PEER_SOURCE" &&
+       ( "$MEASURE_PEER_FAMILY" == 4 || "$MEASURE_PEER_FAMILY" == 6 ) && -n "$MEASURE_PEER_IFACE" ]] || {
+        die "正式测速尚未冻结对端地址、来源地址和出口网卡"
+        return 1
+    }
+    if [[ -n "$MEASURE_IFACE" && "$MEASURE_IFACE" != "$MEASURE_PEER_IFACE" ]]; then
+        die "测量网卡 $MEASURE_IFACE 与冻结出口 $MEASURE_PEER_IFACE 不一致"
+        return 1
+    fi
+    state=$(measure_capture_route_state "$MEASURE_PEER_FAMILY" "$MEASURE_PEER_ADDRESS" "$MEASURE_PEER_IFACE" "$MEASURE_PEER_SOURCE") || {
+        die "测速路径已漂移；拒绝继续并恢复操作前 qdisc"
+        return 1
+    }
+    IFS=$'\t' read -r iface source <<< "$state"
+    [[ "$iface" == "$MEASURE_PEER_IFACE" && "$source" == "$MEASURE_PEER_SOURCE" ]] || {
+        die "测速路径已漂移；拒绝使用本次样本"
+        return 1
+    }
+    path_verify_route_identity || {
+        die "测速路由、网关、路由表、MTU 或 FIB 指纹已经漂移"
+        return 1
+    }
+}
+
+measure_require_sample_lock() {
+    local peer="$1" iface
+    if [[ -z "$MEASURE_PEER_ADDRESS" ]]; then
+        iface="${MEASURE_IFACE:-}"
+        [[ -n "$iface" ]] || iface=$(detect_interface auto) || return 1
+        measure_lock_peer "$peer" "$iface" || return $?
+    elif [[ "$peer" != "$MEASURE_PEER_HOST" && "$peer" != "$MEASURE_PEER_ADDRESS" ]]; then
+        die "样本对端 $peer 与冻结对端 $MEASURE_PEER_HOST/$MEASURE_PEER_ADDRESS 不一致"
+        return 1
+    fi
+    measure_peer_route_guard
+}
+
+measure_require_locked_port() {
+    local peer="$1" port="$2"
+    measure_peer_route_guard || return 1
+    if ! peer_port_open "$MEASURE_PEER_ADDRESS" "$port"; then
+        die "无法连接 $peer:$port（冻结地址 $MEASURE_PEER_ADDRESS）"
+        measure_clear_peer_lock
+        return "$IPERF_UNAVAILABLE_RC"
+    fi
+    measure_peer_route_guard
+}
+
+measure_append_locked_peer_summary() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    printf 'LOCKED_ADDRESS\t%s\nLOCKED_SOURCE\t%s\nLOCKED_INTERFACE\t%s\nLOCKED_FAMILY\t%s\n' \
+        "$MEASURE_PEER_ADDRESS" "$MEASURE_PEER_SOURCE" "$MEASURE_PEER_IFACE" "$MEASURE_PEER_FAMILY" >> "$file"
+    path_profile_append_summary "$file"
 }
 
 peer_port_open() {
@@ -332,17 +581,24 @@ iperf_sample() {
     local rc=0 reason="" bps bytes retrans goodput ratio retrans_per_gib loaded_median="na" loaded_p95="na"
     local tx_before=0 tx_after=0 background="na" cpu_before cpu_after cpu_busy="na" cpu_steal="na" contaminated=0
     local core_before core_after core_busy="na" core_steal="na" reason_parse_rc=0 cpu_metrics core_metrics latency_metrics
+    local route_guard_rc=0
+    local -a family_arg=()
+    validate_peer "$peer" "$port" || return 1
+    measure_require_sample_lock "$peer" || return $?
+    family_arg=("-$MEASURE_PEER_FAMILY")
     json=$(mktemp) || return 1
     error_file=$(mktemp) || { rm -f -- "$json"; return 1; }
     latency_file=$(mktemp) || { rm -f -- "$json" "$error_file"; return 1; }
     if [[ "$(uname -s 2>/dev/null || true)" == Linux ]] && command_exists ping; then
-        ping -n -i 0.2 -W 1 -c "$((duration * 5))" -- "$peer" > "$latency_file" 2>/dev/null &
+        ping "${family_arg[@]}" -I "$MEASURE_PEER_IFACE" -I "$MEASURE_PEER_SOURCE" \
+            -n -i 0.2 -W 1 -c "$((duration * 5))" -- "$MEASURE_PEER_ADDRESS" > "$latency_file" 2>/dev/null &
         latency_pid=$!
     fi
     if [[ -n "$MEASURE_IFACE" ]]; then tx_before=$(interface_counter "$MEASURE_IFACE" tx_bytes); fi
     cpu_before=$(cpu_snapshot)
     core_before=$(cpu_core_snapshot)
-    if timeout "$((duration + 20))" iperf3 -c "$peer" -p "$port" -t "$duration" -P "$parallel" -J > "$json" 2> "$error_file"; then
+    if timeout "$((duration + 20))" iperf3 "${family_arg[@]}" -c "$MEASURE_PEER_ADDRESS" -B "$MEASURE_PEER_SOURCE" \
+        -p "$port" -t "$duration" -P "$parallel" -J > "$json" 2> "$error_file"; then
         if [[ -s "$json" ]]; then reason=$(jq -r '.error // empty' "$json" 2>/dev/null) || reason_parse_rc=$?; fi
         [[ -z "$reason" ]] || rc=1
     else
@@ -358,12 +614,18 @@ iperf_sample() {
         if (( rc != 0 )); then kill "$latency_pid" 2>/dev/null || true; fi
         wait "$latency_pid" 2>/dev/null || true
     fi
+    measure_peer_route_guard || route_guard_rc=$?
+    if (( route_guard_rc != 0 )); then
+        rm -f -- "$json" "$error_file" "$latency_file"
+        log ERR "iperf3 $peer:$port 完成后检测到路径漂移；本样本无效"
+        return 1
+    fi
     rm -f -- "$error_file"
     if (( rc != 0 )); then
         reason=${reason//$'\n'/ }
         reason=${reason//$'\r'/}
         reason=${reason:0:240}
-        log WARN "iperf3 $peer:$port 测试失败: $reason"
+        log WARN "iperf3 $peer:$port（$MEASURE_PEER_ADDRESS）测试失败: $reason"
         rm -f -- "$json" "$latency_file"
         if (( rc == 124 )) || iperf_failure_is_unavailable "$reason"; then return "$IPERF_UNAVAILABLE_RC"; fi
         return 1
@@ -432,8 +694,8 @@ bufferbloat_delta_ms() {
 }
 
 measurement_confidence() {
-    local sample_count="$1" spread="$2" loaded_p95="$3" contaminated="$4" failovers="${5:-0}"
-    local score=100 grade reason
+    local sample_count="$1" spread="$2" loaded_p95="$3" contaminated="$4" failovers="${5:-0}" path_score="${6:-na}"
+    local score=100 grade reason path_penalty=0
     local -a reasons=()
     is_uint "$sample_count" || sample_count=0
     if ! is_uint "$contaminated"; then
@@ -451,6 +713,13 @@ measurement_confidence() {
     if ! is_decimal "$loaded_p95"; then score=$((score - 15)); reasons+=(loaded-rtt-unavailable); fi
     if (( contaminated )); then score=$((score - 50)); reasons+=(contaminated); fi
     if (( failovers > 0 )); then score=$((score - 10)); reasons+=(peer-failover); fi
+    if is_uint "$path_score" && (( path_score <= 100 )); then
+        if (( path_score < 40 )); then path_penalty=35; reasons+=(path-unsafe)
+        elif (( path_score < 65 )); then path_penalty=20; reasons+=(path-low-confidence)
+        elif (( path_score < 90 )); then path_penalty=10; reasons+=(path-variable)
+        fi
+        score=$((score - path_penalty))
+    fi
     (( score < 0 )) && score=0
     if (( score >= 90 )); then grade=high; elif (( score >= 65 )); then grade=medium; else grade=low; fi
     if ((${#reasons[@]})); then
@@ -622,6 +891,33 @@ new_measure_run() {
     printf 'TIME\tLABEL\tGOODPUT_MBIT\tRETRANSMITS\tBYTES\tRETRANS_RATIO_EST_PERCENT\tRETRANS_PER_GIB\tIDLE_RTT_MS\tLOADED_RTT_MEDIAN_MS\tLOADED_RTT_P95_MS\tBUFFERBLOAT_P95_MS\tBACKGROUND_TX_PERCENT\tCPU_BUSY_PERCENT\tCPU_STEAL_PERCENT\tCONTAMINATED\n' > "$MEASURE_RESULT_FILE"
 }
 
+measure_path_profile() {
+    require_root || return 1; acquire_lock || return 1
+    require_commands ip ping find sort awk || return 1
+    local peer="$1" requested="${2:-auto}" samples="${3:-7}" pmtu_enabled="${4:-1}"
+    local iface dir rc=0
+    validate_peer "$peer" 5201 || return 1
+    is_uint "$samples" && (( samples >= 3 && samples <= 20 )) || { die "路径画像样本数必须是 3–20"; return 1; }
+    [[ "$pmtu_enabled" == 0 || "$pmtu_enabled" == 1 ]] || { die "PMTU 开关只能是 0/1"; return 1; }
+    iface=$(detect_interface "$requested") || return 1
+    measure_lock_peer "$peer" "$iface" || return $?
+    new_measure_run path || { measure_clear_peer_lock; return 1; }
+    dir="$MEASURE_RUN_DIR"
+    rm -f -- "$MEASURE_RESULT_FILE"; MEASURE_RESULT_FILE=""
+    if measure_set_latency_baseline "$peer" "$samples" "$pmtu_enabled"; then
+        printf 'TYPE\tpath\nPEER\t%s\nINTERFACE\t%s\n' "$peer" "$iface" > "$dir/summary.tsv"
+        measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
+        if (( rc == 0 )); then
+            path_profile_report
+            log INFO "路径画像: $dir"
+        fi
+    else
+        rc=$?
+    fi
+    measure_clear_peer_lock
+    return "$rc"
+}
+
 measure_probe() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
@@ -629,8 +925,9 @@ measure_probe() {
     local confidence confidence_score confidence_grade confidence_reasons
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && is_uint "$parallel" && ((duration>=3 && duration<=120 && parallel>=1 && parallel<=32)) || { die "duration/parallel 超出安全范围"; return 1; }
-    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return "$IPERF_UNAVAILABLE_RC"; }
     iface=$(detect_interface "$requested") || return 1
+    measure_lock_peer "$peer" "$iface" || return $?
+    measure_require_locked_port "$peer" "$port" || return $?
     qdisc_guard "$iface" || return 1
     speed=$(detect_link_speed "$iface")
     if is_uint "$speed"; then
@@ -639,16 +936,17 @@ measure_probe() {
     fi
     new_measure_run probe || return 1
     dir="$MEASURE_RUN_DIR"
-    measure_set_latency_baseline "$peer"
+    measure_set_latency_baseline "$peer" || return 1
     measure_begin "$iface" || return 1
     if apply_fq "$iface" && row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 unshaped 3 6); then
-        confidence=$(measurement_confidence "$(cut -f13 <<< "$row")" "$(cut -f12 <<< "$row")" "$(cut -f7 <<< "$row")" "$(cut -f11 <<< "$row")" 0)
+        confidence=$(measurement_confidence "$(cut -f13 <<< "$row")" "$(cut -f12 <<< "$row")" "$(cut -f7 <<< "$row")" "$(cut -f11 <<< "$row")" 0 "$PATH_PROFILE_SCORE")
         IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
         printf 'TYPE\tprobe\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nGOODPUT_MBIT\t%s\nRETRANS_RATIO_EST_PERCENT\t%s\nRETRANS_PER_GIB\t%s\nIDLE_RTT_MS\t%s\nLOADED_RTT_P95_MS\t%s\nBUFFERBLOAT_P95_MS\t%s\nGOODPUT_SPREAD_PERCENT\t%s\nSAMPLE_COUNT\t%s\nBACKGROUND_TX_PERCENT_MAX\t%s\nCPU_BUSY_PERCENT_MAX\t%s\nCPU_STEAL_PERCENT_MAX\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
             "$peer" "$port" "$iface" "$(cut -f1 <<< "$row")" "$(cut -f4 <<< "$row")" "$(cut -f5 <<< "$row")" \
             "$MEASURE_IDLE_RTT_MS" "$(cut -f7 <<< "$row")" "$(cut -f14 <<< "$row")" "$(cut -f12 <<< "$row")" "$(cut -f13 <<< "$row")" \
             "$(cut -f8 <<< "$row")" "$(cut -f9 <<< "$row")" "$(cut -f10 <<< "$row")" \
             "$confidence_score" "$confidence_grade" "$confidence_reasons" > "$dir/summary.tsv"
+        measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         log OK "可用带宽中位数: $(cut -f1 <<< "$row") Mbit/s，重传 $(cut -f5 <<< "$row") 次/GiB，负载 RTT p95 $(cut -f7 <<< "$row") ms"
         log INFO "测量置信度: ${confidence_grade} (${confidence_score}/100, ${confidence_reasons})"
         log INFO "结果: $dir"
@@ -673,17 +971,24 @@ measure_sweep() {
     [[ "$result_mode" == manual || "$result_mode" == auto ]] || { die "扫描结果模式只支持 manual/auto"; return 1; }
     for value in "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$force_scan" "$cap"; do is_uint "$value" || { die "扫描参数必须为非负整数"; return 1; }; done
     is_decimal "$threshold" || { die "loss threshold 必须是数字"; return 1; }
+    (( duration >= 3 && duration <= 120 && parallel >= 1 && parallel <= 32 && margin <= 25 && force_scan <= 1 &&
+       (cap == 0 || (cap >= 100 && cap <= 1000000)) )) || { die "扫描参数超出安全范围"; return 1; }
     (( nominal == 0 )) && nominal_was_auto=1
     if (( cap == 0 )) || [[ "$result_mode" == auto ]]; then auto_cap=1; fi
-    if (( cap == 0 )); then cap=$(recommended_scan_cap "$requested" "$nominal") || return 1; fi
-    (( duration >= 3 && duration <= 120 && parallel >= 1 && parallel <= 32 && margin <= 25 && force_scan <= 1 && cap >= 100 && cap <= 1000000 )) || { die "扫描参数超出安全范围"; return 1; }
-    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return "$IPERF_UNAVAILABLE_RC"; }
     iface=$(detect_interface "$requested") || return 1
+    measure_lock_peer "$peer" "$iface" || return $?
+    measure_require_locked_port "$peer" "$port" || return $?
+    if (( cap == 0 )); then cap=$(recommended_scan_cap "$iface" "$nominal") || return 1; fi
     qdisc_guard "$iface" || return 1
     hardware_profile_values "$iface" "$nominal" || return 1
     new_measure_run sweep || return 1
     dir="$MEASURE_RUN_DIR"
-    measure_set_latency_baseline "$peer"
+    measure_set_latency_baseline "$peer" || return 1
+    path_profile_tuning_gate "$force_scan" || {
+        rc=$?
+        measure_clear_peer_lock
+        return "$rc"
+    }
     measure_begin "$iface" || return 1
 
     baseline_duration="$duration"; ((baseline_duration>5)) && baseline_duration=5
@@ -824,7 +1129,7 @@ measure_sweep() {
             "${baseline_gp:-}" "${baseline_loss:-}" "${base_loss:-0}" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$above_cap" > "$dir/summary.tsv"
         confidence_row="${confirm_row:-${baseline_row:-}}"
         if [[ -n "$confidence_row" ]]; then
-            confidence=$(measurement_confidence "$(cut -f13 <<< "$confidence_row")" "$(cut -f12 <<< "$confidence_row")" "$(cut -f7 <<< "$confidence_row")" "$(cut -f11 <<< "$confidence_row")" 0)
+            confidence=$(measurement_confidence "$(cut -f13 <<< "$confidence_row")" "$(cut -f12 <<< "$confidence_row")" "$(cut -f7 <<< "$confidence_row")" "$(cut -f11 <<< "$confidence_row")" 0 "$PATH_PROFILE_SCORE")
             IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
         else
             confidence_score=0; confidence_grade=low; confidence_reasons=no-usable-sample
@@ -836,6 +1141,7 @@ measure_sweep() {
             "$(cut -f8 <<< "${confirm_row:-}")" "$(cut -f9 <<< "${confirm_row:-}")" "$(cut -f10 <<< "${confirm_row:-}")" \
             "$(cut -f12 <<< "${confirm_row:-}")" "$(cut -f13 <<< "${confirm_row:-}")" \
             "$confidence_score" "$confidence_grade" "$confidence_reasons" >> "$dir/summary.tsv"
+        measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         if [[ -n "${recommend:-}" ]]; then
             log OK "扫描完成: last clean=${last_ok} Mbit, break=${broke_at:-above-range} Mbit, 推荐=${recommend} Mbit"
             if [[ "$result_mode" == auto ]]; then
@@ -860,12 +1166,20 @@ summary_value() {
 measure_path_check() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
-    local peer="$1" port="$2" requested="$3" rate="$4" iface row gp loss rc=0
+    local peer="$1" port="$2" requested="$3" rate="$4" iface dir row="" gp="" loss="" rc=0 accepted=0
     validate_peer "$peer" "$port" || return 1
     is_uint "$rate" && (( rate > 0 )) || { die "路径检查速率无效"; return 1; }
     iface=$(detect_interface "$requested") || return 1
+    measure_lock_peer "$peer" "$iface" || return $?
+    measure_require_locked_port "$peer" "$port" || return $?
     qdisc_guard "$iface" || return 1
-    measure_set_latency_baseline "$peer"
+    new_measure_run path-check || return 1; dir="$MEASURE_RUN_DIR"
+    measure_set_latency_baseline "$peer" || return 1
+    path_profile_tuning_gate 0 || {
+        rc=$?
+        measure_clear_peer_lock
+        return "$rc"
+    }
     measure_begin "$iface" || return 1
     log INFO "路径预检: 临时整形 ${rate} Mbit/s，检查对端是否足以承载测量"
     if ! apply_shaping "$iface" "$rate"; then
@@ -879,10 +1193,17 @@ measure_path_check() {
             log ERR "路径预检重传比例过高 (${loss}%)；本次对端不适合寻找 policer 拐点"
             rc=2
         else
+            accepted=1
             log OK "路径预检通过: ${gp} Mbit/s，重传估算 ${loss}%"
         fi
     else
         rc=$?
+    fi
+    if [[ -n "$row" ]]; then
+        printf 'TYPE\tpath-check\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nRATE_MBIT\t%s\nGOODPUT_MBIT\t%s\nRETRANS_RATIO_EST_PERCENT\t%s\nACCEPTED\t%s\n' \
+            "$peer" "$port" "$iface" "$rate" "$gp" "$loss" "$accepted" > "$dir/summary.tsv"
+        measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
+        log INFO "路径预检结果: $dir"
     fi
     measure_restore || rc=$?
     return "$rc"
@@ -904,12 +1225,18 @@ measure_verify() {
         die "verify 验收参数超出安全范围"
         return 1
     }
-    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return "$IPERF_UNAVAILABLE_RC"; }
     iface=$(detect_interface "$requested") || return 1
+    measure_lock_peer "$peer" "$iface" || return $?
+    measure_require_locked_port "$peer" "$port" || return $?
     qdisc_guard "$iface" || return 1
     multi_parallel=$(recommended_verify_flows "$iface" "$expected_rate") || return 1
     new_measure_run verify || return 1; dir="$MEASURE_RUN_DIR"
-    measure_set_latency_baseline "$peer"
+    measure_set_latency_baseline "$peer" || return 1
+    path_profile_tuning_gate 0 || {
+        rc=$?
+        measure_clear_peer_lock
+        return "$rc"
+    }
     measure_begin "$iface" || return 1
     one=$(sample_repeated "$peer" "$port" "$duration" 1 2 verify-single 3 6) || rc=$?
     if (( rc == 0 )); then multi=$(sample_repeated "$peer" "$port" "$duration" "$multi_parallel" 2 "verify-multi-${multi_parallel}" 3 6) || rc=$?; fi
@@ -938,13 +1265,14 @@ measure_verify() {
             combined_loaded=na
         fi
         combined_contaminated=$(printf '%s\n%s\n' "$(cut -f11 <<< "$one")" "$(cut -f11 <<< "$multi")" | max_numbers)
-        confidence=$(measurement_confidence "$combined_count" "$combined_spread" "$combined_loaded" "$combined_contaminated" 0)
+        confidence=$(measurement_confidence "$combined_count" "$combined_spread" "$combined_loaded" "$combined_contaminated" 0 "$PATH_PROFILE_SCORE")
         IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
         printf 'TYPE\tverify\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nEXPECTED_RATE_MBIT\t%s\nMIN_EFFICIENCY_RATIO\t%s\nIDLE_RTT_MS\t%s\nSINGLE_MBIT\t%s\nSINGLE_RETRANS_EST_PERCENT\t%s\nSINGLE_RETRANS_PER_GIB\t%s\nSINGLE_LOADED_RTT_P95_MS\t%s\nSINGLE_BUFFERBLOAT_P95_MS\t%s\nSINGLE_GOODPUT_SPREAD_PERCENT\t%s\nSINGLE_SAMPLE_COUNT\t%s\nMULTI_FLOWS\t%s\nMULTI_MBIT\t%s\nMULTI_RETRANS_EST_PERCENT\t%s\nMULTI_RETRANS_PER_GIB\t%s\nMULTI_LOADED_RTT_P95_MS\t%s\nMULTI_BUFFERBLOAT_P95_MS\t%s\nMULTI_GOODPUT_SPREAD_PERCENT\t%s\nMULTI_SAMPLE_COUNT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\nACCEPTED\t%s\nREJECT_REASON\t%s\n' \
             "$peer" "$port" "$iface" "$expected_rate" "$min_efficiency" "$MEASURE_IDLE_RTT_MS" \
             "$one_gp" "$one_loss" "$(cut -f5 <<< "$one")" "$(cut -f7 <<< "$one")" "$(cut -f14 <<< "$one")" "$one_spread" "$one_count" \
             "$multi_parallel" "$multi_gp" "$multi_loss" "$(cut -f5 <<< "$multi")" "$(cut -f7 <<< "$multi")" "$(cut -f14 <<< "$multi")" "$multi_spread" "$multi_count" \
             "$confidence_score" "$confidence_grade" "$confidence_reasons" "$accepted" "$reject_reason" > "$dir/summary.tsv"
+        measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         if (( accepted )); then
             log OK "验证完成: 单流 ${one_gp} Mbit/s，多流(${multi_parallel}) ${multi_gp} Mbit/s"
             log INFO "负载 RTT p95: 单流 $(cut -f7 <<< "$one") ms，多流 $(cut -f7 <<< "$multi") ms；置信度 ${confidence_grade} (${confidence_score}/100)"
@@ -971,11 +1299,12 @@ measure_compare() {
     is_uint "$rate" && (( rate >= 1 && rate <= 1000000 )) || { die "compare rate 必须是 1–1000000 的整数"; return 1; }
     is_uint "$duration" && (( duration >= 3 && duration <= 30 )) || { die "compare duration 必须是 3–30 秒"; return 1; }
     is_uint "$rounds" && (( rounds >= 2 && rounds <= 5 )) || { die "compare rounds 必须是 2–5"; return 1; }
-    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return "$IPERF_UNAVAILABLE_RC"; }
     iface=$(detect_interface "$requested") || return 1
+    measure_lock_peer "$peer" "$iface" || return $?
+    measure_require_locked_port "$peer" "$port" || return $?
     qdisc_guard "$iface" || return 1
     new_measure_run compare || return 1; dir="$MEASURE_RUN_DIR"
-    measure_set_latency_baseline "$peer"
+    measure_set_latency_baseline "$peer" || return 1
     speed=$(detect_link_speed "$iface"); estimate_rate="$rate"
     if is_uint "$speed" && (( speed > estimate_rate )); then estimate_rate="$speed"; fi
     estimate=$(estimate_sweep_bytes "$estimate_rate" "$duration" "$((rounds * 2))")
@@ -1012,13 +1341,14 @@ measure_compare() {
             combined_loaded=na
         fi
         verdict=$(compare_verdict "$fq_gp" "$shaped_gp" "$fq_bloat" "$shaped_bloat" "$fq_rpg" "$shaped_rpg")
-        confidence=$(measurement_confidence "$rounds" "$combined_spread" "$combined_loaded" 0 0)
+        confidence=$(measurement_confidence "$rounds" "$combined_spread" "$combined_loaded" 0 0 "$PATH_PROFILE_SCORE")
         IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
         throughput_delta=$(awk -v f="$fq_gp" -v s="$shaped_gp" 'BEGIN {if(f<=0) print "na"; else printf "%.2f", (s-f)*100/f}')
         printf 'TYPE\tcompare\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nRATE_MBIT\t%s\nDURATION_SECONDS\t%s\nROUNDS\t%s\nORDER\tinterleaved\nIDLE_RTT_MS\t%s\nFQ_GOODPUT_MBIT\t%s\nFQ_RETRANS_PER_GIB\t%s\nFQ_BUFFERBLOAT_P95_MS\t%s\nFQ_GOODPUT_SPREAD_PERCENT\t%s\nSHAPED_GOODPUT_MBIT\t%s\nSHAPED_RETRANS_PER_GIB\t%s\nSHAPED_BUFFERBLOAT_P95_MS\t%s\nSHAPED_GOODPUT_SPREAD_PERCENT\t%s\nSHAPED_THROUGHPUT_DELTA_PERCENT\t%s\nVERDICT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\nPERSISTED\t0\n' \
             "$peer" "$port" "$iface" "$rate" "$duration" "$rounds" "$MEASURE_IDLE_RTT_MS" \
             "$fq_gp" "$fq_rpg" "$fq_bloat" "$fq_spread" "$shaped_gp" "$shaped_rpg" "$shaped_bloat" "$shaped_spread" \
             "$throughput_delta" "$verdict" "$confidence_score" "$confidence_grade" "$confidence_reasons" > "$dir/summary.tsv"
+        measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         log OK "A/B 完成: FQ ${fq_gp} Mbit/s / ${fq_bloat} ms，整形 ${shaped_gp} Mbit/s / ${shaped_bloat} ms，结论 ${verdict}"
         log INFO "对照置信度: ${confidence_grade} (${confidence_score}/100, ${confidence_reasons})；未写入配置或服务"
         log INFO "结果: $dir"

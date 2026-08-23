@@ -143,8 +143,14 @@ buffer_profile_values() {
     BUFFER_REASON="2xBDP with hardware floor, bounded by RAM/32 and platform cap"
 }
 
+sysctl_model_interface() {
+    if (( ${MULTI_NIC_ENABLED:-0} == 1 )); then printf '%s\n' "${NIC_MODEL_INTERFACE:-auto}"
+    else printf '%s\n' "${TC_INTERFACE:-auto}"
+    fi
+}
+
 render_sysctl_profile() {
-    buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "${TC_INTERFACE:-auto}" || return 1
+    buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "$(sysctl_model_interface)" || return 1
     cat <<EOF
 # Managed by ${SCRIPT_NAME} v${SCRIPT_VERSION}
 # profile=${SYSCTL_PROFILE} role=${ROLE} bandwidth=${BANDWIDTH_MBIT}Mbps tuning_rtt=${RTT_MS}ms
@@ -177,7 +183,7 @@ normalize_sysctl_words() { awk '{$1=$1; print}'; }
 
 verify_sysctl_profile_runtime() {
     local key expected actual rc=0
-    buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "${TC_INTERFACE:-auto}" || return 1
+    buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "$(sysctl_model_interface)" || return 1
     while IFS=$'\t' read -r key expected; do
         actual=$(sysctl -n "$key" 2>/dev/null | normalize_sysctl_words || true)
         expected=$(normalize_sysctl_words <<< "$expected")
@@ -263,4 +269,27 @@ apply_initial_windows() {
         if ip "$family" route change "${clean[@]}"; then ((changed+=1)); fi
     done
     (( changed > 0 )) || { die "没有可设置 initcwnd/initrwnd 的默认路由"; return 1; }
+}
+
+restore_default_route_windows_snapshot() {
+    local directory="$1" family file baseline current token i rc=0
+    local -a route=() clean=()
+    for family in -4 -6; do
+        file="$directory/default-route-v${family#-}.txt"
+        [[ -s "$file" ]] || continue
+        baseline=$(head -n1 "$file")
+        current=$(ip "$family" route show default 2>/dev/null | head -n1 || true)
+        [[ "$baseline$current" == *initcwnd* || "$baseline$current" == *initrwnd* ]] || continue
+        [[ -n "$current" ]] || { rc=1; continue; }
+        read -r -a route <<< "$current"; clean=()
+        for ((i=0; i<${#route[@]}; i++)); do
+            token="${route[$i]}"
+            if [[ "$token" == initcwnd || "$token" == initrwnd ]]; then ((i+=1)); continue; fi
+            clean+=("$token")
+        done
+        if [[ "$baseline" =~ (^|[[:space:]])initcwnd[[:space:]]+([0-9]+) ]]; then clean+=(initcwnd "${BASH_REMATCH[2]}"); fi
+        if [[ "$baseline" =~ (^|[[:space:]])initrwnd[[:space:]]+([0-9]+) ]]; then clean+=(initrwnd "${BASH_REMATCH[2]}"); fi
+        ip "$family" route replace "${clean[@]}" || rc=1
+    done
+    return "$rc"
 }
