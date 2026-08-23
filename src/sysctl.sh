@@ -255,7 +255,7 @@ apply_initial_windows() {
     local family line token i changed=0
     local -a args=() clean=()
     for family in -4 -6; do
-        line=$(ip "$family" route show default 2>/dev/null | head -n1 || true)
+        line=$(ip "$family" route show default 2>/dev/null | sed -n '1p' || true)
         [[ -n "$line" ]] || continue
         read -r -a args <<< "$line"
         clean=()
@@ -278,7 +278,7 @@ restore_default_route_windows_snapshot() {
         file="$directory/default-route-v${family#-}.txt"
         [[ -s "$file" ]] || continue
         baseline=$(head -n1 "$file")
-        current=$(ip "$family" route show default 2>/dev/null | head -n1 || true)
+        current=$(ip "$family" route show default 2>/dev/null | sed -n '1p' || true)
         [[ "$baseline$current" == *initcwnd* || "$baseline$current" == *initrwnd* ]] || continue
         [[ -n "$current" ]] || { rc=1; continue; }
         read -r -a route <<< "$current"; clean=()

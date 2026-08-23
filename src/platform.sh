@@ -47,7 +47,7 @@ default_route_output() {
 default_route_interface_for_family() {
     local family="$1" output
     output=$(default_route_output "$family") || return 1
-    route_output_interfaces <<< "$output" | head -n1
+    route_output_interfaces <<< "$output" | sed -n '1p'
 }
 
 default_route_interface() {
@@ -131,7 +131,7 @@ target_route_records() {
             die "测速目标 $address 的 route-get 无法确定唯一出口"
             return 1
         fi
-        iface=$(route_output_interfaces <<< "$output" | head -n1)
+        iface=$(route_output_interfaces <<< "$output" | sed -n '1p')
         validate_interface_name "$iface" || { die "测速目标 $address 返回非法出口网卡: $iface"; return 1; }
 
         # `route get` can hash an ECMP route and expose only one selected dev.
@@ -153,7 +153,7 @@ target_route_records() {
             die "测速目标 $address 的 fibmatch 无法确定唯一出口"
             return 1
         fi
-        fib_iface=$(route_output_interfaces <<< "$fibmatch" | head -n1)
+        fib_iface=$(route_output_interfaces <<< "$fibmatch" | sed -n '1p')
         validate_interface_name "$fib_iface" || { die "测速目标 $address 的 fibmatch 返回非法出口网卡: $fib_iface"; return 1; }
         [[ "$fib_iface" == "$iface" ]] || {
             die "测速目标 $address 的 route-get/fibmatch 出口不一致（$iface/$fib_iface）；无法证明路径稳定，已停止"

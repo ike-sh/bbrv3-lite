@@ -38,7 +38,7 @@ chmod 0755 "$FAKE_BIN/curl"
 output=$(PATH="$FAKE_BIN:$PATH" FIXTURE_ROOT="$ROOT_DIR" bash "$ROOT_DIR/install-alias.sh" --prefix "$PREFIX" 2>&1)
 [[ -x "$PREFIX/bbr" ]] || { echo "FAIL: installer did not create bbr" >&2; exit 1; }
 grep -Fq 'falling back to immutable tag' <<< "$output" || { echo "FAIL: tag fallback was not reported" >&2; exit 1; }
-"$PREFIX/bbr" version | grep -Fq 'v8.0.0' || { echo "FAIL: installed version mismatch" >&2; exit 1; }
+"$PREFIX/bbr" version | grep -F 'v8.0.0' >/dev/null || { echo "FAIL: installed version mismatch" >&2; exit 1; }
 if [[ $(id -u) == 0 ]]; then
     chown 12345:12345 "$PREFIX/bbr"
     PATH="$FAKE_BIN:$PATH" FIXTURE_ROOT="$ROOT_DIR" bash "$ROOT_DIR/install-alias.sh" --prefix "$PREFIX" >/dev/null 2>&1

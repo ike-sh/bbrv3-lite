@@ -282,7 +282,7 @@ path_profile_capture() {
     received=$(awk 'END {print NR+0}' "$values_file"); PATH_PING_RECEIVED="$received"
     PATH_LOSS_PERCENT=$(awk -v s="$samples" -v r="$received" 'BEGIN {printf "%.2f",(s-r)*100/s}')
     if (( received > 0 )); then
-        PATH_RTT_MIN_MS=$(sort -n "$values_file" | head -n1)
+        PATH_RTT_MIN_MS=$(sort -n "$values_file" | sed -n '1p')
         PATH_RTT_MEDIAN_MS=$(median_numbers < "$values_file")
         PATH_RTT_P95_MS=$(path_percentile_95 < "$values_file")
         PATH_RTT_MAX_MS=$(sort -n "$values_file" | tail -n1)

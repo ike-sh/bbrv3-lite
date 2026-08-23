@@ -4,7 +4,9 @@
 
 secure_boot_enabled() {
     command_exists mokutil || return 1
-    mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'
+    # Do not use grep -q in a pipe while pipefail is active: an early match can
+    # close the pipe, give mokutil SIGPIPE, and turn a true result into false.
+    mokutil --sb-state 2>/dev/null | grep -i 'SecureBoot enabled' >/dev/null
 }
 
 cpu_flags_line() {
@@ -129,7 +131,7 @@ kernel_remove() {
     mapfile -t packages < <(dpkg-query -W -f='${Package}\n' 'linux-*xanmod*' 2>/dev/null | sort -u)
     ((${#packages[@]})) || { log INFO "没有已安装的 XanMod 包"; return 0; }
     for package in "${packages[@]}"; do
-        if [[ "$(uname -r)" == *xanmod* ]] && dpkg-query -L "$package" 2>/dev/null | grep -Fq "/boot/vmlinuz-$(uname -r)"; then
+        if [[ "$(uname -r)" == *xanmod* ]] && dpkg-query -L "$package" 2>/dev/null | grep -F "/boot/vmlinuz-$(uname -r)" >/dev/null; then
             log WARN "跳过当前正在运行的内核包: $package"
         else safe+=("$package"); fi
     done

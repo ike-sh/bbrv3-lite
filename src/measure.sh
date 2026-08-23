@@ -273,7 +273,7 @@ measure_unique_route_iface() {
         die "$context 无法确定唯一出口网卡"
         return 1
     fi
-    iface=$(route_output_interfaces <<< "$output" | head -n1)
+    iface=$(route_output_interfaces <<< "$output" | sed -n '1p')
     validate_interface_name "$iface" || { die "$context 返回非法出口网卡: $iface"; return 1; }
     printf '%s\n' "$iface"
 }

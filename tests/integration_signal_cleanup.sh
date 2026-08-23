@@ -119,7 +119,7 @@ test_real_tc_trial_signal_restore() {
     wait "$child" || rc=$?
     child=""
     (( rc != 0 )) || fail "SIGTERM trial child reported success"
-    tc qdisc show dev "$iface" | grep -Eq '^qdisc fq .* root([[:space:]]|$)' ||
+    tc qdisc show dev "$iface" | grep -E '^qdisc fq .* root([[:space:]]|$)' >/dev/null ||
         fail "real TC trial qdisc was not restored after SIGTERM"
     cleanup_real_tc_signal
     trap 'rm -rf -- "$TEST_ROOT"' EXIT

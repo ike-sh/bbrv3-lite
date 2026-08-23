@@ -381,7 +381,7 @@ default_route_output() {
 default_route_interface_for_family() {
     local family="$1" output
     output=$(default_route_output "$family") || return 1
-    route_output_interfaces <<< "$output" | head -n1
+    route_output_interfaces <<< "$output" | sed -n '1p'
 }
 
 default_route_interface() {
@@ -465,7 +465,7 @@ target_route_records() {
             die "测速目标 $address 的 route-get 无法确定唯一出口"
             return 1
         fi
-        iface=$(route_output_interfaces <<< "$output" | head -n1)
+        iface=$(route_output_interfaces <<< "$output" | sed -n '1p')
         validate_interface_name "$iface" || { die "测速目标 $address 返回非法出口网卡: $iface"; return 1; }
 
         # `route get` can hash an ECMP route and expose only one selected dev.
@@ -487,7 +487,7 @@ target_route_records() {
             die "测速目标 $address 的 fibmatch 无法确定唯一出口"
             return 1
         fi
-        fib_iface=$(route_output_interfaces <<< "$fibmatch" | head -n1)
+        fib_iface=$(route_output_interfaces <<< "$fibmatch" | sed -n '1p')
         validate_interface_name "$fib_iface" || { die "测速目标 $address 的 fibmatch 返回非法出口网卡: $fib_iface"; return 1; }
         [[ "$fib_iface" == "$iface" ]] || {
             die "测速目标 $address 的 route-get/fibmatch 出口不一致（$iface/$fib_iface）；无法证明路径稳定，已停止"
@@ -1103,7 +1103,7 @@ path_profile_capture() {
     received=$(awk 'END {print NR+0}' "$values_file"); PATH_PING_RECEIVED="$received"
     PATH_LOSS_PERCENT=$(awk -v s="$samples" -v r="$received" 'BEGIN {printf "%.2f",(s-r)*100/s}')
     if (( received > 0 )); then
-        PATH_RTT_MIN_MS=$(sort -n "$values_file" | head -n1)
+        PATH_RTT_MIN_MS=$(sort -n "$values_file" | sed -n '1p')
         PATH_RTT_MEDIAN_MS=$(median_numbers < "$values_file")
         PATH_RTT_P95_MS=$(path_percentile_95 < "$values_file")
         PATH_RTT_MAX_MS=$(sort -n "$values_file" | tail -n1)
@@ -1897,7 +1897,7 @@ apply_initial_windows() {
     local family line token i changed=0
     local -a args=() clean=()
     for family in -4 -6; do
-        line=$(ip "$family" route show default 2>/dev/null | head -n1 || true)
+        line=$(ip "$family" route show default 2>/dev/null | sed -n '1p' || true)
         [[ -n "$line" ]] || continue
         read -r -a args <<< "$line"
         clean=()
@@ -1920,7 +1920,7 @@ restore_default_route_windows_snapshot() {
         file="$directory/default-route-v${family#-}.txt"
         [[ -s "$file" ]] || continue
         baseline=$(head -n1 "$file")
-        current=$(ip "$family" route show default 2>/dev/null | head -n1 || true)
+        current=$(ip "$family" route show default 2>/dev/null | sed -n '1p' || true)
         [[ "$baseline$current" == *initcwnd* || "$baseline$current" == *initrwnd* ]] || continue
         [[ -n "$current" ]] || { rc=1; continue; }
         read -r -a route <<< "$current"; clean=()
@@ -3716,7 +3716,7 @@ measure_unique_route_iface() {
         die "$context 无法确定唯一出口网卡"
         return 1
     fi
-    iface=$(route_output_interfaces <<< "$output" | head -n1)
+    iface=$(route_output_interfaces <<< "$output" | sed -n '1p')
     validate_interface_name "$iface" || { die "$context 返回非法出口网卡: $iface"; return 1; }
     printf '%s\n' "$iface"
 }
@@ -5964,7 +5964,9 @@ verify_system_state() {
 
 secure_boot_enabled() {
     command_exists mokutil || return 1
-    mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'
+    # Do not use grep -q in a pipe while pipefail is active: an early match can
+    # close the pipe, give mokutil SIGPIPE, and turn a true result into false.
+    mokutil --sb-state 2>/dev/null | grep -i 'SecureBoot enabled' >/dev/null
 }
 
 cpu_flags_line() {
@@ -6089,7 +6091,7 @@ kernel_remove() {
     mapfile -t packages < <(dpkg-query -W -f='${Package}\n' 'linux-*xanmod*' 2>/dev/null | sort -u)
     ((${#packages[@]})) || { log INFO "没有已安装的 XanMod 包"; return 0; }
     for package in "${packages[@]}"; do
-        if [[ "$(uname -r)" == *xanmod* ]] && dpkg-query -L "$package" 2>/dev/null | grep -Fq "/boot/vmlinuz-$(uname -r)"; then
+        if [[ "$(uname -r)" == *xanmod* ]] && dpkg-query -L "$package" 2>/dev/null | grep -F "/boot/vmlinuz-$(uname -r)" >/dev/null; then
             log WARN "跳过当前正在运行的内核包: $package"
         else safe+=("$package"); fi
     done

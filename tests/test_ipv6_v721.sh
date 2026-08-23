@@ -475,8 +475,8 @@ test_real_global_topology_counterexample() (
     if ipv6_disable temporary >/dev/null 2>&1; then fail "real global IPv6 topology was allowed to disable"; fi
     [[ ! -e "$IPV6_BACKUP_DIR/baseline" ]] || fail "real topology guard created a baseline before refusal"
     grep -qx 0 "/proc/sys/net/ipv6/conf/$iface/disable_ipv6" || fail "real topology guard changed disable flag"
-    "$real_ip" -6 -o addr show dev "$iface" | grep -Fq '2001:db8:720::1/64' || fail "global address disappeared during refused operation"
-    "$real_ip" -6 route show 2001:db8:721::/64 | grep -Fq '2001:db8:721::/64' || fail "static IPv6 route disappeared during refused operation"
+    "$real_ip" -6 -o addr show dev "$iface" | grep -F '2001:db8:720::1/64' >/dev/null || fail "global address disappeared during refused operation"
+    "$real_ip" -6 route show 2001:db8:721::/64 | grep -F '2001:db8:721::/64' >/dev/null || fail "static IPv6 route disappeared during refused operation"
     printf 'real global IPv6 topology counterexample: OK\n'
 
     # A v2 snapshot may contain a historical all=1 observation. Manufacture
@@ -496,8 +496,8 @@ test_real_global_topology_counterexample() (
     assert_eq "$all_before" "$(<"/proc/sys/net/ipv6/conf/all/disable_ipv6")" "real v2 restore changed all write-trigger state"
     assert_eq 0 "$MOCK_ALL_WRITE_COUNT" "real v2 restore invoked all write trigger"
     [[ "$WRITE_EVENTS" != *' all='* ]] || fail "real v2 restore replayed all: $WRITE_EVENTS"
-    "$real_ip" -6 -o addr show dev "$iface" | grep -Fq '2001:db8:720::1/64' || fail "real v2 restore deleted global address"
-    "$real_ip" -6 route show 2001:db8:721::/64 | grep -Fq '2001:db8:721::/64' || fail "real v2 restore deleted static route"
+    "$real_ip" -6 -o addr show dev "$iface" | grep -F '2001:db8:720::1/64' >/dev/null || fail "real v2 restore deleted global address"
+    "$real_ip" -6 route show 2001:db8:721::/64 | grep -F '2001:db8:721::/64' >/dev/null || fail "real v2 restore deleted static route"
     printf 'real v2 restore all-trigger regression: OK\n'
 )
 

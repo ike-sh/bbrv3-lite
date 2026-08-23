@@ -28,7 +28,7 @@ verify_shaping "$iface"
 [[ "$(managed_rate_mbit "$iface")" == 100 ]]
 restore_action_qdisc "$iface" "$snapshot"
 rm -f "$snapshot"
-tc -d qdisc show dev "$iface" | grep -q 'fq_codel.*limit 2048p.*target 7ms'
+tc -d qdisc show dev "$iface" | grep 'fq_codel.*limit 2048p.*target 7ms' >/dev/null
 
 # Newer kernels expose read-only FQ band maps. A snapshot must ignore those
 # presentation fields and still restore the original FQ root successfully.
