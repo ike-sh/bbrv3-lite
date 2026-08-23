@@ -722,18 +722,35 @@ test_systemd_lifecycle_strict_queries_and_runtime_states() {
 
 test_persistent_artifact_consistency_verifier() {
     (
-        local verify_root="$TEST_ROOT/persistence-verify"
+        local verify_root="$TEST_ROOT/persistence-verify" mock_link=10000 mock_rx=2 mock_ram=4096
         CONFIG_FILE="$verify_root/etc/bbrv3-lite.conf"; SYSCTL_FILE="$verify_root/etc/99-bbrv3-lite.conf"
         LEGACY_SYSCTL_FILE="$verify_root/etc/99-bbr-ultimate.conf"
         SERVICE_FILE="$verify_root/systemd/bbrv3-lite.service"; PERSIST_DIR="$verify_root/persist"
         PERSIST_SCRIPT="$PERSIST_DIR/net-tcp-tune.sh"
+        cpu_count() { printf '4\n'; }; memory_mb() { printf '%s\n' "$mock_ram"; }
+        detect_interface() { printf 'eth0\n'; }; detect_link_speed() { printf '%s\n' "$mock_link"; }
+        detect_rx_queues() { printf '%s\n' "$mock_rx"; }; detect_tx_queues() { printf '2\n'; }
+        detect_mtu() { printf '1500\n'; }; detect_driver() { printf 'virtio_net\n'; }; virtualization_type() { printf 'kvm\n'; }
         mkdir -p "$(dirname "$CONFIG_FILE")" "$(dirname "$SERVICE_FILE")" "$PERSIST_DIR"
         reset_config; save_config
         render_sysctl_profile > "$SYSCTL_FILE"
         cp "$ROOT_DIR/net-tcp-tune.sh" "$PERSIST_SCRIPT"; chmod 0755 "$PERSIST_SCRIPT"
         printf '[Service]\nExecStart=%s apply\n' "$PERSIST_SCRIPT" > "$SERVICE_FILE"
         current_script_path() { printf '%s\n' "$ROOT_DIR/net-tcp-tune.sh"; }
+        # Runtime-only NIC telemetry may drift between installation and a
+        # consistency check; the applied key/value profile must remain valid.
+        mock_link=unknown; mock_rx=8
         verify_persistence_artifacts || fail "matching persistent artifacts rejected"
+        mock_ram=256
+        if verify_persistence_artifacts >/dev/null 2>&1; then fail "hardware change affecting managed sysctls was accepted"; fi
+        mock_ram=4096
+        grep -v '^# hardware=' "$SYSCTL_FILE" > "$SYSCTL_FILE.without-hardware"
+        mv -- "$SYSCTL_FILE.without-hardware" "$SYSCTL_FILE"
+        if verify_persistence_artifacts >/dev/null 2>&1; then fail "missing hardware telemetry line accepted"; fi
+        render_sysctl_profile > "$SYSCTL_FILE"
+        sed -i 's/net.core.somaxconn = 4096/net.core.somaxconn = 8192/' "$SYSCTL_FILE"
+        if verify_persistence_artifacts >/dev/null 2>&1; then fail "drifted managed sysctl value accepted"; fi
+        render_sysctl_profile > "$SYSCTL_FILE"
         printf '# legacy project profile\n' > "$LEGACY_SYSCTL_FILE"
         if verify_persistence_artifacts >/dev/null 2>&1; then fail "coexisting legacy sysctl was accepted"; fi
         rm -f -- "$LEGACY_SYSCTL_FILE"

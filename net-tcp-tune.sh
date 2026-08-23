@@ -1848,18 +1848,35 @@ verify_sysctl_profile_runtime() {
     return "$rc"
 }
 
+normalize_sysctl_profile_for_compare() {
+    # The hardware line is diagnostic telemetry, not an applied setting. Link
+    # speed, queue counts and driver visibility can change transiently (for
+    # example while a virtual NIC is being reconfigured) without changing any
+    # managed sysctl value. Keep the line mandatory, but normalize its payload
+    # so semantic persistence verification does not produce a false drift.
+    awk '/^# hardware=/ { print "# hardware=<runtime-observation>"; next } { print }'
+}
+
 verify_sysctl_profile_file() {
-    local expected
+    local expected observed
     [[ -f "$SYSCTL_FILE" ]] || { log ERR "sysctl 持久化文件缺失: $SYSCTL_FILE"; return 1; }
     command_exists cmp || { die "缺少命令: cmp"; return 1; }
     expected=$(mktemp) || return 1
-    if ! render_sysctl_profile > "$expected"; then rm -f -- "$expected"; return 1; fi
-    if ! cmp -s "$expected" "$SYSCTL_FILE"; then
-        rm -f -- "$expected"
+    observed=$(mktemp) || { rm -f -- "$expected"; return 1; }
+    if ! render_sysctl_profile | normalize_sysctl_profile_for_compare > "$expected"; then
+        rm -f -- "$expected" "$observed"
+        return 1
+    fi
+    if ! normalize_sysctl_profile_for_compare < "$SYSCTL_FILE" > "$observed"; then
+        rm -f -- "$expected" "$observed"
+        return 1
+    fi
+    if ! cmp -s "$expected" "$observed"; then
+        rm -f -- "$expected" "$observed"
         log ERR "sysctl 持久化文件与当前配置不一致: $SYSCTL_FILE"
         return 1
     fi
-    rm -f -- "$expected"
+    rm -f -- "$expected" "$observed"
 }
 
 write_sysctl_profile() {
