@@ -44,6 +44,10 @@ apply_shaping "$iface" 100
 managed_htb "$iface"
 apply_shaping "$iface" 120
 [[ "$(managed_rate_mbit "$iface")" == 120 ]]
+# High-rate bucket must also be accepted by the real kernel and parsed back
+# correctly; v7.1's 8 MiB cap could throttle 25/100G configurations.
+apply_shaping "$iface" 25000
+[[ "$(managed_rate_mbit "$iface")" == 25000 ]]
 apply_fq "$iface"
 [[ "$(root_qdisc_kind "$iface")" == fq ]]
 echo "tc integration test: OK ($iface)"

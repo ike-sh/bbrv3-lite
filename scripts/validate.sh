@@ -12,7 +12,7 @@ for file in src/*.sh scripts/*.sh tests/*.sh install-alias.sh; do bash -n "$file
 bash -n net-tcp-tune.sh
 
 echo "==> Generated artifact markers"
-grep -Fq 'SCRIPT_VERSION="7.0.7"' net-tcp-tune.sh
+grep -Fq 'SCRIPT_VERSION="7.2.0"' net-tcp-tune.sh
 grep -Fq 'Configuration is data and is never sourced' net-tcp-tune.sh
 grep -Fq 'tc qdisc replace dev "$iface" root handle 1: htb default 10' net-tcp-tune.sh
 grep -Fq 'tc qdisc replace dev "$iface" parent 1:10 handle 10: fq' net-tcp-tune.sh
@@ -22,6 +22,13 @@ grep -Fq 'verify_sysctl_profile_runtime' net-tcp-tune.sh
 grep -Fq 'CONFIG_HZ' net-tcp-tune.sh
 grep -Fq 'verify_persistence_artifacts' net-tcp-tune.sh
 grep -Fq 'capture_unit_state' net-tcp-tune.sh
+grep -Fq 'auto_measure_with_peer_failover' net-tcp-tune.sh
+grep -Fq 'measure_compare' net-tcp-tune.sh
+grep -Fq 'RETRANS_PER_GIB' net-tcp-tune.sh
+grep -Fq 'LOADED_RTT_P95_MS' net-tcp-tune.sh
+grep -Fq 'hardware_profile_values' net-tcp-tune.sh
+grep -Fq 'recommended_scan_cap' net-tcp-tune.sh
+grep -Fq 'MULTI_FLOWS' net-tcp-tune.sh
 grep -Fq 'refusing to overwrite an unmanaged file' install-alias.sh
 if grep -Eq 'source[[:space:]]+.*bbrv3-lite\.conf' net-tcp-tune.sh; then echo "unsafe config source detected" >&2; exit 1; fi
 
@@ -37,7 +44,7 @@ fi
 echo "==> ShellCheck"
 if command -v shellcheck >/dev/null 2>&1; then
     # load_config/migrate_legacy_config intentionally accept optional paths used by sourced tests.
-    shellcheck -S warning -e SC2120 net-tcp-tune.sh scripts/build.sh scripts/release.sh scripts/validate.sh tests/test_core.sh tests/test_installer.sh tests/integration_tc.sh install-alias.sh
+    shellcheck -S warning -e SC2120 net-tcp-tune.sh scripts/build.sh scripts/release.sh scripts/validate.sh tests/test_core.sh tests/test_installer.sh tests/integration_tc.sh tests/integration_measure.sh install-alias.sh
 else
     echo "shellcheck unavailable; skipped"
 fi

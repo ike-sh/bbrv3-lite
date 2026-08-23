@@ -7,12 +7,30 @@ secure_boot_enabled() {
     mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'
 }
 
+cpu_flags_line() {
+    grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true
+}
+
+cpu_has_any_flag() {
+    local flags="$1" flag; shift
+    for flag in "$@"; do grep -qw "$flag" <<< "$flags" && return 0; done
+    return 1
+}
+
 detect_x86_level() {
     local flags
     [[ "$(uname -m)" == x86_64 ]] || { printf 'unknown\n'; return 1; }
-    flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)
-    if all_cpu_flags "$flags" avx avx2 bmi1 bmi2 fma movbe xsave; then printf '3\n'
-    elif all_cpu_flags "$flags" cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3; then printf '2\n'
+    flags=$(cpu_flags_line)
+    # x86-64-v3 additionally requires F16C and LZCNT. Linux commonly exposes
+    # BMI1 as bmi/bmi1, LZCNT as abm/lzcnt, and SSE3 as pni. AVX is hidden by
+    # Linux when the OS has not enabled the XSAVE state, so avx+xsave is the
+    # practical /proc/cpuinfo proxy for the psABI OSXSAVE requirement.
+    if all_cpu_flags "$flags" avx avx2 bmi2 f16c fma movbe xsave &&
+        cpu_has_any_flag "$flags" bmi bmi1 && cpu_has_any_flag "$flags" abm lzcnt; then
+        printf '3\n'
+    elif all_cpu_flags "$flags" cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3 &&
+        cpu_has_any_flag "$flags" pni sse3; then
+        printf '2\n'
     else printf '1\n'; fi
 }
 
@@ -22,13 +40,23 @@ all_cpu_flags() {
 }
 
 xanmod_candidates() {
-    local level="$1" track="$2" prefix="linux-xanmod"
-    [[ "$track" == lts ]] && prefix="linux-xanmod-lts"
-    case "$level" in
-        3) printf '%s\n' "${prefix}-x64v3" "${prefix}-x64v2" "linux-xanmod-lts-x64v1" ;;
-        2) printf '%s\n' "${prefix}-x64v2" "linux-xanmod-lts-x64v1" ;;
-        *) printf '%s\n' "linux-xanmod-lts-x64v1" ;;
-    esac
+    local level="$1" track="$2"
+    if [[ "$track" == lts ]]; then
+        case "$level" in
+            3) printf '%s\n' linux-xanmod-lts-x64v3 linux-xanmod-lts-x64v2 linux-xanmod-lts-x64v1 ;;
+            2) printf '%s\n' linux-xanmod-lts-x64v2 linux-xanmod-lts-x64v1 ;;
+            *) printf '%s\n' linux-xanmod-lts-x64v1 ;;
+        esac
+    else
+        # XanMod Main currently has x64v2/x64v3 packages only. Never satisfy a
+        # Main request with an LTS package: that silently changes the lifecycle
+        # track the operator explicitly selected.
+        case "$level" in
+            3) printf '%s\n' linux-xanmod-x64v3 linux-xanmod-x64v2 ;;
+            2) printf '%s\n' linux-xanmod-x64v2 ;;
+            *) return 0 ;;
+        esac
+    fi
 }
 
 select_xanmod_package() {
@@ -55,7 +83,8 @@ kernel_status() {
     printf '%-18s %s\n' "Architecture" "$(uname -m)"
     printf '%-18s %s\n' "x86-64 level" "$(detect_x86_level 2>/dev/null || echo n/a)"
     printf '%-18s %s\n' "Secure Boot" "$(secure_boot_enabled && echo enabled || echo disabled/unknown)"
-    printf '%-18s %s\n' "BBR module" "$(modinfo tcp_bbr 2>/dev/null | awk '/^version:/ {print $2; found=1} END{if(!found)print "available/unknown version"}')"
+    printf '%-18s %s\n' "BBR support" "$(bbr_kernel_support_status)"
+    printf '%-18s %s\n' "BBR compatibility" "$(bbr_compatibility_status "$cc")"
     printf '%-18s %s\n' "BBR generation" "$(bbr_generation_status "$cc")"
     dpkg-query -W -f='${Package}\t${Version}\n' 'linux-*xanmod*' 2>/dev/null || true
 }

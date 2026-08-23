@@ -53,7 +53,7 @@ capture_runtime_sysctls() {
         net.core.default_qdisc net.ipv4.tcp_congestion_control \
         net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
         net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen net.core.somaxconn \
-        net.core.netdev_max_backlog; do
+        net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog; do
         value=$(sysctl -n "$key" 2>/dev/null || true)
         [[ -n "$value" ]] && printf '%s\t%s\n' "$key" "$value"
     done

@@ -348,6 +348,7 @@ install_base_tuning() {
     local requested="$1" profile="$2" role="$3" bandwidth="$4" rtt="$5" iface
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
+    BANDWIDTH_MBIT="$bandwidth"; network_tuning_preflight "$iface" 1 || return 1
     run_action_transaction "$iface" install_base_tuning_steps "$iface" "$requested" "$profile" "$role" "$bandwidth" "$rtt"
 }
 
@@ -387,7 +388,7 @@ restore_baseline_qdisc() {
     local iface kind
     iface=$(awk -F'\t' '$1=="INTERFACE" {print $2}' "$BASELINE_DIR/manifest" 2>/dev/null)
     [[ -n "$iface" && -e "/sys/class/net/$iface" ]] || return 0
-    kind=$(awk '$1=="qdisc" && $0~/ root / {print $2; exit}' "$BASELINE_DIR/qdisc.txt" 2>/dev/null)
+    kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$BASELINE_DIR/qdisc.txt" 2>/dev/null)
     if ! restore_qdisc_text_snapshot "$iface" "$BASELINE_DIR/qdisc.txt"; then
         log WARN "基线 root qdisc 为 '$kind'，文本快照无法无损重放；已保留快照供人工恢复"
         return 1
@@ -579,6 +580,7 @@ verify_persistence_artifacts() {
 
 show_status() {
     local iface="" cc available profile_state service_state service_active shaping=off config_state baseline_state buffer_state="unavailable" script_state
+    local hardware_state="unavailable" queue_state="unavailable" backlog_state="unavailable" scaling_state="unavailable"
     load_config || return 1
     iface=$(detect_interface "$TC_INTERFACE" 2>/dev/null || true)
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
@@ -590,17 +592,28 @@ show_status() {
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then service_active=active; else service_active=inactive; fi
     config_state=$([[ -f "$CONFIG_FILE" ]] && echo present || echo absent)
     if [[ -f "$BASELINE_DIR/manifest" ]]; then baseline_state="recorded ($(baseline_provenance))"; else baseline_state=missing; fi
-    if buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" 2>/dev/null; then
+    if buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "${iface:-${TC_INTERFACE:-auto}}" 2>/dev/null; then
         buffer_state="$(human_bytes "$BUFFER_MAX") ($BUFFER_REASON)"
+        hardware_state="$HARDWARE_CLASS / ${HARDWARE_CPU_COUNT} CPU / ${HARDWARE_MEMORY_MB} MiB"
+        queue_state="${HARDWARE_DRIVER} / RX ${HARDWARE_RX_QUEUES} / TX ${HARDWARE_TX_QUEUES} / MTU ${HARDWARE_MTU} / link ${HARDWARE_LINK_MBIT} (${HARDWARE_LINK_TRUST})"
+        backlog_state="listen/SYN ${SOMAXCONN}/${TCP_MAX_SYN_BACKLOG} / netdev ${NETDEV_BACKLOG}"
+        scaling_state=$(hardware_scaling_note)
     fi
     script_state=$(persistence_script_state)
     printf '%-20s %s\n' "Version" "v${SCRIPT_VERSION}"
     printf '%-20s %s\n' "Kernel" "$(uname -r)"
     printf '%-20s %s\n' "Congestion control" "$cc (available: $available)"
     printf '%-20s %s\n' "BBR generation" "$(bbr_generation_status "$cc")"
+    printf '%-20s %s\n' "BBR compatibility" "$(bbr_compatibility_status "$cc" "$available")"
     printf '%-20s %s\n' "Sysctl profile" "$SYSCTL_PROFILE ($profile_state)"
     printf '%-20s %s\n' "Tuning model" "$ROLE / ${BANDWIDTH_MBIT} Mbit / ${RTT_MS} ms"
+    printf '%-20s %s\n' "Hardware model" "$hardware_state"
+    printf '%-20s %s\n' "NIC model" "$queue_state"
+    if [[ -n "$iface" ]]; then printf '%-20s %s\n' "NIC offloads" "$(detect_offload_summary "$iface")"; fi
+    printf '%-20s %s\n' "Effective bandwidth" "${EFFECTIVE_BANDWIDTH_MBIT:-unknown} Mbit (${EFFECTIVE_BANDWIDTH_SOURCE:-unknown})"
     printf '%-20s %s\n' "Buffer ceiling" "$buffer_state"
+    printf '%-20s %s\n' "Queue budgets" "$backlog_state"
+    printf '%-20s %s\n' "Scaling note" "$scaling_state"
     printf '%-20s %s\n' "Persistence" "$service_state / $service_active"
     printf '%-20s %s\n' "Persistence script" "$script_state"
     printf '%-20s %s\n' "Config" "$config_state ($CONFIG_FILE)"
@@ -618,10 +631,10 @@ bbr_generation_status() {
     [[ "$cc" == bbr ]] || { printf 'inactive\n'; return 0; }
     module_version=$(modinfo tcp_bbr 2>/dev/null | awk '/^version:/ {print $2; exit}')
     kernel=$(uname -r)
-    if [[ "$module_version" =~ ^3([.-]|$) ]]; then
-        printf 'v3 verified (module %s)\n' "$module_version"
-    elif [[ "$kernel" == *xanmod* ]]; then
-        printf 'likely v3 (XanMod; kernel API cannot prove generation)\n'
+    if [[ "$kernel" == *xanmod* ]]; then
+        printf 'v3 expected (XanMod default; runtime API cannot prove generation)\n'
+    elif [[ -n "$module_version" ]]; then
+        printf 'unknown (vendor module version %s is not BBR generation proof)\n' "$module_version"
     else
         printf 'unknown (BBR active; not proof of BBRv3)\n'
     fi

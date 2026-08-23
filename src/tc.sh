@@ -3,20 +3,50 @@
 # -----------------------------------------------------------------------------
 
 TC_SESSION_HTB_IFACE=""
-HTB_BURST_CAP=8388608
+# Enough for 1 Tbit/s even at CONFIG_HZ=100. The actual value remains rate/HZ,
+# so ordinary VPS rates do not inherit a large bucket merely because the cap
+# supports modern 25/100/400G NICs.
+HTB_BURST_CAP=2147483647
 
 tc_dependencies() { require_commands ip tc awk; }
 has_net_admin() { tc qdisc show >/dev/null 2>&1; }
 
+qdisc_module_hint() {
+    local kind="$1" module="sch_$1"
+    command_exists modprobe || return 0
+    modprobe -q "$module" 2>/dev/null || true
+    # A qdisc can be built into the kernel and therefore have no module entry.
+    # The real replace operation below remains the authoritative capability
+    # check and is always followed by structural verification.
+    return 0
+}
+
+network_tuning_preflight() {
+    local iface="$1" need_shaping="${2:-0}" key
+    tc_dependencies || return 1
+    [[ -e "/sys/class/net/$iface" ]] || { die "网卡不存在: $iface"; return 1; }
+    tc qdisc show dev "$iface" >/dev/null 2>&1 || { die "无法读取 $iface 的 qdisc；缺少 NET_ADMIN 或驱动不支持"; return 1; }
+    for key in default_qdisc rmem_max wmem_max somaxconn netdev_max_backlog; do
+        [[ -e "/proc/sys/net/core/$key" ]] || { die "内核缺少受管 sysctl: net.core.$key"; return 1; }
+    done
+    [[ -e /proc/sys/net/ipv4/tcp_congestion_control ]] || { die "内核缺少 TCP 拥塞控制 sysctl"; return 1; }
+    [[ -e /proc/sys/net/ipv4/tcp_max_syn_backlog ]] || { die "内核缺少 TCP SYN backlog sysctl"; return 1; }
+    qdisc_module_hint fq
+    (( need_shaping == 0 )) || qdisc_module_hint htb
+    hardware_profile_values "$iface" "${BANDWIDTH_MBIT:-0}" || return 1
+    log INFO "硬件预检: ${HARDWARE_CLASS}, ${HARDWARE_CPU_COUNT} CPU, ${HARDWARE_MEMORY_MB} MiB RAM, ${HARDWARE_RX_QUEUES}/${HARDWARE_TX_QUEUES} RX/TX queues, link ${HARDWARE_LINK_MBIT} Mbit"
+    log INFO "硬件建议: $(hardware_scaling_note)"
+}
+
 root_qdisc_kind() {
     local text
     text=$(tc qdisc show dev "$1" 2>/dev/null) || return 1
-    awk '$1=="qdisc" && $0 ~ / root / {print $2; exit}' <<< "$text"
+    awk '$1=="qdisc" && $0 ~ / root([[:space:]]|$)/ {print $2; exit}' <<< "$text"
 }
 
 qdisc_replay_args_from_stream() {
     awk '
-        $1=="qdisc" && $0~/ root / {
+        $1=="qdisc" && $0~/ root([[:space:]]|$)/ {
             seen=0; bands=3;
             for(i=1;i<=NF;i++) {
                 if(seen) {
@@ -35,6 +65,50 @@ qdisc_replay_args_from_stream() {
 
 root_qdisc_replay_args() {
     tc qdisc show dev "$1" 2>/dev/null | qdisc_replay_args_from_stream
+}
+
+mq_child_replay_rows_from_stream() {
+    awk '
+        $1=="qdisc" && $0!~/ root([[:space:]]|$)/ {
+            parent=""; start=0; bands=3
+            for(i=1;i<=NF;i++) if($i=="parent" && $(i+1) ~ /^:[[:xdigit:]]+$/) {
+                parent=$(i+1); start=i+2; break
+            }
+            if(parent=="") next
+            kind=$2; out=""
+            for(i=start;i<=NF;i++) {
+                if($i=="refcnt") {i++; continue}
+                if($i=="bands") {bands=$(i+1); i++; continue}
+                if($i=="priomap") {i+=16; continue}
+                if($i=="weights") {i+=bands; continue}
+                token=$i; if(token ~ /^[0-9]+p$/) sub(/p$/, "", token)
+                out=out (out?" ":"") token
+            }
+            printf "%s\t%s\t%s\n", parent, kind, out
+        }'
+}
+
+mq_unsupported_child_qdiscs() {
+    local iface="$1"
+    tc qdisc show dev "$iface" 2>/dev/null | mq_child_replay_rows_from_stream |
+        awk -F'\t' '$2!="fq" && $2!="fq_codel" && $2!="pfifo_fast" && $2!="pfifo" && $2!="bfifo" && $2!="noqueue" {print $2 "@" $1}'
+}
+
+restore_mq_qdisc_snapshot() {
+    local iface="$1" file="$2" parent kind args_string
+    local -a args=()
+    tc qdisc replace dev "$iface" root mq >/dev/null 2>&1 || return 1
+    while IFS=$'\t' read -r parent kind args_string; do
+        [[ -n "$parent" && -n "$kind" ]] || continue
+        case "$kind" in
+            fq|fq_codel|pfifo_fast|pfifo|bfifo)
+                args=(); [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
+                tc qdisc replace dev "$iface" parent "$parent" "$kind" "${args[@]}" >/dev/null 2>&1 || return 1
+                ;;
+            noqueue) ;;
+            *) return 2 ;;
+        esac
+    done < <(mq_child_replay_rows_from_stream < "$file")
 }
 
 managed_htb() {
@@ -63,7 +137,8 @@ managed_rate_mbit() {
     text=$(tc class show dev "$iface" 2>/dev/null) || return 1
     token=$(awk '$1=="class" && $2=="htb" && $3=="1:10" {for(i=1;i<=NF;i++) if($i=="rate") {print $(i+1); exit}}' <<< "$text")
     awk -v r="$token" 'BEGIN {
-        if (r ~ /Gbit$/) {sub(/Gbit$/, "", r); printf "%.0f\n", r*1000}
+        if (r ~ /Tbit$/) {sub(/Tbit$/, "", r); printf "%.0f\n", r*1000000}
+        else if (r ~ /Gbit$/) {sub(/Gbit$/, "", r); printf "%.0f\n", r*1000}
         else if (r ~ /Mbit$/) {sub(/Mbit$/, "", r); printf "%.0f\n", r}
         else if (r ~ /Kbit$/) {sub(/Kbit$/, "", r); printf "%.0f\n", r/1000}
     }'
@@ -90,11 +165,19 @@ managed_htb_diagnostic() {
 }
 
 qdisc_guard() {
-    local iface="$1" kind detail
+    local iface="$1" kind detail unsupported
     kind=$(root_qdisc_kind "$iface") || { die "无法读取 $iface 的 root qdisc"; return 1; }
     if managed_htb "$iface" || session_owned_htb "$iface"; then return 0; fi
     case "$kind" in
-        ""|fq|fq_codel|noqueue|mq|pfifo_fast) return 0 ;;
+        ""|fq|fq_codel|noqueue|pfifo_fast) return 0 ;;
+        mq)
+            unsupported=$(mq_unsupported_child_qdiscs "$iface")
+            if [[ -n "$unsupported" ]]; then
+                die "拒绝覆盖含不可安全重放子队列的 mq（$iface；$unsupported）"
+                return 1
+            fi
+            return 0
+            ;;
         htb)
             detail=$(managed_htb_diagnostic "$iface")
             die "拒绝覆盖未管理的 root qdisc 'htb'（$iface；$detail）"
@@ -138,7 +221,11 @@ restore_action_qdisc() {
             else return 1
             fi
             ;;
-        ""|noqueue|mq|pfifo_fast)
+        mq)
+            restore_mq_qdisc_snapshot "$iface" "$file" || return 1
+            if [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]]; then TC_SESSION_HTB_IFACE=""; fi
+            ;;
+        ""|noqueue|pfifo_fast)
             tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
             if [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]]; then TC_SESSION_HTB_IFACE=""; fi
             ;;
@@ -149,12 +236,13 @@ restore_action_qdisc() {
 restore_qdisc_text_snapshot() {
     local iface="$1" file="$2" kind args_string
     local -a args=()
-    kind=$(awk '$1=="qdisc" && $0~/ root / {print $2; exit}' "$file" 2>/dev/null)
+    kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$file" 2>/dev/null)
     args_string=$(qdisc_replay_args_from_stream < "$file")
     [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
     case "$kind" in
         fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null 2>&1 || tc qdisc replace dev "$iface" root "$kind" ;;
-        ""|noqueue|mq|pfifo_fast) tc qdisc del dev "$iface" root 2>/dev/null || true ;;
+        mq) restore_mq_qdisc_snapshot "$iface" "$file" ;;
+        ""|noqueue|pfifo_fast) tc qdisc del dev "$iface" root 2>/dev/null || true ;;
         *) return 2 ;;
     esac
 }
@@ -200,6 +288,7 @@ verify_shaping() {
 _apply_shaping_raw() {
     local iface="$1" rate="$2" mtu burst quantum cburst hierarchy_exists=0 kind
     is_uint "$rate" && (( rate > 0 && rate <= 1000000 )) || { die "非法整形速率: $rate"; return 1; }
+    qdisc_module_hint htb; qdisc_module_hint fq
     mtu=$(detect_mtu "$iface"); is_uint "$mtu" || mtu=1500
     burst=$(calc_htb_burst "$rate" "$mtu")
     quantum=$(calc_htb_quantum "$mtu")
@@ -238,7 +327,7 @@ apply_shaping() {
 
 apply_fq() {
     local iface="$1" snapshot
-    tc_dependencies || return 1; qdisc_guard "$iface" || return 1
+    tc_dependencies || return 1; qdisc_guard "$iface" || return 1; qdisc_module_hint fq
     snapshot=$(mktemp) || return 1
     action_qdisc_snapshot "$iface" "$snapshot" || { rm -f -- "$snapshot"; return 1; }
     if ! tc qdisc replace dev "$iface" root fq || [[ "$(root_qdisc_kind "$iface")" != fq ]]; then
@@ -256,6 +345,7 @@ tc_trial() {
     local rate="$1" requested="${2:-auto}" iface
     is_uint "$rate" && (( rate > 0 && rate <= 1000000 )) || { die "非法整形速率: $rate"; return 1; }
     iface=$(detect_interface "$requested") || return 1
+    BANDWIDTH_MBIT="$rate"; network_tuning_preflight "$iface" 1 || return 1
     capture_baseline "$iface" || return 1
     apply_shaping "$iface" "$rate" || return 1
     log OK "临时整形已生效: $iface ${rate} Mbit（未写配置，重启后失效）"
@@ -284,6 +374,7 @@ tc_enable() {
     (( knee == 0 || knee >= rate )) || { die "拐点速率不能低于最终整形速率"; return 1; }
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
+    BANDWIDTH_MBIT="$rate"; network_tuning_preflight "$iface" 1 || return 1
     run_action_transaction "$iface" tc_enable_steps "$iface" "$rate" "$requested" "$knee" "$margin"
 }
 
@@ -306,6 +397,7 @@ tc_disable() {
     [[ "$requested" == auto && "$TC_INTERFACE" != auto ]] && requested="$TC_INTERFACE"
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
+    network_tuning_preflight "$iface" 0 || return 1
     run_action_transaction "$iface" tc_disable_steps "$iface"
 }
 

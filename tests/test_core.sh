@@ -69,10 +69,10 @@ EOF
 
 test_profile_math() {
     buffer_profile_values balanced mixed 0 0
-    assert_eq 16777216 "$BUFFER_MAX" "balanced buffer"
+    (( BUFFER_MAX >= 4194304 && BUFFER_MAX <= 16777216 )) || fail "balanced buffer outside hardware-safe range"
     buffer_profile_values adaptive proxy 500 200
-    (( BUFFER_MAX >= 16777216 )) || fail "adaptive buffer below balanced floor"
-    (( BUFFER_MAX <= 268435456 )) || fail "adaptive buffer above absolute cap"
+    (( BUFFER_MAX >= 4194304 )) || fail "adaptive buffer below hardware floor"
+    (( BUFFER_MAX <= 2147483647 )) || fail "adaptive buffer above absolute cap"
     assert_eq 100 "$(recommended_tuning_rtt mixed 1)" "mixed tuning RTT floor"
     assert_eq 150 "$(recommended_tuning_rtt proxy 1)" "proxy tuning RTT floor"
     assert_eq 220 "$(recommended_tuning_rtt proxy 220)" "observed RTT above role floor"
@@ -81,7 +81,108 @@ test_profile_math() {
     burst=$(calc_htb_burst 100 1500)
     assert_eq 50000 "$burst" "HTB burst uses kernel HZ"
     capped=$(calc_htb_burst 1000000 1500)
-    assert_eq 8388608 "$capped" "HTB burst absolute cap"
+    assert_eq 500000000 "$capped" "HTB burst supports 1 Tbit at 250Hz"
+    detect_kernel_hz() { printf '100\n'; }
+    capped=$(calc_htb_burst 1000000 1500)
+    assert_eq 1250000000 "$capped" "HTB burst supports 1 Tbit at 100Hz"
+}
+
+test_bbr_compatibility_guard_and_generation_reporting() {
+    (
+        local mock_current=bbr2 mock_available='reno cubic bbr bbr2' output
+        sysctl() {
+            [[ "$1" == -n ]] || return 1
+            case "$2" in
+                net.ipv4.tcp_congestion_control) printf '%s\n' "$mock_current" ;;
+                net.ipv4.tcp_available_congestion_control) printf '%s\n' "$mock_available" ;;
+                *) return 1 ;;
+            esac
+        }
+        modprobe() { :; }
+        if ensure_bbr_available >/dev/null 2>&1; then fail "third-party BBR variant was silently replaced"; fi
+        output=$(bbr_compatibility_status "$mock_current" "$mock_available")
+        [[ "$output" == conflict:*bbr2* ]] || fail "third-party BBR conflict was not reported: $output"
+
+        mock_current=cubic
+        ensure_bbr_available || fail "standard BBR availability was rejected"
+        assert_eq 'ready: standard bbr is available' "$(bbr_compatibility_status "$mock_current" "$mock_available")" "standard BBR readiness"
+
+        modinfo() { printf 'version: 3.7-vendor\n'; }
+        uname() { [[ "$1" == -r ]] && printf '6.12.0-generic\n'; }
+        output=$(bbr_generation_status bbr)
+        [[ "$output" == unknown*'not BBR generation proof'* ]] || fail "vendor module version was treated as BBRv3 proof: $output"
+        uname() { [[ "$1" == -r ]] && printf '6.12.0-x64v3-xanmod1\n'; }
+        output=$(bbr_generation_status bbr)
+        [[ "$output" == 'v3 expected'* ]] || fail "XanMod BBRv3 expectation missing: $output"
+    )
+}
+
+test_xanmod_cpu_level_and_track_selection() {
+    (
+        local mock_cpu_flags
+        uname() { [[ "$1" == -m ]] && printf 'x86_64\n'; }
+        cpu_flags_line() { printf '%s\n' "$mock_cpu_flags"; }
+
+        mock_cpu_flags='flags : cx16 lahf_lm popcnt pni sse4_1 sse4_2 ssse3 avx avx2 bmi1 bmi2 f16c fma movbe xsave abm'
+        assert_eq 3 "$(detect_x86_level)" "complete x86-64-v3 feature set"
+        mock_cpu_flags='flags : cx16 lahf_lm popcnt pni sse4_1 sse4_2 ssse3 avx avx2 bmi1 bmi2 fma movbe xsave abm'
+        assert_eq 2 "$(detect_x86_level)" "missing F16C must downgrade x86-64-v3"
+        mock_cpu_flags='flags : cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3'
+        assert_eq 1 "$(detect_x86_level)" "missing SSE3 must downgrade x86-64-v2"
+
+        assert_eq $'linux-xanmod-x64v3\nlinux-xanmod-x64v2' "$(xanmod_candidates 3 main)" "XanMod Main candidates"
+        assert_eq $'linux-xanmod-lts-x64v2\nlinux-xanmod-lts-x64v1' "$(xanmod_candidates 2 lts)" "XanMod LTS fallback candidates"
+        assert_eq '' "$(xanmod_candidates 1 main)" "XanMod Main must not silently fall back to LTS"
+    )
+}
+
+test_hardware_aware_model() {
+    (
+        cpu_count() { printf '1\n'; }; memory_mb() { printf '256\n'; }
+        detect_interface() { printf 'eth0\n'; }; detect_link_speed() { printf '100\n'; }
+        detect_rx_queues() { printf '1\n'; }; detect_tx_queues() { printf '1\n'; }
+        detect_mtu() { printf '1500\n'; }; detect_driver() { printf 'virtio_net\n'; }; virtualization_type() { printf 'kvm\n'; }
+        TC_INTERFACE=eth0
+        buffer_profile_values adaptive mixed 100 100 eth0
+        assert_eq micro "$HARDWARE_CLASS" "micro hardware class"
+        assert_eq 4194304 "$BUFFER_MAX" "micro adaptive floor"
+        assert_eq 4096 "$NETDEV_BACKLOG" "micro backlog cap"
+        assert_eq 5000 "$(recommended_scan_cap eth0 0)" "slow link scan floor"
+        assert_eq 2 "$(recommended_verify_flows eth0 100)" "single-core verify flows"
+    )
+    (
+        cpu_count() { printf '16\n'; }; memory_mb() { printf '16384\n'; }
+        detect_interface() { printf 'eth0\n'; }; detect_link_speed() { printf '25000\n'; }
+        detect_rx_queues() { printf '16\n'; }; detect_tx_queues() { printf '16\n'; }
+        detect_mtu() { printf '9000\n'; }; detect_driver() { printf 'mlx5_core\n'; }; virtualization_type() { printf 'none\n'; }
+        assert_eq 31250 "$(recommended_scan_cap eth0 0)" "25G dynamic scan cap"
+        assert_eq 18000 "$(expanded_scan_cap 5000 12000)" "measured scan cap expansion"
+        assert_eq 100000 "$(expanded_scan_cap 100000 12000)" "larger explicit planning cap retained"
+        assert_eq 1000000 "$(expanded_scan_cap 5000 900000)" "measured scan cap absolute bound"
+        assert_eq 4 "$(recommended_measure_duration eth0 25000)" "25G sample duration"
+        assert_eq 8 "$(recommended_verify_flows eth0 25000)" "25G verify flows"
+        buffer_profile_values adaptive bulk 25000 150 eth0
+        assert_eq 16384 "$NETDEV_BACKLOG" "25G backlog budget"
+        (( BUFFER_MAX > 268435456 )) || fail "high-BDP host remained capped at v7.1 ceiling"
+    )
+    (
+        cpu_count() { printf '64\n'; }; memory_mb() { printf '65536\n'; }
+        detect_interface() { printf 'eth0\n'; }; detect_link_speed() { printf '100000\n'; }
+        detect_rx_queues() { printf '32\n'; }; detect_tx_queues() { printf '32\n'; }
+        detect_mtu() { printf '9000\n'; }; detect_driver() { printf 'mlx5_core\n'; }; virtualization_type() { printf 'none\n'; }
+        buffer_profile_values adaptive bulk 100000 200 eth0
+        assert_eq extreme "$HARDWARE_CLASS" "extreme hardware class"
+        assert_eq 2147483647 "$BUFFER_MAX" "extreme absolute buffer cap"
+        assert_eq 32768 "$NETDEV_BACKLOG" "extreme backlog budget"
+        assert_eq 16 "$(recommended_verify_flows eth0 100000)" "100G verify flows"
+    )
+    (
+        cpu_count() { printf '4\n'; }; memory_mb() { printf '4096\n'; }
+        detect_interface() { printf 'eth0\n'; }; detect_link_speed() { printf 'unknown\n'; }
+        detect_rx_queues() { printf '1\n'; }; detect_tx_queues() { printf '1\n'; }
+        detect_mtu() { printf '1500\n'; }; detect_driver() { printf 'virtio_net\n'; }; virtualization_type() { printf 'kvm\n'; }
+        assert_eq 5000 "$(recommended_scan_cap eth0 0)" "unknown-link conservative scan cap"
+    )
 }
 
 test_managed_sysctl_runtime_verifier() {
@@ -97,8 +198,9 @@ test_managed_sysctl_runtime_verifier() {
             [net.ipv4.tcp_wmem]="4096 $BUFFER_W_DEFAULT $BUFFER_MAX"
             [net.ipv4.tcp_mtu_probing]=1
             [net.ipv4.tcp_fastopen]=3
-            [net.core.somaxconn]=4096
-            [net.core.netdev_max_backlog]=4096
+            [net.core.somaxconn]="$SOMAXCONN"
+            [net.ipv4.tcp_max_syn_backlog]="$TCP_MAX_SYN_BACKLOG"
+            [net.core.netdev_max_backlog]="$NETDEV_BACKLOG"
         )
         sysctl() { [[ "$1" == -n && -n "${values[$2]+x}" ]] || return 1; printf '%s\n' "${values[$2]}"; }
         verify_sysctl_profile_runtime || fail "matching managed sysctls rejected"
@@ -133,6 +235,54 @@ test_qdisc_replay_filters_kernel_runtime_fields() {
     args=$(root_qdisc_replay_args eth0)
     [[ "$args" == *'limit 10000'* && "$args" == *'flow_limit 100'* && "$args" == *'quantum 3028b'* ]] || fail "stable FQ arguments were not retained: $args"
     [[ "$args" != *bands* && "$args" != *priomap* && "$args" != *weights* ]] || fail "kernel runtime FQ fields were replayed: $args"
+}
+
+test_mq_child_guard_and_restore() {
+    (
+        local rows mock_child=fq_codel snapshot="$TEST_ROOT/mq.snapshot" events=""
+        rows=$(printf '%s\n' \
+            'qdisc mq 0: root' \
+            'qdisc fq_codel 0: parent :1 limit 10240p flows 1024 quantum 1514 target 5ms interval 100ms refcnt 2' \
+            'qdisc fq 0: parent :2 limit 10000p flow_limit 100p bands 3 priomap 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 weights 1 1 1' |
+            mq_child_replay_rows_from_stream)
+        [[ "$rows" == *$':1\tfq_codel\tlimit 10240 flows 1024 quantum 1514 target 5ms interval 100ms'* ]] ||
+            fail "mq fq_codel replay row malformed: $rows"
+        [[ "$rows" == *$':2\tfq\tlimit 10000 flow_limit 100'* && "$rows" != *priomap* && "$rows" != *weights* ]] ||
+            fail "mq fq replay row retained runtime fields: $rows"
+
+        tc() {
+            case "$*" in
+                'qdisc show dev eth0')
+                    printf 'qdisc mq 0: root\nqdisc %s 0: parent :1 limit 10240p\n' "$mock_child"
+                    ;;
+                'class show dev eth0') : ;;
+                *) events+=" [$*]" ;;
+            esac
+        }
+        qdisc_guard eth0 || fail "restorable mq hierarchy was rejected"
+        mock_child=cake
+        if qdisc_guard eth0 >/dev/null 2>&1; then fail "unrestorable mq child was accepted"; fi
+
+        printf '%s\n' \
+            $'KIND\tmq' $'RATE\t' $'ARGS\t' \
+            'qdisc mq 0: root' \
+            'qdisc fq_codel 0: parent :1 limit 10240p flows 1024 quantum 1514 target 5ms interval 100ms' > "$snapshot"
+        restore_mq_qdisc_snapshot eth0 "$snapshot" || fail "mq hierarchy restore failed"
+        [[ "$events" == *'[qdisc replace dev eth0 root mq]'* &&
+            "$events" == *'[qdisc replace dev eth0 parent :1 fq_codel limit 10240 flows 1024 quantum 1514 target 5ms interval 100ms]'* ]] ||
+            fail "mq hierarchy restore calls missing: $events"
+    )
+}
+
+test_managed_rate_unit_parsing() {
+    (
+        tc() { echo 'class htb 1:10 root prio 0 rate 1Tbit ceil 1Tbit'; }
+        assert_eq 1000000 "$(managed_rate_mbit eth0)" "Tbit managed rate parsing"
+    )
+    (
+        tc() { echo 'class htb 1:10 root prio 0 rate 25Gbit ceil 25Gbit'; }
+        assert_eq 25000 "$(managed_rate_mbit eth0)" "Gbit managed rate parsing"
+    )
 }
 
 test_tc_transaction() {
@@ -198,6 +348,90 @@ test_measurement_math_and_history() {
     new_measure_run sweep
     [[ -f "$MEASURE_RESULT_FILE" ]] || fail "measurement history not created"
     [[ "$MEASURE_RUN_DIR" == *-sweep ]] || fail "measurement directory label"
+}
+
+test_v71_measurement_metrics_and_confidence() {
+    (
+        local latency_file="$TEST_ROOT/latency-samples" stats confidence
+        printf '%s\n' \
+            '64 bytes from 192.0.2.1: icmp_seq=1 ttl=64 time=10.0 ms' \
+            '64 bytes from 192.0.2.1: icmp_seq=2 ttl=64 time=20.0 ms' \
+            '64 bytes from 192.0.2.1: icmp_seq=3 ttl=64 time=30.0 ms' > "$latency_file"
+        stats=$(latency_stats_from_file "$latency_file")
+        assert_eq 20.0 "$(cut -f1 <<< "$stats")" "loaded RTT median"
+        assert_eq 30.0 "$(cut -f2 <<< "$stats")" "loaded RTT p95"
+        assert_eq 10.00 "$(bufferbloat_delta_ms 20 30)" "bufferbloat delta"
+        assert_eq 0.00 "$(background_tx_percent 1000 1101000 1000000)" "protocol overhead allowance"
+        assert_eq 1.47 "$(relative_spread_percent 100 110 101)" "robust adaptive spread"
+        confidence=$(measurement_confidence 3 1.47 30 0 0)
+        assert_eq 100 "$(cut -f1 <<< "$confidence")" "measurement confidence score"
+        assert_eq high "$(cut -f2 <<< "$confidence")" "measurement confidence grade"
+        assert_eq improved "$(compare_verdict 100 98 40 10 10 2)" "A/B improvement verdict"
+        assert_eq regressed "$(compare_verdict 100 80 40 10 10 2)" "A/B throughput regression verdict"
+    )
+}
+
+test_peak_core_cpu_detection() {
+    local metrics
+    metrics=$(cpu_core_delta_metrics $'cpu0\t100\t50\t0\ncpu1\t100\t50\t0' $'cpu0\t200\t50\t0\ncpu1\t200\t140\t2')
+    assert_eq $'100.00\t2.00' "$metrics" "peak per-core CPU/steal metrics"
+}
+
+test_adaptive_sampling_and_contamination_guard() {
+    (
+        local calls_file="$TEST_ROOT/adaptive-calls" row rc=0
+        printf '0\n' > "$calls_file"
+        MEASURE_RESULT_FILE="$TEST_ROOT/adaptive-samples.tsv"; MEASURE_IDLE_RTT_MS=10
+        sleep() { :; }
+        iperf_sample() {
+            local call goodput
+            call=$(( $(<"$calls_file") + 1 )); printf '%s\n' "$call" > "$calls_file"
+            case "$call" in 1) goodput=100 ;; 2) goodput=110 ;; *) goodput=101 ;; esac
+            printf '%s\t0\t1000000\t0.00000\t0.000\t20\t30\t0\t20\t0\t0\n' "$goodput"
+        }
+        row=$(sample_repeated example.com 5201 3 1 2 adaptive 3 6)
+        assert_eq 3 "$(cut -f13 <<< "$row")" "adaptive third sample"
+        assert_eq 1.47 "$(cut -f12 <<< "$row")" "adaptive final spread"
+        assert_eq 20.00 "$(cut -f14 <<< "$row")" "adaptive bufferbloat result"
+
+        printf '0\n' > "$calls_file"; BBRV3_CONTAMINATION_RETRIES=1
+        iperf_sample() {
+            printf '%s\n' "$(( $(<"$calls_file") + 1 ))" > "$calls_file"
+            printf '100\t0\t1000000\t0.00000\t0.000\t20\t30\t25\t20\t20\t1\n'
+        }
+        if sample_repeated example.com 5201 3 1 1 contaminated >/dev/null 2>&1; then
+            fail "persistently contaminated sample was accepted"
+        else
+            rc=$?
+        fi
+        assert_eq "$IPERF_CONTAMINATED_RC" "$rc" "contaminated sample exit status"
+        assert_eq 2 "$(<"$calls_file")" "contaminated sample retry count"
+    )
+}
+
+test_measure_compare_is_temporary_and_auditable() {
+    (
+        local restore_file="$TEST_ROOT/compare-restored" summary
+        require_root() { :; }; acquire_lock() { :; }; tc_dependencies() { :; }; require_commands() { :; }
+        peer_port_open() { :; }; detect_interface() { printf 'eth0\n'; }; qdisc_guard() { :; }
+        detect_link_speed() { printf '100\n'; }; measure_set_latency_baseline() { MEASURE_IDLE_RTT_MS=10; }
+        measure_begin() { MEASURE_IFACE=eth0; MEASURE_TX_START=0; MEASURE_RX_START=0; }
+        measure_restore() { printf restored > "$restore_file"; MEASURE_IFACE=""; }
+        traffic_report() { :; }; apply_fq() { :; }; apply_shaping() { :; }; sleep() { :; }
+        sample_repeated() {
+            if [[ "$6" == *-fq-* ]]; then
+                printf '100\t10\t1000000\t0.01000\t10.000\t20\t50\t0\t20\t0\t0\t0\t1\t40\n'
+            else
+                printf '98\t2\t1000000\t0.00200\t2.000\t15\t20\t0\t20\t0\t0\t0\t1\t10\n'
+            fi
+        }
+        measure_compare example.com 5201 auto 95 3 2
+        summary="$MEASURE_RUN_DIR/summary.tsv"
+        [[ -f "$restore_file" ]] || fail "A/B comparison did not restore original qdisc"
+        assert_eq improved "$(summary_value "$summary" VERDICT)" "A/B summary verdict"
+        assert_eq 0 "$(summary_value "$summary" PERSISTED)" "A/B unexpectedly persisted state"
+        assert_eq interleaved "$(summary_value "$summary" ORDER)" "A/B execution order"
+    )
 }
 
 test_systemd_generation() {
@@ -275,7 +509,7 @@ test_self_update_rolls_back_split_install() {
         installed_path="$update_root/bbr"; candidate="$update_root/new.sh"; PERSIST_SCRIPT="$update_root/persist.sh"
         printf '#!/usr/bin/env bash\nSCRIPT_VERSION="7.0.6"\nSCRIPT_NAME="bbrv3-lite"\nprintf old\\n\n' > "$installed_path"
         cp "$installed_path" "$PERSIST_SCRIPT"; chmod 0755 "$installed_path" "$PERSIST_SCRIPT"
-        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="7.0.8"\nSCRIPT_NAME="bbrv3-lite"\nprintf new\\n\n' > "$candidate"
+        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="7.2.1"\nSCRIPT_NAME="bbrv3-lite"\nprintf new\\n\n' > "$candidate"
         require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
         current_script_path() { printf '%s\n' "$installed_path"; }
         curl() {
@@ -289,7 +523,7 @@ test_self_update_rolls_back_split_install() {
                 esac
             done
             case "$url" in
-                */releases/latest) printf '{"tag_name":"v7.0.8"}\n' ;;
+                */releases/latest) printf '{"tag_name":"v7.2.1"}\n' ;;
                 */net-tcp-tune.sh) cp "$candidate" "$output_path" ;;
                 */SHA256SUMS)
                     printf '%s  net-tcp-tune.sh\n' "$(sha256sum "$candidate" | awk '{print $1}')" > "$output_path"
@@ -309,8 +543,8 @@ test_self_update_rolls_back_split_install() {
 
         fail_persist=0
         self_update >/dev/null
-        grep -Fq 'SCRIPT_VERSION="7.0.8"' "$installed_path" || fail "successful update did not replace current command"
-        grep -Fq 'SCRIPT_VERSION="7.0.8"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
+        grep -Fq 'SCRIPT_VERSION="7.2.1"' "$installed_path" || fail "successful update did not replace current command"
+        grep -Fq 'SCRIPT_VERSION="7.2.1"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
     )
 }
 
@@ -382,6 +616,104 @@ test_public_peer_requires_real_iperf_preflight() {
     assert_eq 5203 "$(public_peer_port example.com)" "public iperf preflight"
 }
 
+test_public_peer_pool_and_formal_failover() {
+    (
+        local events="" rc=0
+        require_commands() { :; }
+        PUBLIC_PEER_POOL=$'near.example|近端|ProviderA\nbackup.example|备用|ProviderB'
+        median_ping_ms() { [[ "$1" == near.example ]] && printf '1\n' || printf '8\n'; }
+        public_peer_ports() {
+            if [[ "$1" == near.example ]]; then printf '5201\n5202\n'; else printf '5203\n5204\n'; fi
+        }
+        BBRV3_PUBLIC_PEER_CANDIDATES=4 BBRV3_PUBLIC_PORTS_PER_HOST=2 auto_pick_peer
+        assert_eq 4 "${#PUBLIC_PEER_CANDIDATES[@]}" "public peer reserve count"
+        assert_eq 'near.example|5201|1|近端|ProviderA' "${PUBLIC_PEER_CANDIDATES[0]}" "primary public candidate"
+        assert_eq 'backup.example|5203|8|备用|ProviderB' "${PUBLIC_PEER_CANDIDATES[1]}" "public pool host diversity"
+        assert_eq 'near.example|5202|1|近端|ProviderA' "${PUBLIC_PEER_CANDIDATES[2]}" "same-host fallback ordering"
+
+        WIZARD_PUBLIC_PEER=1; WIZARD_PUBLIC_INDEX=0; WIZARD_FAILOVERS=0
+        activate_public_peer_candidate 0
+        measure_sweep() {
+            events+=" $1:$2"
+            case "$1:$2" in near.example:5201|self.example:5201) return "$IPERF_UNAVAILABLE_RC" ;; *) return 0 ;; esac
+        }
+        auto_measure_with_peer_failover eth0 0
+        assert_eq ' near.example:5201 backup.example:5203' "$events" "formal public peer failover order"
+        assert_eq backup.example "$WIZARD_PEER" "failover host"
+        assert_eq 5203 "$WIZARD_PORT" "failover port"
+        assert_eq 1 "$WIZARD_FAILOVERS" "failover counter"
+        assert_eq backup.example "$WIZARD_SWEEP_PEER" "sweep host identity"
+
+        events=""
+        measure_verify() {
+            events+=" $1:$2"
+            [[ "$1:$2" != backup.example:5203 ]] || return "$IPERF_UNAVAILABLE_RC"
+        }
+        auto_verify_with_peer_failover eth0 6 100 0.94 0
+        assert_eq ' backup.example:5203 backup.example:5204' "$events" "same-host final verification failover order"
+        assert_eq backup.example "$WIZARD_PEER" "final verification backup host"
+        assert_eq 5204 "$WIZARD_PORT" "final verification backup port"
+
+        activate_public_peer_candidate 0
+        WIZARD_SWEEP_PEER=near.example; WIZARD_SWEEP_PORT=5201; events=""
+        measure_verify() {
+            events+=" $1:$2"
+            [[ "$1" == backup.example ]] && return 0
+            return "$IPERF_UNAVAILABLE_RC"
+        }
+        if auto_verify_with_peer_failover eth0 6 100 0.94 0 >/dev/null 2>&1; then
+            fail "final verification crossed to a different host"
+        else
+            rc=$?
+        fi
+        assert_eq "$IPERF_UNAVAILABLE_RC" "$rc" "same-path verification failure status"
+        assert_eq ' near.example:5201 near.example:5202' "$events" "final verification attempted a different host"
+
+        WIZARD_PUBLIC_PEER=0; WIZARD_PEER=self.example; WIZARD_PORT=5201; events=""
+        if auto_measure_with_peer_failover eth0 0 >/dev/null 2>&1; then fail "private peer failure reported success"; else rc=$?; fi
+        assert_eq "$IPERF_UNAVAILABLE_RC" "$rc" "private peer unavailable status"
+        assert_eq ' self.example:5201' "$events" "private peer unexpectedly failed over"
+    )
+}
+
+test_repeated_sample_classifies_peer_unavailable() {
+    (
+        local rc=0 calls_file="$TEST_ROOT/iperf-sample-calls"
+        printf '0\n' > "$calls_file"
+        BBRV3_IPERF_ATTEMPTS=1
+        iperf_sample() { printf '%s\n' "$(( $(<"$calls_file") + 1 ))" > "$calls_file"; return "$IPERF_UNAVAILABLE_RC"; }
+        if sample_repeated busy.example 5201 5 1 1 unshaped >/dev/null 2>&1; then
+            fail "unavailable peer sample reported success"
+        else
+            rc=$?
+        fi
+        assert_eq "$IPERF_UNAVAILABLE_RC" "$rc" "unavailable peer status"
+        assert_eq 1 "$(<"$calls_file")" "unavailable peer attempt count"
+
+        printf '0\n' > "$calls_file"; BBRV3_IPERF_ATTEMPTS=3
+        iperf_sample() { printf '%s\n' "$(( $(<"$calls_file") + 1 ))" > "$calls_file"; return "$IPERF_DATA_RC"; }
+        if sample_repeated malformed.example 5201 5 1 1 unshaped >/dev/null 2>&1; then
+            fail "malformed iperf result reported success"
+        else
+            rc=$?
+        fi
+        assert_eq "$IPERF_DATA_RC" "$rc" "iperf data error status"
+        assert_eq 1 "$(<"$calls_file")" "local data error was retried"
+        iperf_failure_is_unavailable 'the server is busy running a test. try again later' || fail "busy error was not classified as unavailable"
+        iperf_failure_is_unavailable 'unable to connect to server: Connection refused' || fail "connection error was not classified as unavailable"
+        if iperf_failure_is_unavailable 'invalid JSON output'; then fail "local parse error was classified as unavailable"; fi
+
+        require_root() { :; }; acquire_lock() { :; }; tc_dependencies() { :; }; require_commands() { :; }
+        peer_port_open() { return 1; }
+        if measure_sweep closed.example 5201 auto 0 0 0 0 5 1 3 0.1 0 5000 >/dev/null 2>&1; then
+            fail "closed public port reported sweep success"
+        else
+            rc=$?
+        fi
+        assert_eq "$IPERF_UNAVAILABLE_RC" "$rc" "closed peer status"
+    )
+}
+
 test_process_substitution_source_resolution() {
     local downloaded="$TEST_ROOT/downloaded.sh" resolved
     rm -f -- "$PERSIST_SCRIPT"
@@ -440,14 +772,54 @@ test_refine_preserves_throughput_stall_and_confirmation_gate() {
 }
 
 test_sweep_baseline_failure_stops_and_restores() {
-    local output="$TEST_ROOT/sweep-baseline-failure.log" restore_count=0
+    local output="$TEST_ROOT/sweep-baseline-failure.log" restore_count=0 rc=0
     sample_repeated() { return 7; }
     measure_restore() { ((restore_count+=1)); }
     if measure_sweep example.com 5201 auto 0 0 0 0 3 1 3 0.1 1 5000 >"$output" 2>&1; then
         fail "failed baseline sample reported sweep success"
+    else
+        rc=$?
     fi
+    assert_eq 7 "$rc" "baseline sample failure status"
     assert_eq 1 "$restore_count" "qdisc restore after baseline failure"
     if grep -Fqi 'division by 0' "$output"; then fail "baseline failure reached invalid sweep arithmetic"; fi
+}
+
+test_sweep_hard_cap_and_setup_failure_restore() {
+    (
+        local restore_count=0 max_rate=0 summary rc=0
+        require_root() { :; }; acquire_lock() { :; }; tc_dependencies() { :; }; require_commands() { :; }
+        peer_port_open() { :; }; detect_interface() { printf 'eth0\n'; }; qdisc_guard() { :; }
+        hardware_profile_values() {
+            HARDWARE_CLASS=standard; HARDWARE_LINK_MBIT=1000; HARDWARE_RX_QUEUES=1; HARDWARE_TX_QUEUES=1
+        }
+        measure_set_latency_baseline() { MEASURE_IDLE_RTT_MS=1; }
+        measure_begin() { MEASURE_IFACE=eth0; }
+        measure_restore() { ((restore_count+=1)); }
+        traffic_report() { :; }; apply_fq() { :; }
+        apply_shaping() { (( $2 > max_rate )) && max_rate="$2"; }
+        sample_repeated() {
+            local label="$6" rate=300
+            [[ "$label" =~ (rate|refine|confirm)-([0-9]+) ]] && rate="${BASH_REMATCH[2]}"
+            printf '%s\t0\t1000000\t0\t0\t0\tna\t0\t0\t0\t0\t0\t1\tna\n' "$rate"
+        }
+
+        measure_sweep example.com 5201 auto 300 100 1000 100 3 1 3 0.1 1 400
+        summary="$MEASURE_RUN_DIR/summary.tsv"
+        assert_eq 400 "$(summary_value "$summary" HIGH)" "explicit sweep cap clamps high"
+        assert_eq 400 "$max_rate" "no shaping sample exceeds explicit cap"
+        assert_eq 1 "$restore_count" "qdisc restore after capped sweep"
+
+        restore_count=0
+        expanded_scan_cap() { return 9; }
+        if measure_sweep example.com 5201 auto 0 0 0 0 3 1 3 0.1 1 5000 auto >/dev/null 2>&1; then
+            fail "scan-cap setup failure reported success"
+        else
+            rc=$?
+        fi
+        assert_eq 9 "$rc" "scan-cap setup failure status"
+        assert_eq 1 "$restore_count" "qdisc restore after scan-cap setup failure"
+    )
 }
 
 test_persistence_restart_hands_off_lock() {
@@ -484,7 +856,7 @@ test_install_failure_is_not_success() {
     require_root() { :; }; require_host_network_control() { :; }; require_systemd_runtime() { :; }
     acquire_lock() { :; }; require_commands() { :; }
     detect_interface() { printf 'eth0\n'; }; capture_baseline() { :; }; migrate_legacy_config() { :; }
-    qdisc_guard() { :; }; run_action_transaction() { shift; "$@"; }
+    qdisc_guard() { :; }; network_tuning_preflight() { :; }; run_action_transaction() { shift; "$@"; }
     load_config() { reset_config; }; apply_sysctl_profile() { :; }; apply_fq() { :; }; apply_initial_windows() { :; }
     save_config() { :; }; install_persistence() { return 9; }; systemctl() { fail "systemctl called after persistence failure"; }
     if install_base_tuning auto balanced mixed 0 0 >"$output" 2>&1; then fail "persistence failure reported success"; fi
@@ -563,7 +935,8 @@ test_action_transaction_rolls_back_failed_step() {
 test_auto_tune_commits_only_after_final_verify() {
     local events="" verify_fail=0 candidate_rejected=0 summary_dir="$TEST_ROOT/auto-summary"
     mkdir -p "$summary_dir"
-    WIZARD_PEER=example.com; WIZARD_PORT=5201
+    WIZARD_PEER=example.com; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0
+    WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0
     prepare_auto_tuning_runtime() { events+=" prepare"; }
     measure_sweep() {
         events+=" sweep"; MEASURE_RUN_DIR="$summary_dir"
@@ -599,6 +972,9 @@ test_auto_tune_commits_only_after_final_verify() {
     assert_eq 150 "$RTT_MS" "auto tuning RTT"
     assert_eq 1 "$(summary_value "$summary_dir/summary.tsv" PEER_RTT_MS)" "auto peer RTT history"
     assert_eq 150 "$(summary_value "$summary_dir/summary.tsv" TUNING_RTT_MS)" "auto tuning RTT history"
+    assert_eq example.com "$(summary_value "$summary_dir/summary.tsv" SWEEP_PEER)" "auto sweep peer history"
+    assert_eq 5201 "$(summary_value "$summary_dir/summary.tsv" SWEEP_PORT)" "auto sweep port history"
+    assert_eq 0 "$(summary_value "$summary_dir/summary.tsv" TOTAL_PUBLIC_PEER_FAILOVERS)" "auto failover history"
 
     events=""; verify_fail=1
     if auto_tune_execute eth0 balanced mixed 0 150 1; then fail "failed final verify reported auto success"; fi
@@ -611,6 +987,7 @@ test_cli_rejects_missing_and_ignored_options() {
     tc_trial() { called=1; }
     measure_probe() { called=1; }
     measure_verify() { called=1; }
+    measure_compare() { called=1; }
     kernel_status() { called=1; }
     kernel_install() { called=1; }
     dns_status() { called=1; }
@@ -626,6 +1003,10 @@ test_cli_rejects_missing_and_ignored_options() {
     if cmd_tc enable 100 --knee 90 >/dev/null 2>&1; then fail "knee below rate accepted"; fi
     if cmd_measure probe --peer example.com --low 50 >/dev/null 2>&1; then fail "ignored probe option accepted"; fi
     if cmd_measure verify --peer example.com --parallel 2 >/dev/null 2>&1; then fail "ignored verify parallel accepted"; fi
+    if cmd_measure compare --peer example.com --rate 100 --parallel 2 >/dev/null 2>&1; then fail "ignored compare parallel accepted"; fi
+    if cmd_measure probe --peer example.com --rounds 2 >/dev/null 2>&1; then fail "ignored probe rounds accepted"; fi
+    if cmd_measure compare --peer example.com >/dev/null 2>&1; then fail "missing compare rate accepted"; fi
+    if cmd_measure compare --peer example.com --rate 08 >/dev/null 2>&1; then fail "ambiguous compare rate accepted"; fi
     if cmd_kernel status --track lts >/dev/null 2>&1; then fail "ignored kernel status option accepted"; fi
     if cmd_kernel install --track edge >/dev/null 2>&1; then fail "invalid kernel track accepted"; fi
     if cmd_dns status plain >/dev/null 2>&1; then fail "extra DNS status argument accepted"; fi
@@ -639,10 +1020,11 @@ test_dns_apply_failure_restores_action_snapshot() {
     local restart_count=0
     rm -rf -- "$DNS_BACKUP_DIR"
     rm -f -- "$DNS_DROPIN" "$DNS_RESOLV_CONF"
-    mkdir -p -- "$(dirname "$DNS_DROPIN")" "$(dirname "$DNS_RESOLV_CONF")" "$DNS_BACKUP_DIR/baseline"
+    mkdir -p -- "$(dirname "$DNS_DROPIN")" "$(dirname "$DNS_RESOLV_CONF")" "$(dirname "$DNS_STUB_RESOLV")" "$DNS_BACKUP_DIR/baseline"
     printf 'incomplete\n' > "$DNS_BACKUP_DIR/baseline/partial"
     printf 'nameserver 192.0.2.53\n' > "$DNS_RESOLV_CONF"
     printf 'old-dropin\n' > "$DNS_DROPIN"
+    printf 'nameserver 127.0.0.53\n' > "$DNS_STUB_RESOLV"
     DNS_TRANSACTION_DIR=""
     require_root() { :; }; require_host_network_control() { :; }; require_systemd_runtime() { :; }
     acquire_lock() { :; }; require_commands() { :; }
@@ -709,11 +1091,20 @@ test_ipv6_failure_restores_runtime_and_persistent_file() {
 test_config_parser
 test_legacy_migration
 test_profile_math
+test_bbr_compatibility_guard_and_generation_reporting
+test_xanmod_cpu_level_and_track_selection
+test_hardware_aware_model
 test_managed_sysctl_runtime_verifier
 test_legacy_baseline_reference
 test_qdisc_replay_filters_kernel_runtime_fields
+test_mq_child_guard_and_restore
+test_managed_rate_unit_parsing
 test_tc_transaction
 test_measurement_math_and_history
+test_v71_measurement_metrics_and_confidence
+test_peak_core_cpu_detection
+test_adaptive_sampling_and_contamination_guard
+test_measure_compare_is_temporary_and_auditable
 test_systemd_generation
 test_baseline_captures_persistence_lifecycle
 test_persistent_artifact_consistency_verifier
@@ -723,9 +1114,12 @@ test_submenu_stays_until_explicit_return
 test_menu_exits_after_uninstall_signal
 test_peer_parser
 test_public_peer_requires_real_iperf_preflight
+test_public_peer_pool_and_formal_failover
+test_repeated_sample_classifies_peer_unavailable
 test_sweep_without_knee_does_not_recommend_ceiling
 test_refine_preserves_throughput_stall_and_confirmation_gate
 test_sweep_baseline_failure_stops_and_restores
+test_sweep_hard_cap_and_setup_failure_restore
 test_persistence_restart_hands_off_lock
 test_dependency_install_is_minimal
 test_process_substitution_source_resolution

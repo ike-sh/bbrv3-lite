@@ -2,15 +2,18 @@
 
 BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-当前版本：v7.0.7
+当前版本：v7.2.0
 
 项目不追求“sysctl 越多越好”。默认配置保持克制。命令行 `measure` 只给出结果；交互式 `auto` 会在一次总确认后完成测量、决策、应用和复验，未发现可信拐点时保持纯 FQ。
 
 ## 核心能力
 
-- BBR + FQ 基础调优，以及可选的 BDP/RAM 自适应缓冲区。
+- BBR + FQ 基础调优，以及按 CPU、内存、网卡队列、可信链路速率、实测带宽和业务 RTT 计算的硬件感知调优模型。
+- 覆盖 256 MiB 小型 VPS 到 100G 级服务器的分档预算：低内存机降低缓冲区下限，高 BDP/大内存机按需放宽到约 2 GiB 的 Linux signed-sysctl 边界；listen/SYN backlog 与 `netdev_max_backlog` 同步按资源上限分级。
 - `HTB root -> FQ leaf` 接口聚合出口整形，不用 FQ `maxrate` 冒充总限速。
-- `iperf3 -J` JSON 探测、粗扫、细扫、边界复测和测速流量统计。
+- `iperf3 -J` JSON 探测、粗扫、细扫、边界复测和测速流量统计；同时记录负载 RTT p95、bufferbloat、每 GiB 重传、全机/峰值单核 CPU、steal 与后台流量污染。
+- 基准档和最终复验采用 2–3 次自适应采样；离散度过高会自动补样，持续不稳定或受污染时停止并回滚，不拿可疑样本生成推荐值。
+- 安全的 `measure compare` 交错 A/B 对照 FQ 与指定 HTB/FQ 速率，输出吞吐、负载延迟、标准化重传、置信度和结论，结束后恢复原 qdisc 且不持久化。
 - 三问式自动向导：带宽、测速对端、业务用途；执行前集中展示耗时、流量和落盘位置。
 - 公共 iperf3 节点先按 RTT 筛选，再用低流量真实会话排除繁忙或伪开放端口；正式样本短暂失败会自动重试。
 - 交互式子菜单会停留在当前模块，结果确认后再清屏重绘；只有选择 `0` 才返回主菜单。
@@ -28,12 +31,12 @@ BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原
 ```mermaid
 flowchart LR
     CLI["CLI / 交互菜单"] --> CFG["严格配置解析"]
-    CLI --> DETECT["机器与默认出口检测"]
-    CLI --> MEASURE["probe / sweep"]
+    CLI --> DETECT["硬件/NIC/默认出口检测"]
+    CLI --> MEASURE["probe / sweep / verify / compare"]
     MEASURE --> TEMP["临时 HTB + FQ"]
     TEMP --> RESULT["历史样本与推荐值"]
     CFG --> APPLY["事务化 apply"]
-    APPLY --> SYSCTL["BBR + sysctl profile"]
+    APPLY --> SYSCTL["BBR + hardware-aware sysctl"]
     APPLY --> TC["HTB aggregate -> FQ leaf"]
     APPLY --> SERVICE["bbrv3-lite.service"]
     APPLY --> BASELINE["不可覆盖的可信基线"]
@@ -92,8 +95,8 @@ sudo bbr auto
 1. 保存首次可信基线和本次操作回滚点，临时应用 BBR + FQ。
 2. 已知带宽时先用约 40% 速率做路径预检。
 3. 以与最终配置相同的 `HTB -> FQ` 层级粗扫/细扫 policer 边界。
-4. 粗扫、精扫和候选确认使用相同的重传/吞吐效率判据；确认失败不生成推荐值。
-5. 临时应用候选速率，完成单流和四流最终复验。
+4. 粗扫、精扫和候选确认使用相同的重传/吞吐效率判据；基准与确认样本按离散度自动补到最多 3 次，确认失败不生成推荐值。
+5. 临时应用候选速率，完成单流和硬件自适应多流最终复验；单核机使用 2 流，普通机器使用 4 流，10G/40G 级机器最多使用 8/16 流。同时采集负载 RTT、标准化重传、后台流量和 CPU steal，持续污染或不稳定直接失败。
 6. 只有最终复验通过才写配置、安装服务；任一步失败恢复操作开始前的 qdisc、sysctl、配置和服务状态。
 
 中途任何关键步骤失败都会返回非零并执行事务回滚；不会留下本轮未验证的 HTB、配置或服务，也不会继续打印“安装成功”。
@@ -108,7 +111,7 @@ sudo bbr detect --target 你的业务目标或近端iperf服务器
 sudo bbr kernel status
 ```
 
-`detect` 输出内核、虚拟化、内存、默认出口、驱动、MTU、链路速率、RX 队列、BBR 可用性和可选目标 RTT，不修改系统。
+`detect` 输出内核、虚拟化、CPU/内存、硬件档位、默认出口、驱动、MTU、链路速率可信度、RX/TX 队列、TSO/GSO/GRO 状态、BBR 可用性/兼容性和可选目标 RTT，不修改系统。标准 BBRv1/BBRv3 都通过内核名称 `bbr` 暴露，和本项目兼容；如果当前使用 `bbr2`、`bbrplus` 等第三方变体，检测页会显示 conflict，任何安装/刷新操作也会在写入前停止，避免静默替换及遗留 sysctl 混用。虚拟网卡报告的 10G/100G 数值只展示，不会在没有实测或显式带宽时直接当作真实线路能力。
 
 ### 2. 按需安装 XanMod
 
@@ -119,7 +122,9 @@ sudo bbr kernel install --track lts
 sudo reboot
 ```
 
-重启后再次执行 `sudo bbr kernel status`。XanMod 官方 APT 当前只面向 amd64 Debian 系发行版；ARM64 社区内核不再由本项目自动下载和安装，避免把未经项目控制的第三方内核带入默认信任链。
+重启后再次执行 `sudo bbr kernel status`。XanMod 官方 APT 当前只面向 amd64 Debian 系发行版；ARM64 社区内核不再由本项目自动下载和安装，避免把未经项目控制的第三方内核带入默认信任链。CPU 包等级按 x86-64 psABI 完整特性集保守判断（包含 SSE3、F16C、LZCNT 等容易漏判的位）；Main 只选择 Main 的 x64v2/v3 包，绝不为兼容老 CPU 静默改装 LTS，x64v1 机器应明确使用 `--track lts`。
+
+BBRv3 自身不会和 FQ 或本项目的 HTB → FQ 层级冲突：BBR 使用标准 TCP pacing，HTB 仅作为本机出口的聚合速率边界，FQ 仍负责叶子流调度。本项目也不改写 BBRv3 可选的 ECN/`ecn_low` 路由策略。需要注意，Linux 运行时只报告拥塞控制名 `bbr`，官方 BBRv3 源码并不提供可通用读取的代际接口，因此普通内核上无法仅凭 `sysctl` 或供应商 `modinfo version` 严格证明 v3；XanMod 状态只显示“按发行版默认预期为 v3”，不会再误报为已验证。
 
 ### 3. 安装基础调优
 
@@ -136,7 +141,9 @@ sudo bbr explain --profile adaptive --role proxy --bandwidth 1000 --rtt 180
 sudo bbr install --profile adaptive --role proxy --bandwidth 1000 --rtt 180
 ```
 
-`balanced` 使用 16 MiB TCP 自动调优上限。`adaptive` 使用 `2 × BDP`，同时受 16 MiB 下限、RAM/32 和 256 MiB 绝对上限约束。`--rtt` 表示业务调优 RTT，而不是最近测速节点的 RTT。两种 profile 都不会修改 `tcp_mem`、`tcp_adv_win_scale`、TIME_WAIT、端口范围、VM、文件句柄或 RPS/RFS。
+`balanced` 以 16 MiB 为目标，但在低内存系统上会自动降到硬件安全预算。`adaptive` 使用 `2 × BDP`，下限按内存分为 4/8/16 MiB，上限同时受 RAM/32 和 8 MiB–约 2 GiB 的平台分档约束。16 GiB 级机器可超过旧版 256 MiB 固定上限，64 GiB 级机器可抵达 Linux signed-sysctl 边界，但只有实际 BDP 需要时才会扩大。`--rtt` 表示业务调优 RTT，而不是最近测速节点的 RTT。
+
+系统还会依据用途、CPU、内存与有效带宽计算 `somaxconn`、`tcp_max_syn_backlog` 和 `netdev_max_backlog`，并在 `explain`、`status` 与生成的 sysctl 文件中写明模型、来源和结果。两种 profile 都不会自动修改 `tcp_mem`、`tcp_adv_win_scale`、TIME_WAIT、端口范围、VM、文件句柄、IRQ affinity、网卡 offload 或 RPS/RFS；这些项目依赖具体驱动、NUMA 和业务线程布局，盲目统一设置反而可能降低性能或造成乱序。
 
 ### 4. 准备可信 iperf3 对端
 
@@ -150,7 +157,7 @@ iperf3 -s
 sudo bbr measure deps
 ```
 
-自动向导可在用户明确选择后，从 Leaseweb、OVH、Clouvider 的公共测速节点中筛选 120ms 内的对端，并对公开端口执行 1 秒、1 Mbit/s 的真实 iperf3 预检，不再把“TCP 端口已打开”误判为“测速服务可用”。正式样本失败会输出服务端或超时原因并最多尝试 3 次，再失败则安全结束并恢复操作前 qdisc。公共节点仍可能限速或路径不稳定；自有、同机房或低 RTT 的 iperf3 服务器始终是推荐方案。测量结果代表 VPS 到该对端路径，不代表所有业务目的地。
+自动向导可在用户明确选择后，从 Leaseweb、OVH、Clouvider 的公共测速节点中筛选 120ms 内的对端，并对公开端口执行 1 秒、1 Mbit/s 的真实 iperf3 预检，不再把“TCP 端口已打开”误判为“测速服务可用”。它会预留最多 4 个候选，优先保留不同主机，并在可用时为首选主机预留一个备用端口；正式样本连续 3 次遇到 busy、超时或连接类临时故障时，先恢复本轮 qdisc，再从备用对端重新开始完整 sweep。最终复验只允许切换扫描主机上的备用端口；该主机全部不可用时会执行总事务回滚，不会拿其他路径验证旧基线。JSON/本地执行、TC、sysctl 等错误不会触发误切换。公共节点仍可能限速或路径不稳定；自有、同机房或低 RTT 的 iperf3 服务器始终是推荐方案。测量结果代表 VPS 到该对端路径，不代表所有业务目的地。
 
 ### 5. 探测与扫描
 
@@ -176,21 +183,35 @@ sudo bbr measure sweep \
   --margin 3 --loss-threshold 0.1 --cap 5000
 ```
 
+不传 `--cap` 时使用硬件感知上限：可信物理链路按线速留 25% 余量，未知或虚拟链路先使用 5000 Mbit/s；取得不限速基准后，自动模式会把规划上限扩展到基准的 1.5 倍（最高 1,000,000 Mbit/s），因此不会再因旧版固定 5G 上限而跳过 10G/25G/100G 机器。显式 `--cap` 是人工硬上限：即使同时给出更大的 `--high`，实际扫描上界也会收敛到 `--cap`，不会发出超限整形样本。
+
 扫描流程：
 
 1. 保存操作前 qdisc 和接口流量计数器。
-2. 使用 root FQ 做两次不超过 5 秒的单流不限速 JSON 测试并取中位数；超过 `--cap` 时停止扫描。
+2. 使用 root FQ 做两次不超过 5 秒的单流不限速 JSON 测试并取中位数；自动模式按基准更新扫描上限，高于 10G/40G 时把后续样本缩短到 4/3 秒，兼顾稳定性和流量消耗。只有显式硬上限被超过时才停止扫描。
 3. 建立低速率重传本底。
 4. 使用与最终部署完全相同的 HTB/FQ 层级向上粗扫。
 5. 用低速干净档的 `goodput / HTB rate` 校准协议开销；粗扫和细扫都要求吞吐增益及效率比保持正常。
-6. 对最后干净档位退让 `--margin`，再进行两次确认；确认吞吐或重传不合格时不输出推荐值。
+6. 对最后干净档位退让 `--margin`，进行至少两次确认；吞吐离散度超过 6% 时自动增加第三次样本，仍不稳定或确认吞吐/重传不合格时不输出推荐值。
 7. 保存样本并恢复操作前 qdisc。
 
-结果保存在 `/var/lib/bbrv3-lite/history/`。自动调优生成的扫描摘要还会记录 `PEER_RTT_MS`、`TUNING_RTT_MS`、`TUNING_RTT_SOURCE` 和 `ROLE`，便于审计缓冲区决策。这里显示的 `RETRANS_RATIO_EST_PERCENT` 是“iperf3 retransmits / 按 1448 字节估算的 TCP 段数”，用于寻找相对跳变，不是抓包意义上的真实丢包率。
+结果保存在 `/var/lib/bbrv3-lite/history/`。`samples.tsv` 除原始吞吐与重传外，还记录 `RETRANS_PER_GIB`、空闲 RTT、负载 RTT 中位数/p95、bufferbloat p95、未归因后台 TX、CPU busy/steal 和污染标记。摘要记录硬件档位、链路/队列、扫描上限、采样时长、多流数量、样本离散度、实际样本数以及 0–100 的置信度；`high/medium/low` 不是线路评级，而是对“本轮测量是否足以支撑结论”的审计信息。自动调优摘要还会记录 `PEER_RTT_MS`、`TUNING_RTT_MS`、`TUNING_RTT_SOURCE`、`ROLE`、最终复验 peer 和公共节点切换次数。
+
+这里显示的 `RETRANS_RATIO_EST_PERCENT` 是“iperf3 retransmits / 按 1448 字节估算的 TCP 段数”，用于寻找相对跳变，不是抓包意义上的真实丢包率。`RETRANS_PER_GIB` 则把重传次数按发送 1 GiB 归一化，适合比较不同持续时间和吞吐的样本，但同样不等同于丢包率。
 
 扫描同时观察相对重传跳变、吞吐增益连续停滞和相对低速干净档的效率下降。扫描到上界仍无可信边界时不会错误地把上界当作推荐值，而是保持纯 FQ。不限速路径自身重传过高时，默认拒绝给出 policer 结论；自定义 `--low/--high` 不会绕过保护，只有显式 `--force-scan` 才继续。
 
-### 6. 试跑和持久化
+### 6. 临时 A/B 对照
+
+对扫描得到的候选速率做交错 A/B 复验，不改配置、不安装服务：
+
+```bash
+sudo bbr measure compare --peer 192.0.2.10 --rate 420 --duration 6 --rounds 2
+```
+
+第 1 轮按 FQ → HTB/FQ 执行，第 2 轮反向执行，降低固定先后顺序造成的路径漂移偏差。命令比较中位吞吐、每 GiB 重传和 bufferbloat p95，并给出 `improved`、`neutral` 或 `regressed`。这个结论只针对当前 peer 和测试时段；若负载 RTT无法采集，仍会保留吞吐/重传结果，但置信度降级。无论成功、失败还是中断，命令都恢复进入前的 qdisc，摘要中的 `PERSISTED=0` 可用于审计。
+
+### 7. 试跑和持久化
 
 ```bash
 # 临时试跑，不写配置、不安装服务
@@ -213,10 +234,10 @@ sudo bbr tc disable
 
 - HTB 只负责接口聚合出口上限。
 - FQ 只负责流隔离和 pacing，不设置每流 `maxrate`。
-- HTB `burst` 根据 `rate / 内核 CONFIG_HZ`、MTU 和 32 KiB 下限动态计算，并限制在 8 MiB 以内；无法读取内核配置时保守使用 250Hz。不会用 `getconf CLK_TCK` 的用户态 USER_HZ 代替内核调度频率。
+- HTB `burst` 根据 `rate / 内核 CONFIG_HZ`、MTU 和 32 KiB 下限动态计算，绝对上限约 2 GiB，可覆盖 1 Tbit/s@100Hz；普通速率仍只得到对应的小 bucket。无法读取内核配置时保守使用 250Hz，不会用 `getconf CLK_TCK` 的用户态 USER_HZ 代替内核调度频率。
 - `cburst` 使用 `2 × MTU`；单 class 场景的 quantum 使用 `10 × MTU`，最大 60000 字节。
 - 固定 handle 为 `1:`、`1:10`、`10:`，重复执行使用 `replace`，不会不断叠加层级。
-- FQ/FQ-CoDel 会保存并重放 `tc qdisc show` 可恢复的参数；发现未知 root qdisc（例如自建 CAKE）时拒绝覆盖。
+- FQ/FQ-CoDel 会保存并重放 `tc qdisc show` 可恢复的参数；多队列物理网卡的 `mq` 根节点会逐硬件队列保存并重建 FQ/FQ-CoDel/PFIFO 叶子。发现未知 root qdisc（例如自建 CAKE），或 `mq` 下存在无法安全重放的自定义叶子时拒绝覆盖。
 
 本工具只处理 egress，不自动创建 IFB，也不做 ingress shaping。
 
@@ -357,7 +378,7 @@ bash scripts/validate.sh
 
 ```bash
 docker run --rm --cap-add NET_ADMIN -v "$PWD:/src:ro" debian:12 \
-  bash -lc 'apt-get update -qq && apt-get install -y -qq iproute2 procps util-linux >/dev/null && bash /src/tests/integration_tc.sh'
+  bash -lc 'apt-get update -qq && apt-get install -y -qq iproute2 procps util-linux iperf3 jq iputils-ping coreutils >/dev/null && bash /src/tests/integration_tc.sh && bash /src/tests/integration_measure.sh'
 ```
 
 生成 release 校验文件：
@@ -415,7 +436,7 @@ tag 推送会触发 Release 工作流，验证 tag 与脚本版本一致，并�
 
 - 修复精扫只检查重传、忽略吞吐平台的问题；粗扫、精扫、候选确认统一使用重传与动态效率门槛。
 - 自动向导和交互扫描默认不再强制绕过高重传基线；只有显式 `--force-scan` 才允许继续。
-- 候选确认或最终单双流复验不达标时不生成、不持久化推荐速率。
+- 候选确认或最终单流/自适应多流复验不达标时不生成、不持久化推荐速率。
 - 自动调优改为临时应用后复验，全部通过才提交配置和 systemd 服务；失败恢复操作前 qdisc、sysctl、配置及服务状态。
 - `install`、`tc enable`、`tc disable` 纳入同一事务回滚框架，TC 拐点和退让比例在修改系统前完成验证。
 - 测量历史同秒运行不再互相覆盖，流量提示明确区分计划样本和失败重试。
@@ -423,12 +444,43 @@ tag 推送会触发 Release 工作流，验证 tag 与脚本版本一致，并�
 - DNS 与 IPv6 使用原子首次基线和本次操作事务；服务验证、文件切换或部分 sysctl 写入失败时恢复操作前状态。
 - TCP/TC、DNS 和 IPv6 高层修改入口增加容器保护；需要持久化的入口在修改前验证 systemd 确实可用。
 - 自动调优不再把就近测速节点 RTT 直接当作业务 RTT；按业务用途设置 100/150ms 下限，并在测量摘要中记录测速值、调优值和决策来源。
-- adaptive 缓冲区下限提升到 16 MiB；状态页显示调优模型和缓冲区上限，运行时一致性验证覆盖全部受管 sysctl。
-- HTB burst 改为读取真实内核 `CONFIG_HZ`（不可用时按 250Hz），增加 8 MiB 上限并明确拒绝以 USER_HZ 代替。
+- adaptive 缓冲区使用按内存分级的 4/8/16 MiB 下限与最高约 2 GiB 上限；状态页显示硬件、网卡、队列预算和缓冲区上限，运行时一致性验证覆盖全部受管 sysctl。
+- HTB burst 读取真实内核 `CONFIG_HZ`（不可用时按 250Hz），上限由旧版 8 MiB 扩展到 512 MiB 以覆盖高速网卡，并明确拒绝以 USER_HZ 代替。
 - TCP 基线补全持久化脚本及新旧 systemd unit 的启用/运行状态；恢复时重建父目录并还原服务生命周期。
 - `verify` 增加持久化文件一致性检查，状态页直接显示 systemd 脚本是否与当前命令同步。
 - 自更新改为当前命令与 systemd 副本的事务式替换，第二处写入失败时自动回滚，并保留更新前 `.previous`。
 - 独立安装器使用同目录原子替换，严格拒绝重复/无效参数及相对 prefix，不覆盖或删除非本项目的同名文件。
+
+## v7.0.8 修复重点
+
+- 修复公共 iperf3 节点通过低流量预检后，在正式采样时返回 `server is busy` 就终止整个自动调优的问题。
+- 公共模式预留最多 4 个候选，优先覆盖不同主机，并在可用时为首选主机保留一个备用端口；当前对端连续不可用时恢复该轮 TC 快照并从备用对端重新开始，全部不可用才执行总事务回滚。
+- 对端不可用使用独立退出状态传递，只有 busy、超时、连接类采样失败以及明确的路径不适合才允许换节点；JSON/本地执行、TC 和 sysctl 错误仍立即停止。
+- 最终单双流复验只允许切换 sweep 主机上的备用端口；跨主机必须重新建立完整基线，不能拼接成一次成功调优。
+- 扫描摘要分别记录 sweep peer、最终 verify peer、RTT 和切换次数，便于审计同路径不变量。
+
+## v7.1.0 测量升级重点
+
+- iperf3 正式样本同步采集 ICMP 负载延迟，历史中记录空闲 RTT、负载 RTT 中位数/p95 和 bufferbloat p95；目标不响应 ICMP 时保留吞吐/重传结论并降低置信度，不伪造 0ms。
+- 新增每 GiB 重传标准化指标，避免直接拿不同吞吐、不同持续时间的原始重传次数横向比较；保留旧重传比例估算用于拐点相对跳变判断。
+- 基准、低速本底、候选确认和最终单双流复验采用 2–3 次自适应采样；两次样本离散时自动补第三次，使用稳健离散度抵抗单个离群值，持续不稳定则停止。
+- 每个样本对照接口发送字节和 iperf payload，并读取 `/proc/stat` 的全机及逐核 CPU busy/steal，使用两者较高值；超出协议开销容差的后台流量、任一核心饱和或高 steal 会先重采，持续污染使用独立退出状态终止测量，降低把本地软中断/iperf 单核瓶颈误判成线路 policer 的风险。
+- 新增 `measure compare`：以交错顺序比较 FQ 和指定 HTB/FQ 速率，输出吞吐、bufferbloat、标准化重传、置信度与 A/B 结论；不写配置或服务，结束后恢复原 qdisc。
+- probe、sweep、verify、compare 摘要新增置信度分数、等级和扣分原因；自动调优把最终复验置信度回写到 sweep 摘要，便于追踪推荐值的证据质量。
+
+## v7.2.0 硬件感知调优重点
+
+- 新增 `micro/small/standard/high/extreme` 硬件档位，统一采集 CPU、内存、虚拟化、驱动、MTU、可信链路速率与 RX/TX 队列；`detect`、`explain`、`status` 和测量摘要使用同一模型，避免显示与实际计算分裂。
+- balanced/adaptive 缓冲区改为动态内存预算：小内存 VPS 不再强制承担 16 MiB 单 socket 上限，16–64 GiB 级高 BDP 服务器可按 RAM/32 从 512 MiB 扩展到约 2 GiB；仍以实际 `2 × BDP` 为目标，不因机器大就无条件占用大缓冲。
+- `somaxconn`/`tcp_max_syn_backlog` 与 `netdev_max_backlog` 按业务用途、CPU、内存和有效带宽分档，范围分别保持在 4096–16384 和 4096–32768，防止低配机器堆积过多包，也让高并发代理和高速机器不再固定使用 4096。
+- 自动扫描取消固定 5000 Mbit/s 硬封顶：物理链路可参考可信线速，虚拟链路线速不可信时由首轮实测动态扩展；10G/40G 以上后续采样自动缩短到 4/3 秒，并把最终多流复验扩大到 8/16 流。
+- HTB bucket 仍按 `rate/HZ` 精确生成，上限提升到 Linux signed-value 边界，覆盖 1 Tbit/s@100Hz，避免 25G/100G/400G 机器因整形器 token bucket 过小达不到目标速率；100M 等普通档位的 bucket 不变。
+- 多队列 `mq` 网卡的操作快照和首次基线会逐队列恢复受支持叶子参数；检测到自定义且无法可靠重放的叶子时在修改前拒绝接管。
+- 新增第三方 BBR 变体冲突保护、标准 BBR/BBRv3 兼容状态和更严格的代际措辞；修正 XanMod x86-64-v2/v3 特性判断及 Main/LTS 轨道串线风险。
+- 显式测速 `--cap` 成为真正硬上限；参数自适应阶段失败也通过统一出口恢复进入测量前的 qdisc。
+- 测速污染检测从全机平均 CPU 扩展到逐核峰值；单个 softirq/iperf 核心达到瓶颈时会重采或拒绝结论，不再因为“其他核心空闲”而把本机单核上限当成网络拐点。
+- 修改前新增网卡、qdisc 读取权限和受管 sysctl 能力预检；FQ/HTB 模块会尽早请求加载，真正应用后仍进行 HTB/FQ 层级及全部 sysctl 的严格验证。
+- 只诊断 TSO/GSO/GRO、单 RX 队列和 CPU/线速不匹配，不自动改 offload、IRQ affinity、RSS/RPS/RFS。Linux 内核文档明确说明这些配置依赖队列数量、CPU/NUMA 拓扑和应用位置，必须在真实负载下单独验证。
 
 ## v7 与旧版的差异
 

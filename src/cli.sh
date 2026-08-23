@@ -19,9 +19,10 @@ Usage:
   ${0##*/} measure deps
   ${0##*/} measure probe --peer HOST [--port 5201] [--duration 10] [--parallel 4]
   ${0##*/} measure verify --peer HOST [--port 5201] [--duration 10]
+  ${0##*/} measure compare --peer HOST --rate MBIT [--port 5201] [--duration 6] [--rounds 2]
   ${0##*/} measure sweep --peer HOST [--nominal MBIT] [--low MBIT --high MBIT]
                          [--step MBIT] [--duration 8] [--parallel 1]
-                         [--margin 3] [--loss-threshold 0.1] [--cap 5000] [--force-scan]
+                         [--margin 3] [--loss-threshold 0.1] [--cap MBIT] [--force-scan]
   ${0##*/} kernel status|install [--track lts|main]|remove
   ${0##*/} dns status|apply [auto|dot|plain]|restore
   ${0##*/} ipv6 status|disable [temporary|permanent]|restore
@@ -92,7 +93,7 @@ cmd_detect() {
 cmd_install() { parse_common_profile_options "$@" || return 1; install_base_tuning "$CLI_INTERFACE" "$CLI_PROFILE" "$CLI_ROLE" "$CLI_BANDWIDTH" "$CLI_RTT"; }
 cmd_explain() {
     parse_common_profile_options "$@" || return 1
-    reset_config; SYSCTL_PROFILE="$CLI_PROFILE"; ROLE="$CLI_ROLE"; BANDWIDTH_MBIT="$CLI_BANDWIDTH"; RTT_MS="$CLI_RTT"
+    reset_config; SYSCTL_PROFILE="$CLI_PROFILE"; ROLE="$CLI_ROLE"; BANDWIDTH_MBIT="$CLI_BANDWIDTH"; RTT_MS="$CLI_RTT"; TC_INTERFACE="$CLI_INTERFACE"
     explain_sysctl_profile
 }
 
@@ -142,14 +143,16 @@ cmd_tc() {
 
 cmd_measure() {
     local action="${1:-}"; shift || true
-    local peer="" port=5201 iface=auto duration=10 parallel=4 nominal=0 low=0 high=0 step=0 margin=3 threshold=0.1 force=0 cap=5000
+    local peer="" port=5201 iface=auto duration=10 parallel=4 nominal=0 low=0 high=0 step=0 margin=3 threshold=0.1 force=0 cap=0
+    local rate=0 rounds=2
     if [[ "$action" == deps ]]; then
         require_no_arguments "measure deps" "$@" || return 1
         install_measure_dependencies
         return
     fi
-    [[ "$action" == probe || "$action" == sweep || "$action" == verify ]] || { die "measure 子命令应为 deps/probe/sweep/verify"; return 1; }
+    [[ "$action" == probe || "$action" == sweep || "$action" == verify || "$action" == compare ]] || { die "measure 子命令应为 deps/probe/sweep/verify/compare"; return 1; }
     [[ "$action" == sweep ]] && { duration=8; parallel=1; }
+    [[ "$action" == compare ]] && { duration=6; parallel=1; }
     while (($#)); do
         case "$1" in
             --peer) require_option_value "$@" || return 1; peer="$2"; shift 2 ;;
@@ -157,8 +160,14 @@ cmd_measure() {
             --interface) require_option_value "$@" || return 1; iface="$2"; shift 2 ;;
             --duration) require_option_value "$@" || return 1; duration="$2"; shift 2 ;;
             --parallel)
-                [[ "$action" != verify ]] || { die "measure verify 固定执行单流/四流，不接受 --parallel"; return 1; }
+                [[ "$action" != verify && "$action" != compare ]] || { die "measure $action 使用固定流数，不接受 --parallel"; return 1; }
                 require_option_value "$@" || return 1; parallel="$2"; shift 2
+                ;;
+            --rate|--rounds)
+                [[ "$action" == compare ]] || { die "measure $action 不支持参数: $1"; return 1; }
+                require_option_value "$@" || return 1
+                case "$1" in --rate) rate="$2" ;; --rounds) rounds="$2" ;; esac
+                shift 2
                 ;;
             --nominal|--low|--high|--step|--margin|--loss-threshold|--cap)
                 [[ "$action" == sweep ]] || { die "measure $action 不支持参数: $1"; return 1; }
@@ -177,8 +186,14 @@ cmd_measure() {
         esac
     done
     [[ -n "$peer" ]] || { die "需要 --peer HOST"; return 1; }
+    if [[ "$action" == compare ]]; then
+        is_uint "$rate" && (( rate >= 1 && rate <= 1000000 )) || { die "measure compare 需要 --rate 1–1000000"; return 1; }
+        is_uint "$rounds" && (( rounds >= 2 && rounds <= 5 )) || { die "measure compare --rounds 必须是 2–5"; return 1; }
+        is_uint "$duration" && (( duration >= 3 && duration <= 30 )) || { die "measure compare --duration 必须是 3–30 秒"; return 1; }
+    fi
     if [[ "$action" == probe ]]; then measure_probe "$peer" "$port" "$iface" "$duration" "$parallel"
     elif [[ "$action" == verify ]]; then measure_verify "$peer" "$port" "$iface" "$duration"
+    elif [[ "$action" == compare ]]; then measure_compare "$peer" "$port" "$iface" "$rate" "$duration" "$rounds"
     else measure_sweep "$peer" "$port" "$iface" "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$threshold" "$force" "$cap"; fi
 }
 
@@ -248,24 +263,117 @@ ensure_interactive_measure_dependencies() {
     require_commands iperf3 jq ping timeout || return 1
 }
 
+activate_public_peer_candidate() {
+    local index="$1" candidate host port rtt region provider
+    is_uint "$index" && (( index < ${#PUBLIC_PEER_CANDIDATES[@]} )) || return 1
+    candidate="${PUBLIC_PEER_CANDIDATES[$index]}"
+    IFS='|' read -r host port rtt region provider <<< "$candidate"
+    validate_peer "$host" "$port" || return 1
+    WIZARD_PEER="$host"; WIZARD_PORT="$port"; WIZARD_PEER_RTT="$rtt"
+    WIZARD_PEER_REGION="$region"; WIZARD_PEER_PROVIDER="$provider"; WIZARD_PUBLIC_INDEX="$index"
+}
+
 interactive_select_peer() {
     local choice spec
     printf '%s\n' '测速对端：' '  1) 自动选择公共节点（Leaseweb / OVH / Clouvider）' '  2) 自有 iperf3 服务器（推荐）'
     read -r -p '选择 [1]: ' choice || return 1
     case "${choice:-1}" in
-        1) spec=$(auto_pick_peer) || return 1 ;;
-        2) read -r -p '对端 HOST[:PORT]（IPv6 用 [ADDR]:PORT）: ' spec || return 1 ;;
+        1)
+            auto_pick_peer || return 1
+            WIZARD_PUBLIC_PEER=1; WIZARD_FAILOVERS=0
+            activate_public_peer_candidate 0 || return 1
+            return 0
+            ;;
+        2)
+            read -r -p '对端 HOST[:PORT]（IPv6 用 [ADDR]:PORT）: ' spec || return 1
+            ;;
         *) die "无效对端选择"; return 1 ;;
     esac
     parse_peer_spec "$spec" || return 1
     peer_port_open "$PEER_HOST" "$PEER_PORT" || { die "无法连接 $PEER_HOST:$PEER_PORT"; return 1; }
-    WIZARD_PEER="$PEER_HOST"; WIZARD_PORT="$PEER_PORT"
+    WIZARD_PUBLIC_PEER=0; WIZARD_PEER="$PEER_HOST"; WIZARD_PORT="$PEER_PORT"
+    WIZARD_PEER_RTT=0; WIZARD_PUBLIC_INDEX=0; WIZARD_FAILOVERS=0
+}
+
+auto_measure_with_peer_failover() {
+    local iface="$1" nominal="$2" index=0 count=1 rc path_rate
+    local duration="${WIZARD_SAMPLE_DURATION:-5}" cap="${WIZARD_SCAN_CAP:-5000}"
+    if (( ${WIZARD_PUBLIC_PEER:-0} )); then count=${#PUBLIC_PEER_CANDIDATES[@]}; fi
+    for ((index=0; index<count; index++)); do
+        if (( ${WIZARD_PUBLIC_PEER:-0} )); then
+            activate_public_peer_candidate "$index" || return 1
+            if (( index > 0 )); then
+                ((WIZARD_FAILOVERS+=1))
+                log WARN "切换到备用公共对端 $((index + 1))/${count}: $WIZARD_PEER:$WIZARD_PORT（$WIZARD_PEER_REGION/$WIZARD_PEER_PROVIDER，RTT ${WIZARD_PEER_RTT}ms）"
+            fi
+        fi
+        if (( nominal > 0 )); then
+            path_rate=$((nominal * 40 / 100)); ((path_rate < 1)) && path_rate=1
+            if measure_path_check "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$path_rate"; then
+                :
+            else
+                rc=$?
+                if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == 2) )); then
+                    (( index + 1 < count )) && continue
+                    break
+                fi
+                return "$rc"
+            fi
+        fi
+        if measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$nominal" 0 0 0 "$duration" 1 3 0.1 0 "$cap" auto; then
+            WIZARD_SWEEP_PEER="$WIZARD_PEER"
+            WIZARD_SWEEP_PORT="$WIZARD_PORT"
+            return 0
+        else
+            rc=$?
+        fi
+        if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == 2) )); then
+            (( index + 1 < count )) && continue
+            break
+        fi
+        return "$rc"
+    done
+    die "所有已预检的公共 iperf3 对端都不可用或不适合当前路径；请稍后重试或使用自有服务器"
+    return 1
+}
+
+auto_verify_with_peer_failover() {
+    local iface="$1" duration="$2" expected_rate="$3" min_efficiency="$4" baseline_loss="$5"
+    local sweep_peer="${WIZARD_SWEEP_PEER:-$WIZARD_PEER}" current_index="${WIZARD_PUBLIC_INDEX:-0}"
+    local candidate host index rc
+    if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1; then
+        return 0
+    else
+        rc=$?
+    fi
+    (( ${WIZARD_PUBLIC_PEER:-0} && rc == IPERF_UNAVAILABLE_RC )) || return "$rc"
+
+    # The acceptance thresholds come from the sweep path. A different host may
+    # have a different bottleneck, so final verification may only change ports
+    # on the same host. Cross-host failover must restart the complete sweep.
+    for ((index=0; index<${#PUBLIC_PEER_CANDIDATES[@]}; index++)); do
+        (( index != current_index )) || continue
+        candidate="${PUBLIC_PEER_CANDIDATES[$index]}"
+        host="${candidate%%|*}"
+        [[ "$host" == "$sweep_peer" ]] || continue
+        activate_public_peer_candidate "$index" || return 1
+        ((WIZARD_FAILOVERS+=1))
+        log WARN "最终复验切换到同主机备用端口: $WIZARD_PEER:$WIZARD_PORT"
+        if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1; then
+            return 0
+        else
+            rc=$?
+        fi
+        (( rc == IPERF_UNAVAILABLE_RC )) || return "$rc"
+    done
+    die "扫描主机 $sweep_peer 的可用端口在最终复验阶段全部不可用；为保持同路径基线，不会切换到其他主机"
+    return "$IPERF_UNAVAILABLE_RC"
 }
 
 auto_tune_execute() {
     local iface="$1" profile="$2" role="$3" nominal="$4" tuning_rtt="$5" peer_rtt="${6:-0}"
-    local path_rate summary recommend knee measured no_knee confirmed reject_reason min_efficiency baseline_loss expected_rate=0
-    local role_floor rtt_source
+    local summary recommend knee measured no_knee confirmed reject_reason min_efficiency baseline_loss expected_rate=0
+    local role_floor rtt_source verify_summary verify_confidence_score verify_confidence_grade verify_confidence_reasons
     prepare_auto_tuning_runtime "$iface" auto "$profile" "$role" "$nominal" "$tuning_rtt" || return 1
     if [[ -z "${WIZARD_PEER:-}" ]]; then
         verify_runtime_tuning "$iface" || return 1
@@ -275,11 +383,11 @@ auto_tune_execute() {
         show_status
         return 0
     fi
-    if (( nominal > 0 )); then
-        path_rate=$((nominal * 40 / 100)); ((path_rate < 1)) && path_rate=1
-        measure_path_check "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$path_rate" || return 1
+    auto_measure_with_peer_failover "$iface" "$nominal" || return 1
+    if (( ${WIZARD_PUBLIC_PEER:-0} )); then
+        peer_rtt="${WIZARD_PEER_RTT:-0}"
+        tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
     fi
-    measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$nominal" 0 0 0 5 1 3 0.1 0 5000 auto || return 1
     summary="$MEASURE_RUN_DIR/summary.tsv"
     recommend=$(summary_value "$summary" RECOMMEND)
     knee=$(summary_value "$summary" BROKE_AT); knee="${knee:-0}"
@@ -291,8 +399,8 @@ auto_tune_execute() {
     baseline_loss=$(summary_value "$summary" CLEAN_BASE_RETRANS_RATIO_EST_PERCENT); baseline_loss="${baseline_loss:-0}"
     role_floor=$(role_tuning_rtt_floor "$role") || return 1
     if (( peer_rtt > role_floor )); then rtt_source="observed-peer"; else rtt_source="role-floor"; fi
-    printf 'PEER_RTT_MS\t%s\nTUNING_RTT_MS\t%s\nTUNING_RTT_SOURCE\t%s\nROLE\t%s\n' \
-        "$peer_rtt" "$tuning_rtt" "$rtt_source" "$role" >> "$summary" || return 1
+    printf 'SWEEP_PEER\t%s\nSWEEP_PORT\t%s\nPEER_RTT_MS\t%s\nTUNING_RTT_MS\t%s\nTUNING_RTT_SOURCE\t%s\nROLE\t%s\nPUBLIC_PEER_FAILOVERS\t%s\n' \
+        "${WIZARD_SWEEP_PEER:-$WIZARD_PEER}" "${WIZARD_SWEEP_PORT:-$WIZARD_PORT}" "$peer_rtt" "$tuning_rtt" "$rtt_source" "$role" "${WIZARD_FAILOVERS:-0}" >> "$summary" || return 1
 
     if [[ -n "$reject_reason" || ( -n "$knee" && "$knee" != 0 && "$confirmed" != 1 ) ]]; then
         die "扫描候选值未通过确认测试（${reject_reason:-unconfirmed}），不会应用或持久化"
@@ -312,10 +420,27 @@ auto_tune_execute() {
         log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
     fi
     verify_runtime_tuning "$iface" || return 1
-    measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1 || return 1
+    auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss" || return 1
+    verify_summary="$MEASURE_RUN_DIR/summary.tsv"
+    verify_confidence_score=$(summary_value "$verify_summary" CONFIDENCE_SCORE); verify_confidence_score="${verify_confidence_score:-0}"
+    verify_confidence_grade=$(summary_value "$verify_summary" CONFIDENCE_GRADE); verify_confidence_grade="${verify_confidence_grade:-unknown}"
+    verify_confidence_reasons=$(summary_value "$verify_summary" CONFIDENCE_REASONS); verify_confidence_reasons="${verify_confidence_reasons:-unavailable}"
+    if (( ${WIZARD_FAILOVERS:-0} > 0 )) && is_uint "$verify_confidence_score"; then
+        verify_confidence_score=$((verify_confidence_score - 10)); (( verify_confidence_score < 0 )) && verify_confidence_score=0
+        if (( verify_confidence_score >= 90 )); then verify_confidence_grade=high
+        elif (( verify_confidence_score >= 65 )); then verify_confidence_grade=medium
+        else verify_confidence_grade=low
+        fi
+        if [[ "$verify_confidence_reasons" == clean ]]; then verify_confidence_reasons="peer-failover"
+        else verify_confidence_reasons="${verify_confidence_reasons},peer-failover"
+        fi
+    fi
+    printf 'FINAL_VERIFY_PEER\t%s\nFINAL_VERIFY_PORT\t%s\nTOTAL_PUBLIC_PEER_FAILOVERS\t%s\nFINAL_VERIFY_CONFIDENCE_SCORE\t%s\nFINAL_VERIFY_CONFIDENCE_GRADE\t%s\nFINAL_VERIFY_CONFIDENCE_REASONS\t%s\n' \
+        "$WIZARD_PEER" "$WIZARD_PORT" "${WIZARD_FAILOVERS:-0}" "$verify_confidence_score" "$verify_confidence_grade" "$verify_confidence_reasons" >> "$summary" || return 1
     persist_current_tuning || return 1
     printf '\n'
     log OK "自动调优、复验和持久化提交完成"
+    log INFO "最终复验置信度: ${verify_confidence_grade} (${verify_confidence_score}/100, ${verify_confidence_reasons})"
     show_status
     log INFO "扫描记录: $summary"
 }
@@ -326,7 +451,8 @@ auto_tune_wizard() {
     require_systemd_runtime || return 1
     [[ -t 0 ]] || { die "auto 向导需要交互终端"; return 1; }
     local bandwidth_input nominal=0 role_choice role=mixed peer_rtt=0 tuning_rtt=0 profile=balanced estimate="动态估算" iface rc rollback_rc=0
-    WIZARD_PEER=""; WIZARD_PORT=5201
+    WIZARD_PEER=""; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PUBLIC_INDEX=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0
+    WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SCAN_CAP=5000; WIZARD_SAMPLE_DURATION=5
     printf '\n%s v%s 自动调优\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
     printf '首次修改前会保存不可覆盖的基线：%s\n' "$BASELINE_DIR"
     printf '包含本工具涉及的 sysctl、配置/服务、qdisc/class，以及 IPv4/IPv6 路由快照。\n\n'
@@ -341,35 +467,44 @@ auto_tune_wizard() {
 
     if [[ "$nominal" != 0 || "$bandwidth_input" == a || "$bandwidth_input" == auto ]]; then
         interactive_select_peer || return 1
-        peer_rtt=$(median_ping_ms "$WIZARD_PEER"); [[ -n "$peer_rtt" ]] || peer_rtt=0
+        peer_rtt="${WIZARD_PEER_RTT:-0}"
+        if (( peer_rtt == 0 )); then peer_rtt=$(median_ping_ms "$WIZARD_PEER"); [[ -n "$peer_rtt" ]] || peer_rtt=0; fi
     fi
 
     printf '%s\n' '用途：1) 混合业务  2) 代理/转发  3) 大文件吞吐'
     read -r -p '选择 [1]: ' role_choice || return 1
     case "${role_choice:-1}" in 1) role=mixed ;; 2) role=proxy ;; 3) role=bulk ;; *) die "无效用途"; return 1 ;; esac
     tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
+    iface=$(detect_interface auto) || return 1
+    WIZARD_SCAN_CAP=$(recommended_scan_cap "$iface" "$nominal") || return 1
+    WIZARD_SAMPLE_DURATION=$(recommended_measure_duration "$iface" "$nominal") || return 1
     if (( nominal > 0 && tuning_rtt > 0 )); then
         profile=adaptive
-        estimate="约 $(human_bytes "$(estimate_sweep_bytes "$((nominal * 13 / 10))" 5 20)") 上行"
+        estimate="约 $(human_bytes "$(estimate_sweep_bytes "$((nominal * 13 / 10))" "$WIZARD_SAMPLE_DURATION" 20)") 上行"
     elif [[ -n "${WIZARD_PEER:-}" ]]; then
-        estimate="将按实测带宽动态计算，扫描上限 5000 Mbit/s"
+        estimate="将按实测带宽动态计算，扫描上限 ${WIZARD_SCAN_CAP} Mbit/s"
     else
         estimate="不运行测速"
     fi
 
     printf '\n执行摘要\n'
-    printf '  网卡/用途       auto / %s\n' "$role"
+    hardware_profile_values "$iface" "$nominal" || return 1
+    printf '  网卡/用途       %s / %s\n' "$iface" "$role"
+    printf '  硬件模型        %s / %s CPU / %s MiB / RX:TX %s:%s\n' "$HARDWARE_CLASS" "$HARDWARE_CPU_COUNT" "$HARDWARE_MEMORY_MB" "$HARDWARE_RX_QUEUES" "$HARDWARE_TX_QUEUES"
+    printf '  链路/采样       %s Mbit（%s）/ %ss\n' "$HARDWARE_LINK_MBIT" "$HARDWARE_LINK_TRUST" "$WIZARD_SAMPLE_DURATION"
+    printf '  扫描策略        初始上限 %s Mbit；自动测量后可按基准扩展\n' "$WIZARD_SCAN_CAP"
     printf '  标称带宽        %s\n' "$([[ "$bandwidth_input" == a || "$bandwidth_input" == auto ]] && echo 自动测量 || echo "${nominal} Mbit/s")"
     if [[ -n "${WIZARD_PEER:-}" ]]; then
         printf '  iperf3 对端     %s:%s（测速 RTT %sms）\n' "$WIZARD_PEER" "$WIZARD_PORT" "${peer_rtt:-unknown}"
+        if (( WIZARD_PUBLIC_PEER )); then printf '  公共备用对端    %s 个（正式采样不可用时自动切换）\n' "$(( ${#PUBLIC_PEER_CANDIDATES[@]} - 1 ))"; fi
         printf '  缓冲区调优 RTT  %sms（按用途下限与测速 RTT 取较大值）\n' "$tuning_rtt"
     fi
     printf '  预计时间/流量   约 3–8 分钟 / %s\n' "$estimate"
     printf '  持久化位置      %s + %s\n' "$CONFIG_FILE" "$SERVICE_FILE"
     confirm "确认开始？" || { log INFO "已取消，未修改系统"; return 0; }
 
-    iface=$(detect_interface auto) || return 1
     qdisc_guard "$iface" || return 1
+    BANDWIDTH_MBIT="$nominal"; network_tuning_preflight "$iface" 1 || return 1
     action_transaction_begin "$iface" || return 1
     if auto_tune_execute "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" "$peer_rtt"; then
         action_transaction_commit
@@ -416,13 +551,17 @@ invalid_menu_choice() {
 }
 
 measurement_action() {
-    local choice="$1"
+    local choice="$1" rate
     ensure_interactive_measure_dependencies || return 1
     interactive_select_peer || return 1
     case "$choice" in
-        1) measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto 0 0 0 0 5 1 3 0.1 0 5000 ;;
+        1) measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto 0 0 0 0 5 1 3 0.1 0 0 ;;
         2) measure_probe "$WIZARD_PEER" "$WIZARD_PORT" auto 8 4 ;;
         3) measure_verify "$WIZARD_PEER" "$WIZARD_PORT" auto 8 ;;
+        4)
+            read -r -p 'A/B 整形速率 Mbit/s: ' rate || return 1
+            measure_compare "$WIZARD_PEER" "$WIZARD_PORT" auto "$rate" 6 2
+            ;;
     esac
 }
 
@@ -430,10 +569,10 @@ measurement_menu() {
     local choice
     while true; do
         ui_clear
-        printf '%s\n' '测量与复验' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/四流复验' '0) 返回主菜单'
+        printf '%s\n' '测量与复验' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/硬件自适应多流复验' '4) FQ 与整形 A/B 对照' '0) 返回主菜单'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
-            1|2|3) submenu_run measurement_action "$choice" || return 90 ;;
+            1|2|3|4) submenu_run measurement_action "$choice" || return 90 ;;
             0) return 0 ;;
             *) invalid_menu_choice ;;
         esac

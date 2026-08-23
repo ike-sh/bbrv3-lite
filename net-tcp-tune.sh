@@ -3,7 +3,7 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="7.0.7"
+SCRIPT_VERSION="7.2.0"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
@@ -357,11 +357,163 @@ detect_mtu() { cat "/sys/class/net/$1/mtu" 2>/dev/null || printf '1500\n'; }
 detect_link_speed() {
     local value
     value=$(cat "/sys/class/net/$1/speed" 2>/dev/null || true)
-    if is_uint "${value:-}" && (( value > 0 )); then printf '%s\n' "$value"; else printf 'unknown\n'; fi
+    # Some virtual drivers expose UINT32_MAX or another sentinel instead of a
+    # usable line rate. Treat anything beyond the CLI's supported 1 Tbit/s
+    # range as unknown rather than feeding it into buffer/traffic estimates.
+    if is_uint "${value:-}" && (( value > 0 && value <= 1000000 )); then printf '%s\n' "$value"; else printf 'unknown\n'; fi
 }
-detect_rx_queues() { find "/sys/class/net/$1/queues" -maxdepth 1 -type d -name 'rx-*' 2>/dev/null | wc -l | awk '{print $1}'; }
-detect_driver() { basename "$(readlink -f "/sys/class/net/$1/device/driver" 2>/dev/null)" 2>/dev/null || printf 'virtual\n'; }
-memory_mb() { awk '/MemTotal:/ {printf "%d\n", $2/1024}' /proc/meminfo; }
+detect_rx_queues() {
+    local count
+    count=$(find "/sys/class/net/$1/queues" -maxdepth 1 -type d -name 'rx-*' 2>/dev/null | wc -l | awk '{print $1}')
+    is_uint "${count:-}" && (( count > 0 )) && printf '%s\n' "$count" || printf '1\n'
+}
+detect_tx_queues() {
+    local count
+    count=$(find "/sys/class/net/$1/queues" -maxdepth 1 -type d -name 'tx-*' 2>/dev/null | wc -l | awk '{print $1}')
+    is_uint "${count:-}" && (( count > 0 )) && printf '%s\n' "$count" || printf '1\n'
+}
+detect_driver() {
+    local path
+    path=$(readlink -f "/sys/class/net/$1/device/driver" 2>/dev/null || true)
+    [[ -n "$path" ]] && basename "$path" || printf 'virtual\n'
+}
+detect_offload_summary() {
+    local iface="$1" output feature value summary="" key
+    command_exists ethtool || { printf 'unavailable (ethtool not installed)\n'; return 0; }
+    output=$(ethtool -k "$iface" 2>/dev/null || true)
+    [[ -n "$output" ]] || { printf 'unavailable\n'; return 0; }
+    for key in tcp-segmentation-offload generic-segmentation-offload generic-receive-offload; do
+        value=$(awk -F': ' -v key="$key" '$1==key {print $2; exit}' <<< "$output")
+        value="${value%% *}"
+        case "$key" in tcp-segmentation-offload) feature=tso ;; generic-segmentation-offload) feature=gso ;; *) feature=gro ;; esac
+        [[ -n "$value" ]] && summary+="${summary:+ }${feature}=${value}"
+    done
+    printf '%s\n' "${summary:-unavailable}"
+}
+memory_mb() {
+    local value
+    value=$(awk '/MemTotal:/ {printf "%d\n", $2/1024; exit}' /proc/meminfo 2>/dev/null || true)
+    is_uint "${value:-}" && (( value > 0 )) && printf '%s\n' "$value" || printf '1024\n'
+}
+cpu_count() {
+    local value
+    value=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || true)
+    is_uint "${value:-}" && (( value > 0 )) && printf '%s\n' "$value" || printf '1\n'
+}
+
+hardware_class_for() {
+    local cpu="$1" ram="$2"
+    if (( ram < 768 || cpu <= 1 )); then printf 'micro\n'
+    elif (( ram < 2048 || cpu <= 2 )); then printf 'small\n'
+    elif (( ram < 8192 || cpu <= 8 )); then printf 'standard\n'
+    elif (( ram < 32768 || cpu <= 32 )); then printf 'high\n'
+    else printf 'extreme\n'
+    fi
+}
+
+# Populate a single, auditable hardware model used by sysctl sizing, scan
+# bounds and status output. The configured/observed bandwidth always wins over
+# a NIC-reported line rate because virtual NIC speeds are often synthetic.
+hardware_profile_values() {
+    local requested="${1:-auto}" configured_bandwidth="${2:-0}" iface="" link="unknown"
+    is_uint "$configured_bandwidth" && (( configured_bandwidth <= 1000000 )) || {
+        die "硬件模型带宽无效: $configured_bandwidth"
+        return 1
+    }
+    HARDWARE_CPU_COUNT=$(cpu_count)
+    HARDWARE_MEMORY_MB=$(memory_mb)
+    iface=$(detect_interface "$requested" 2>/dev/null || true)
+    if [[ -n "$iface" ]]; then
+        link=$(detect_link_speed "$iface")
+        HARDWARE_RX_QUEUES=$(detect_rx_queues "$iface")
+        HARDWARE_TX_QUEUES=$(detect_tx_queues "$iface")
+        HARDWARE_MTU=$(detect_mtu "$iface")
+        HARDWARE_DRIVER=$(detect_driver "$iface")
+    else
+        HARDWARE_RX_QUEUES=1; HARDWARE_TX_QUEUES=1; HARDWARE_MTU=1500; HARDWARE_DRIVER=unknown
+    fi
+    HARDWARE_LINK_MBIT="$link"
+    HARDWARE_CLASS=$(hardware_class_for "$HARDWARE_CPU_COUNT" "$HARDWARE_MEMORY_MB")
+    HARDWARE_VIRTUALIZATION=$(virtualization_type)
+    HARDWARE_LINK_TRUST=trusted
+    if [[ "$link" == unknown ]]; then
+        HARDWARE_LINK_TRUST=unknown
+    elif [[ "$HARDWARE_VIRTUALIZATION" != none ]]; then
+        HARDWARE_LINK_TRUST=virtual-untrusted
+    else
+        case "$HARDWARE_DRIVER" in virtual|virtio*|veth|vmxnet*|xen*|hv_netvsc) HARDWARE_LINK_TRUST=virtual-untrusted ;; esac
+    fi
+    if (( configured_bandwidth > 0 )); then
+        EFFECTIVE_BANDWIDTH_MBIT="$configured_bandwidth"
+        EFFECTIVE_BANDWIDTH_SOURCE="configured"
+    elif [[ "$HARDWARE_LINK_TRUST" == trusted ]] && is_uint "$link" && (( link > 0 )); then
+        EFFECTIVE_BANDWIDTH_MBIT="$link"
+        EFFECTIVE_BANDWIDTH_SOURCE="link"
+    else
+        EFFECTIVE_BANDWIDTH_MBIT=1000
+        if [[ "$HARDWARE_LINK_TRUST" == virtual-untrusted ]]; then EFFECTIVE_BANDWIDTH_SOURCE="virtual-link-fallback"
+        else EFFECTIVE_BANDWIDTH_SOURCE="fallback"
+        fi
+    fi
+}
+
+recommended_scan_cap() {
+    local requested="${1:-auto}" nominal="${2:-0}" cap=5000 link
+    hardware_profile_values "$requested" "$nominal" || return 1
+    link="$HARDWARE_LINK_MBIT"
+    if (( nominal > 0 )); then cap=$((nominal * 3 / 2)); fi
+    if [[ "$HARDWARE_LINK_TRUST" == trusted ]] && is_uint "$link" && (( link > 0 && link * 5 / 4 > cap )); then cap=$((link * 5 / 4)); fi
+    (( cap < 5000 )) && cap=5000
+    (( cap > 1000000 )) && cap=1000000
+    printf '%s\n' "$cap"
+}
+
+expanded_scan_cap() {
+    local current="$1" measured="$2" observed
+    is_uint "$current" && (( current >= 100 && current <= 1000000 )) || { die "扫描上限无效: $current"; return 1; }
+    is_decimal "$measured" || { die "基准吞吐无效: $measured"; return 1; }
+    observed=$(awk -v g="$measured" 'BEGIN {v=g*1.5; if(v<5000)v=5000; if(v>1000000)v=1000000; printf "%d", v+0.5}')
+    if (( observed > current )); then printf '%s\n' "$observed"; else printf '%s\n' "$current"; fi
+}
+
+recommended_measure_duration() {
+    local requested="${1:-auto}" bandwidth="${2:-0}"
+    hardware_profile_values "$requested" "$bandwidth" || return 1
+    if (( EFFECTIVE_BANDWIDTH_MBIT >= 40000 )); then printf '3\n'
+    elif (( EFFECTIVE_BANDWIDTH_MBIT >= 10000 )); then printf '4\n'
+    else printf '5\n'
+    fi
+}
+
+recommended_verify_flows() {
+    local requested="${1:-auto}" bandwidth="${2:-0}" flows=4 capacity
+    hardware_profile_values "$requested" "$bandwidth" || return 1
+    capacity="$HARDWARE_CPU_COUNT"
+    if (( HARDWARE_CPU_COUNT <= 1 )); then flows=2
+    elif (( EFFECTIVE_BANDWIDTH_MBIT >= 40000 )); then flows=16
+    elif (( EFFECTIVE_BANDWIDTH_MBIT >= 10000 )); then flows=8
+    else flows=4
+    fi
+    (( flows > capacity * 2 )) && flows=$((capacity * 2))
+    (( flows < 2 )) && flows=2
+    (( flows > 16 )) && flows=16
+    printf '%s\n' "$flows"
+}
+
+hardware_scaling_note() {
+    local cpu="$HARDWARE_CPU_COUNT" rx="$HARDWARE_RX_QUEUES" bandwidth="$EFFECTIVE_BANDWIDTH_MBIT"
+    if (( bandwidth >= 2500 && rx == 1 && cpu >= 4 )); then
+        printf 'single RX queue may limit multi-Gbit throughput; inspect RSS/RPS and IRQ affinity\n'
+    elif (( bandwidth >= 10000 && cpu <= 2 )); then
+        printf 'CPU count may limit line-rate processing; validate CPU saturation during load\n'
+    elif (( bandwidth >= 40000 )); then
+        printf 'aggregate HTB can become the local bottleneck at this rate; require clean per-core CPU metrics and A/B verification\n'
+    elif [[ "$EFFECTIVE_BANDWIDTH_SOURCE" == fallback || "$EFFECTIVE_BANDWIDTH_SOURCE" == virtual-link-fallback ]]; then
+        printf 'line rate is unknown or virtual; using 1000 Mbit planning until measured/configured\n'
+    else
+        printf 'no obvious hardware queue bottleneck detected\n'
+    fi
+}
 
 median_ping_ms() {
     local target="$1" family="${2:-auto}" output
@@ -375,7 +527,7 @@ median_ping_ms() {
 }
 
 detect_profile() {
-    local requested="${1:-auto}" target="${2:-}" iface rtt="not measured"
+    local requested="${1:-auto}" target="${2:-}" iface rtt="not measured" cc available
     require_commands ip awk uname || return 1
     iface=$(detect_interface "$requested") || return 1
     if [[ -n "$target" ]]; then
@@ -387,7 +539,7 @@ detect_profile() {
     printf '%-18s %s\n' "Kernel" "$(uname -r)"
     printf '%-18s %s\n' "Architecture" "$(uname -m)"
     printf '%-18s %s\n' "Virtualization" "$(virtualization_type)"
-    printf '%-18s %s\n' "CPU cores" "$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo '?')"
+    printf '%-18s %s\n' "CPU cores" "$(cpu_count)"
     printf '%-18s %s MB\n' "Memory" "$(memory_mb)"
     printf '%-18s %s\n' "Interface" "$iface"
     printf '%-18s %s\n' "Driver" "$(detect_driver "$iface")"
@@ -397,10 +549,20 @@ detect_profile() {
     [[ "$link_speed" == unknown ]] || link_speed="${link_speed} Mbps"
     printf '%-18s %s\n' "Link speed" "$link_speed"
     printf '%-18s %s\n' "RX queues" "$(detect_rx_queues "$iface")"
+    printf '%-18s %s\n' "TX queues" "$(detect_tx_queues "$iface")"
+    printf '%-18s %s\n' "NIC offloads" "$(detect_offload_summary "$iface")"
+    hardware_profile_values "$iface" 0 || return 1
+    printf '%-18s %s\n' "Hardware class" "$HARDWARE_CLASS"
+    printf '%-18s %s\n' "Link trust" "$HARDWARE_LINK_TRUST"
+    printf '%-18s %s Mbit (%s)\n' "Planning bandwidth" "$EFFECTIVE_BANDWIDTH_MBIT" "$EFFECTIVE_BANDWIDTH_SOURCE"
+    printf '%-18s %s\n' "Scaling note" "$(hardware_scaling_note)"
     [[ "$rtt" == "not measured" || "$rtt" == unreachable ]] || rtt="${rtt} ms"
     printf '%-18s %s\n' "Target RTT" "$rtt"
-    printf '%-18s %s\n' "Congestion control" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-    printf '%-18s %s\n' "Available CC" "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)"
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)
+    printf '%-18s %s\n' "Congestion control" "$cc"
+    printf '%-18s %s\n' "Available CC" "$available"
+    printf '%-18s %s\n' "BBR compatibility" "$(bbr_compatibility_status "$cc" "$available")"
 }
 
 install_measure_dependencies() {
@@ -479,7 +641,7 @@ capture_runtime_sysctls() {
         net.core.default_qdisc net.ipv4.tcp_congestion_control \
         net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
         net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen net.core.somaxconn \
-        net.core.netdev_max_backlog; do
+        net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog; do
         value=$(sysctl -n "$key" 2>/dev/null || true)
         [[ -n "$value" ]] && printf '%s\t%s\n' "$key" "$value"
     done
@@ -570,8 +732,53 @@ baseline_provenance() {
 # -----------------------------------------------------------------------------
 
 BALANCED_BUFFER_MAX=16777216
-ADAPTIVE_BUFFER_FLOOR=16777216
-BUFFER_ABSOLUTE_CAP=268435456
+BUFFER_ABSOLUTE_CAP=2147483647
+
+hardware_tuning_values() {
+    local role="$1" bandwidth="$2" requested="${3:-${TC_INTERFACE:-auto}}"
+    local desired_floor memory_cap platform_cap backlog_limit
+    hardware_profile_values "$requested" "$bandwidth" || return 1
+
+    # Keep the per-socket ceiling proportional to available RAM. Low-memory
+    # VPSes no longer inherit a forced 16 MiB floor, while large-memory systems
+    # can reach the signed sysctl ceiling (about 2 GiB) when BDP actually needs it.
+    if (( HARDWARE_MEMORY_MB < 512 )); then desired_floor=4194304; platform_cap=8388608
+    elif (( HARDWARE_MEMORY_MB < 1024 )); then desired_floor=8388608; platform_cap=16777216
+    elif (( HARDWARE_MEMORY_MB < 2048 )); then desired_floor=16777216; platform_cap=33554432
+    elif (( HARDWARE_MEMORY_MB < 4096 )); then desired_floor=16777216; platform_cap=67108864
+    elif (( HARDWARE_MEMORY_MB < 8192 )); then desired_floor=16777216; platform_cap=134217728
+    elif (( HARDWARE_MEMORY_MB < 12288 )); then desired_floor=16777216; platform_cap=268435456
+    elif (( HARDWARE_MEMORY_MB < 24576 )); then desired_floor=16777216; platform_cap=536870912
+    elif (( HARDWARE_MEMORY_MB < 49152 )); then desired_floor=16777216; platform_cap=1073741824
+    else desired_floor=16777216; platform_cap=$BUFFER_ABSOLUTE_CAP
+    fi
+    memory_cap=$((HARDWARE_MEMORY_MB * 1024 * 1024 / 32))
+    (( memory_cap < 1048576 )) && memory_cap=1048576
+    (( platform_cap > BUFFER_ABSOLUTE_CAP )) && platform_cap=$BUFFER_ABSOLUTE_CAP
+    BUFFER_CAP="$memory_cap"; (( BUFFER_CAP > platform_cap )) && BUFFER_CAP="$platform_cap"
+    BUFFER_FLOOR="$desired_floor"; (( BUFFER_FLOOR > BUFFER_CAP )) && BUFFER_FLOOR="$BUFFER_CAP"
+    BUFFER_MEMORY_CAP="$memory_cap"
+    BUFFER_PLATFORM_CAP="$platform_cap"
+
+    SOMAXCONN=4096
+    if [[ "$role" == proxy ]] && (( HARDWARE_CPU_COUNT >= 4 && HARDWARE_MEMORY_MB >= 2048 )); then SOMAXCONN=8192; fi
+    if [[ "$role" == proxy ]] && (( HARDWARE_CPU_COUNT >= 16 && HARDWARE_MEMORY_MB >= 8192 )); then SOMAXCONN=16384; fi
+    if [[ "$role" == mixed ]] && (( EFFECTIVE_BANDWIDTH_MBIT >= 10000 && HARDWARE_CPU_COUNT >= 8 )); then SOMAXCONN=8192; fi
+    TCP_MAX_SYN_BACKLOG="$SOMAXCONN"
+
+    if (( EFFECTIVE_BANDWIDTH_MBIT <= 1000 )); then NETDEV_BACKLOG=4096
+    elif (( EFFECTIVE_BANDWIDTH_MBIT <= 10000 )); then NETDEV_BACKLOG=8192
+    elif (( EFFECTIVE_BANDWIDTH_MBIT <= 40000 )); then NETDEV_BACKLOG=16384
+    else NETDEV_BACKLOG=32768
+    fi
+    if (( HARDWARE_CPU_COUNT <= 1 || HARDWARE_MEMORY_MB < 1024 )); then backlog_limit=4096
+    elif (( HARDWARE_CPU_COUNT <= 2 || HARDWARE_MEMORY_MB < 2048 )); then backlog_limit=8192
+    elif (( HARDWARE_CPU_COUNT <= 4 )); then backlog_limit=16384
+    else backlog_limit=32768
+    fi
+    (( NETDEV_BACKLOG > backlog_limit )) && NETDEV_BACKLOG="$backlog_limit"
+    return 0
+}
 
 role_tuning_rtt_floor() {
     case "$1" in
@@ -589,8 +796,13 @@ recommended_tuning_rtt() {
 }
 
 ensure_bbr_available() {
+    local available current
+    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    if [[ "$current" == bbr* && "$current" != bbr ]]; then
+        die "检测到当前拥塞控制为第三方 BBR 变体 '$current'；为避免静默替换或与其 sysctl 冲突，已中止。请先人工切换到 cubic/标准 bbr 并确认迁移意图"
+        return 1
+    fi
     modprobe tcp_bbr 2>/dev/null || true
-    local available
     available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
     if ! grep -qw bbr <<< "$available"; then
         die "当前内核不提供 BBR；不会静默回退到 cubic"
@@ -598,45 +810,75 @@ ensure_bbr_available() {
     fi
 }
 
+bbr_compatibility_status() {
+    local current="${1:-}" available="${2:-}"
+    [[ -n "$current" ]] || current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+    [[ -n "$available" ]] || available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if [[ "$current" == bbr* && "$current" != bbr ]]; then
+        printf 'conflict: third-party variant %s would be replaced\n' "$current"
+    elif [[ "$current" == bbr ]]; then
+        printf 'compatible: standard bbr runtime API\n'
+    elif grep -qw bbr <<< "$available"; then
+        printf 'ready: standard bbr is available\n'
+    else
+        printf 'unavailable\n'
+    fi
+}
+
+bbr_kernel_support_status() {
+    local available
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if grep -qw bbr <<< "$available"; then
+        printf 'available (built-in or loaded)\n'
+    elif modinfo tcp_bbr >/dev/null 2>&1; then
+        printf 'module present, not loaded\n'
+    else
+        printf 'unavailable\n'
+    fi
+}
+
 buffer_profile_values() {
-    local profile="$1" role="$2" bandwidth="$3" rtt="$4"
-    local ram bdp max cap floor="$ADAPTIVE_BUFFER_FLOOR" absolute_cap="$BUFFER_ABSOLUTE_CAP" default_r=131072 default_w=65536
-    ram=$(memory_mb)
+    local profile="$1" role="$2" bandwidth="$3" rtt="$4" requested="${5:-${TC_INTERFACE:-auto}}"
+    local bdp max default_r=131072 default_w=65536
+    hardware_tuning_values "$role" "$bandwidth" "$requested" || return 1
     if [[ "$profile" == balanced ]]; then
-        BUFFER_MAX="$BALANCED_BUFFER_MAX"
+        BUFFER_MAX="$BALANCED_BUFFER_MAX"; (( BUFFER_MAX > BUFFER_CAP )) && BUFFER_MAX="$BUFFER_CAP"
         BUFFER_R_DEFAULT=$default_r
         BUFFER_W_DEFAULT=$default_w
-        BUFFER_REASON="balanced fixed 16 MiB ceiling"
+        (( BUFFER_R_DEFAULT > BUFFER_MAX )) && BUFFER_R_DEFAULT="$BUFFER_MAX"
+        (( BUFFER_W_DEFAULT > BUFFER_MAX )) && BUFFER_W_DEFAULT="$BUFFER_MAX"
+        BUFFER_REASON="balanced ceiling, hardware-bounded by RAM/32"
         return 0
     fi
     (( bandwidth > 0 && rtt > 0 )) || { die "adaptive profile 需要 --bandwidth 和 --rtt"; return 1; }
-    # bytes = Mbps * ms * 125; keep two BDPs, bounded by RAM/32 and 256 MiB.
+    # bytes = Mbps * ms * 125; keep two BDPs and apply the hardware budget.
     bdp=$(( bandwidth * rtt * 125 ))
     max=$(( bdp * 2 ))
-    cap=$(( ram * 1024 * 1024 / 32 ))
-    (( cap > absolute_cap )) && cap=$absolute_cap
-    (( cap < floor )) && cap=$floor
-    (( max < floor )) && max=$floor
-    (( max > cap )) && max=$cap
+    (( max < BUFFER_FLOOR )) && max=$BUFFER_FLOOR
+    (( max > BUFFER_CAP )) && max=$BUFFER_CAP
     case "$role" in
         proxy) default_r=131072; default_w=65536 ;;
         mixed) default_r=262144; default_w=131072 ;;
-        bulk)  default_r=1048576; default_w=1048576 ;;
+        bulk)
+            default_r=1048576; default_w=1048576
+            (( EFFECTIVE_BANDWIDTH_MBIT >= 10000 )) && default_r=2097152 && default_w=2097152
+            ;;
     esac
     (( default_r > max )) && default_r=$max
     (( default_w > max )) && default_w=$max
     BUFFER_MAX=$max
     BUFFER_R_DEFAULT=$default_r
     BUFFER_W_DEFAULT=$default_w
-    BUFFER_REASON="2xBDP with 16 MiB floor, bounded by RAM/32 and 256 MiB"
+    BUFFER_REASON="2xBDP with hardware floor, bounded by RAM/32 and platform cap"
 }
 
 render_sysctl_profile() {
-    buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" || return 1
+    buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "${TC_INTERFACE:-auto}" || return 1
     cat <<EOF
 # Managed by ${SCRIPT_NAME} v${SCRIPT_VERSION}
 # profile=${SYSCTL_PROFILE} role=${ROLE} bandwidth=${BANDWIDTH_MBIT}Mbps tuning_rtt=${RTT_MS}ms
 # buffer_max=${BUFFER_MAX} (${BUFFER_REASON})
+# hardware=${HARDWARE_CLASS} cpu=${HARDWARE_CPU_COUNT} ram=${HARDWARE_MEMORY_MB}MiB link=${HARDWARE_LINK_MBIT}Mbit(${HARDWARE_LINK_TRUST}) queues=${HARDWARE_RX_QUEUES}/${HARDWARE_TX_QUEUES}
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = ${BUFFER_MAX}
@@ -645,21 +887,26 @@ net.ipv4.tcp_rmem = 4096 ${BUFFER_R_DEFAULT} ${BUFFER_MAX}
 net.ipv4.tcp_wmem = 4096 ${BUFFER_W_DEFAULT} ${BUFFER_MAX}
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fastopen = 3
-net.core.somaxconn = 4096
-net.core.netdev_max_backlog = 4096
+net.core.somaxconn = ${SOMAXCONN}
+net.ipv4.tcp_max_syn_backlog = ${TCP_MAX_SYN_BACKLOG}
+net.core.netdev_max_backlog = ${NETDEV_BACKLOG}
 EOF
 }
 
 explain_sysctl_profile() {
     render_sysctl_profile
-    printf '\n# Deliberately untouched: tcp_mem, tcp_adv_win_scale, TIME_WAIT, VM, file limits, RPS/RFS.\n'
+    printf '\n# Hardware model: class=%s, effective_bandwidth=%sMbit (%s), buffer_floor=%s, buffer_cap=%s.\n' \
+        "$HARDWARE_CLASS" "$EFFECTIVE_BANDWIDTH_MBIT" "$EFFECTIVE_BANDWIDTH_SOURCE" "$(human_bytes "$BUFFER_FLOOR")" "$(human_bytes "$BUFFER_CAP")"
+    printf '# Buffer bounds: memory_cap=%s, platform_cap=%s.\n' "$(human_bytes "$BUFFER_MEMORY_CAP")" "$(human_bytes "$BUFFER_PLATFORM_CAP")"
+    printf '# Scaling note: %s.\n' "$(hardware_scaling_note)"
+    printf '# Deliberately untouched: tcp_mem, tcp_adv_win_scale, TIME_WAIT, VM, file limits, IRQ affinity, NIC offloads and RPS/RFS.\n'
 }
 
 normalize_sysctl_words() { awk '{$1=$1; print}'; }
 
 verify_sysctl_profile_runtime() {
     local key expected actual rc=0
-    buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" || return 1
+    buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "${TC_INTERFACE:-auto}" || return 1
     while IFS=$'\t' read -r key expected; do
         actual=$(sysctl -n "$key" 2>/dev/null | normalize_sysctl_words || true)
         expected=$(normalize_sysctl_words <<< "$expected")
@@ -676,8 +923,9 @@ verify_sysctl_profile_runtime() {
         net.ipv4.tcp_wmem "4096 $BUFFER_W_DEFAULT $BUFFER_MAX" \
         net.ipv4.tcp_mtu_probing 1 \
         net.ipv4.tcp_fastopen 3 \
-        net.core.somaxconn 4096 \
-        net.core.netdev_max_backlog 4096)
+        net.core.somaxconn "$SOMAXCONN" \
+        net.ipv4.tcp_max_syn_backlog "$TCP_MAX_SYN_BACKLOG" \
+        net.core.netdev_max_backlog "$NETDEV_BACKLOG")
     return "$rc"
 }
 
@@ -751,20 +999,50 @@ apply_initial_windows() {
 # -----------------------------------------------------------------------------
 
 TC_SESSION_HTB_IFACE=""
-HTB_BURST_CAP=8388608
+# Enough for 1 Tbit/s even at CONFIG_HZ=100. The actual value remains rate/HZ,
+# so ordinary VPS rates do not inherit a large bucket merely because the cap
+# supports modern 25/100/400G NICs.
+HTB_BURST_CAP=2147483647
 
 tc_dependencies() { require_commands ip tc awk; }
 has_net_admin() { tc qdisc show >/dev/null 2>&1; }
 
+qdisc_module_hint() {
+    local kind="$1" module="sch_$1"
+    command_exists modprobe || return 0
+    modprobe -q "$module" 2>/dev/null || true
+    # A qdisc can be built into the kernel and therefore have no module entry.
+    # The real replace operation below remains the authoritative capability
+    # check and is always followed by structural verification.
+    return 0
+}
+
+network_tuning_preflight() {
+    local iface="$1" need_shaping="${2:-0}" key
+    tc_dependencies || return 1
+    [[ -e "/sys/class/net/$iface" ]] || { die "网卡不存在: $iface"; return 1; }
+    tc qdisc show dev "$iface" >/dev/null 2>&1 || { die "无法读取 $iface 的 qdisc；缺少 NET_ADMIN 或驱动不支持"; return 1; }
+    for key in default_qdisc rmem_max wmem_max somaxconn netdev_max_backlog; do
+        [[ -e "/proc/sys/net/core/$key" ]] || { die "内核缺少受管 sysctl: net.core.$key"; return 1; }
+    done
+    [[ -e /proc/sys/net/ipv4/tcp_congestion_control ]] || { die "内核缺少 TCP 拥塞控制 sysctl"; return 1; }
+    [[ -e /proc/sys/net/ipv4/tcp_max_syn_backlog ]] || { die "内核缺少 TCP SYN backlog sysctl"; return 1; }
+    qdisc_module_hint fq
+    (( need_shaping == 0 )) || qdisc_module_hint htb
+    hardware_profile_values "$iface" "${BANDWIDTH_MBIT:-0}" || return 1
+    log INFO "硬件预检: ${HARDWARE_CLASS}, ${HARDWARE_CPU_COUNT} CPU, ${HARDWARE_MEMORY_MB} MiB RAM, ${HARDWARE_RX_QUEUES}/${HARDWARE_TX_QUEUES} RX/TX queues, link ${HARDWARE_LINK_MBIT} Mbit"
+    log INFO "硬件建议: $(hardware_scaling_note)"
+}
+
 root_qdisc_kind() {
     local text
     text=$(tc qdisc show dev "$1" 2>/dev/null) || return 1
-    awk '$1=="qdisc" && $0 ~ / root / {print $2; exit}' <<< "$text"
+    awk '$1=="qdisc" && $0 ~ / root([[:space:]]|$)/ {print $2; exit}' <<< "$text"
 }
 
 qdisc_replay_args_from_stream() {
     awk '
-        $1=="qdisc" && $0~/ root / {
+        $1=="qdisc" && $0~/ root([[:space:]]|$)/ {
             seen=0; bands=3;
             for(i=1;i<=NF;i++) {
                 if(seen) {
@@ -783,6 +1061,50 @@ qdisc_replay_args_from_stream() {
 
 root_qdisc_replay_args() {
     tc qdisc show dev "$1" 2>/dev/null | qdisc_replay_args_from_stream
+}
+
+mq_child_replay_rows_from_stream() {
+    awk '
+        $1=="qdisc" && $0!~/ root([[:space:]]|$)/ {
+            parent=""; start=0; bands=3
+            for(i=1;i<=NF;i++) if($i=="parent" && $(i+1) ~ /^:[[:xdigit:]]+$/) {
+                parent=$(i+1); start=i+2; break
+            }
+            if(parent=="") next
+            kind=$2; out=""
+            for(i=start;i<=NF;i++) {
+                if($i=="refcnt") {i++; continue}
+                if($i=="bands") {bands=$(i+1); i++; continue}
+                if($i=="priomap") {i+=16; continue}
+                if($i=="weights") {i+=bands; continue}
+                token=$i; if(token ~ /^[0-9]+p$/) sub(/p$/, "", token)
+                out=out (out?" ":"") token
+            }
+            printf "%s\t%s\t%s\n", parent, kind, out
+        }'
+}
+
+mq_unsupported_child_qdiscs() {
+    local iface="$1"
+    tc qdisc show dev "$iface" 2>/dev/null | mq_child_replay_rows_from_stream |
+        awk -F'\t' '$2!="fq" && $2!="fq_codel" && $2!="pfifo_fast" && $2!="pfifo" && $2!="bfifo" && $2!="noqueue" {print $2 "@" $1}'
+}
+
+restore_mq_qdisc_snapshot() {
+    local iface="$1" file="$2" parent kind args_string
+    local -a args=()
+    tc qdisc replace dev "$iface" root mq >/dev/null 2>&1 || return 1
+    while IFS=$'\t' read -r parent kind args_string; do
+        [[ -n "$parent" && -n "$kind" ]] || continue
+        case "$kind" in
+            fq|fq_codel|pfifo_fast|pfifo|bfifo)
+                args=(); [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
+                tc qdisc replace dev "$iface" parent "$parent" "$kind" "${args[@]}" >/dev/null 2>&1 || return 1
+                ;;
+            noqueue) ;;
+            *) return 2 ;;
+        esac
+    done < <(mq_child_replay_rows_from_stream < "$file")
 }
 
 managed_htb() {
@@ -811,7 +1133,8 @@ managed_rate_mbit() {
     text=$(tc class show dev "$iface" 2>/dev/null) || return 1
     token=$(awk '$1=="class" && $2=="htb" && $3=="1:10" {for(i=1;i<=NF;i++) if($i=="rate") {print $(i+1); exit}}' <<< "$text")
     awk -v r="$token" 'BEGIN {
-        if (r ~ /Gbit$/) {sub(/Gbit$/, "", r); printf "%.0f\n", r*1000}
+        if (r ~ /Tbit$/) {sub(/Tbit$/, "", r); printf "%.0f\n", r*1000000}
+        else if (r ~ /Gbit$/) {sub(/Gbit$/, "", r); printf "%.0f\n", r*1000}
         else if (r ~ /Mbit$/) {sub(/Mbit$/, "", r); printf "%.0f\n", r}
         else if (r ~ /Kbit$/) {sub(/Kbit$/, "", r); printf "%.0f\n", r/1000}
     }'
@@ -838,11 +1161,19 @@ managed_htb_diagnostic() {
 }
 
 qdisc_guard() {
-    local iface="$1" kind detail
+    local iface="$1" kind detail unsupported
     kind=$(root_qdisc_kind "$iface") || { die "无法读取 $iface 的 root qdisc"; return 1; }
     if managed_htb "$iface" || session_owned_htb "$iface"; then return 0; fi
     case "$kind" in
-        ""|fq|fq_codel|noqueue|mq|pfifo_fast) return 0 ;;
+        ""|fq|fq_codel|noqueue|pfifo_fast) return 0 ;;
+        mq)
+            unsupported=$(mq_unsupported_child_qdiscs "$iface")
+            if [[ -n "$unsupported" ]]; then
+                die "拒绝覆盖含不可安全重放子队列的 mq（$iface；$unsupported）"
+                return 1
+            fi
+            return 0
+            ;;
         htb)
             detail=$(managed_htb_diagnostic "$iface")
             die "拒绝覆盖未管理的 root qdisc 'htb'（$iface；$detail）"
@@ -886,7 +1217,11 @@ restore_action_qdisc() {
             else return 1
             fi
             ;;
-        ""|noqueue|mq|pfifo_fast)
+        mq)
+            restore_mq_qdisc_snapshot "$iface" "$file" || return 1
+            if [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]]; then TC_SESSION_HTB_IFACE=""; fi
+            ;;
+        ""|noqueue|pfifo_fast)
             tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
             if [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]]; then TC_SESSION_HTB_IFACE=""; fi
             ;;
@@ -897,12 +1232,13 @@ restore_action_qdisc() {
 restore_qdisc_text_snapshot() {
     local iface="$1" file="$2" kind args_string
     local -a args=()
-    kind=$(awk '$1=="qdisc" && $0~/ root / {print $2; exit}' "$file" 2>/dev/null)
+    kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$file" 2>/dev/null)
     args_string=$(qdisc_replay_args_from_stream < "$file")
     [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
     case "$kind" in
         fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null 2>&1 || tc qdisc replace dev "$iface" root "$kind" ;;
-        ""|noqueue|mq|pfifo_fast) tc qdisc del dev "$iface" root 2>/dev/null || true ;;
+        mq) restore_mq_qdisc_snapshot "$iface" "$file" ;;
+        ""|noqueue|pfifo_fast) tc qdisc del dev "$iface" root 2>/dev/null || true ;;
         *) return 2 ;;
     esac
 }
@@ -948,6 +1284,7 @@ verify_shaping() {
 _apply_shaping_raw() {
     local iface="$1" rate="$2" mtu burst quantum cburst hierarchy_exists=0 kind
     is_uint "$rate" && (( rate > 0 && rate <= 1000000 )) || { die "非法整形速率: $rate"; return 1; }
+    qdisc_module_hint htb; qdisc_module_hint fq
     mtu=$(detect_mtu "$iface"); is_uint "$mtu" || mtu=1500
     burst=$(calc_htb_burst "$rate" "$mtu")
     quantum=$(calc_htb_quantum "$mtu")
@@ -986,7 +1323,7 @@ apply_shaping() {
 
 apply_fq() {
     local iface="$1" snapshot
-    tc_dependencies || return 1; qdisc_guard "$iface" || return 1
+    tc_dependencies || return 1; qdisc_guard "$iface" || return 1; qdisc_module_hint fq
     snapshot=$(mktemp) || return 1
     action_qdisc_snapshot "$iface" "$snapshot" || { rm -f -- "$snapshot"; return 1; }
     if ! tc qdisc replace dev "$iface" root fq || [[ "$(root_qdisc_kind "$iface")" != fq ]]; then
@@ -1004,6 +1341,7 @@ tc_trial() {
     local rate="$1" requested="${2:-auto}" iface
     is_uint "$rate" && (( rate > 0 && rate <= 1000000 )) || { die "非法整形速率: $rate"; return 1; }
     iface=$(detect_interface "$requested") || return 1
+    BANDWIDTH_MBIT="$rate"; network_tuning_preflight "$iface" 1 || return 1
     capture_baseline "$iface" || return 1
     apply_shaping "$iface" "$rate" || return 1
     log OK "临时整形已生效: $iface ${rate} Mbit（未写配置，重启后失效）"
@@ -1032,6 +1370,7 @@ tc_enable() {
     (( knee == 0 || knee >= rate )) || { die "拐点速率不能低于最终整形速率"; return 1; }
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
+    BANDWIDTH_MBIT="$rate"; network_tuning_preflight "$iface" 1 || return 1
     run_action_transaction "$iface" tc_enable_steps "$iface" "$rate" "$requested" "$knee" "$margin"
 }
 
@@ -1054,6 +1393,7 @@ tc_disable() {
     [[ "$requested" == auto && "$TC_INTERFACE" != auto ]] && requested="$TC_INTERFACE"
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
+    network_tuning_preflight "$iface" 0 || return 1
     run_action_transaction "$iface" tc_disable_steps "$iface"
 }
 
@@ -1078,6 +1418,12 @@ MEASURE_TX_START=0
 MEASURE_RX_START=0
 MEASURE_RESULT_FILE=""
 MEASURE_RUN_DIR=""
+MEASURE_IDLE_RTT_MS="na"
+IPERF_DATA_RC=65
+IPERF_CONTAMINATED_RC=66
+IPERF_UNSTABLE_RC=67
+IPERF_UNAVAILABLE_RC=75
+PUBLIC_PEER_CANDIDATES=()
 
 # Public endpoints are opt-in and used only by the interactive auto-tune wizard.
 # Providers and test traffic are disclosed before execution; a private iperf3 peer is preferred.
@@ -1111,20 +1457,32 @@ parse_peer_spec() {
     validate_peer "$PEER_HOST" "$PEER_PORT"
 }
 
-public_peer_port() {
-    local host="$1" port
+public_peer_ports() {
+    local host="$1" limit="${2:-1}" port found=0
+    is_uint "$limit" && (( limit >= 1 && limit <= 4 )) || limit=1
     for port in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200; do
         if peer_port_open "$host" "$port" && iperf_peer_usable "$host" "$port"; then
             printf '%s\n' "$port"
-            return 0
+            ((found+=1))
+            (( found < limit )) || return 0
         fi
     done
-    return 1
+    (( found > 0 ))
+}
+
+public_peer_port() {
+    public_peer_ports "$1" 1
 }
 
 auto_pick_peer() {
     require_commands ping timeout iperf3 jq || return 1
-    local temp host region provider rtt port line max_rtt="${BBRV3_PEER_MAX_RTT:-120}"
+    local temp host region provider rtt port max_rtt="${BBRV3_PEER_MAX_RTT:-120}"
+    local limit="${BBRV3_PUBLIC_PEER_CANDIDATES:-4}" per_host="${BBRV3_PUBLIC_PORTS_PER_HOST:-2}" candidate found rank
+    local primary_host="" preferred_extra="" primary_take index
+    local -a primary_candidates=() extra_candidates=() ordered_candidates=()
+    is_uint "$limit" && (( limit >= 2 && limit <= 8 )) || limit=4
+    is_uint "$per_host" && (( per_host >= 1 && per_host <= 4 )) || per_host=2
+    PUBLIC_PEER_CANDIDATES=()
     temp=$(mktemp -d) || return 1
     log INFO "正在按 RTT 筛选公共 iperf3 节点（Leaseweb / OVH / Clouvider）"
     while IFS='|' read -r host region provider; do
@@ -1137,19 +1495,63 @@ auto_pick_peer() {
     wait || true
     while IFS=$'\t' read -r rtt host region provider; do
         (( rtt <= max_rtt )) || { log INFO "$host ($region/$provider) RTT ${rtt}ms，过远跳过"; continue; }
-        if port=$(public_peer_port "$host"); then
-            log OK "公共对端已通过 iperf3 预检: $host:$port ($region/$provider, RTT ${rtt}ms)"
-            rm -rf -- "$temp"
-            printf '%s:%s\n' "$host" "$port"
-            return 0
-        fi
-        log INFO "$host ($region/$provider) 当前无可用测试端口"
+        found=0; rank=0
+        while IFS= read -r port; do
+            [[ -n "$port" ]] || continue
+            candidate="$host|$port|$rtt|$region|$provider"
+            if (( rank == 0 )); then primary_candidates+=("$candidate"); else extra_candidates+=("$candidate"); fi
+            ((found+=1)); ((rank+=1))
+        done < <(public_peer_ports "$host" "$per_host")
+        (( found > 0 )) || log INFO "$host ($region/$provider) 当前无可用测试端口"
+        # Prefer distinct hosts before reserving a second port on the same host.
+        (( ${#primary_candidates[@]} < limit )) || break
     done < <(cat "$temp"/* 2>/dev/null | sort -n)
     rm -rf -- "$temp"
-    die "120ms 内没有可用公共 iperf3 节点；请使用自有对端"
+    if ((${#primary_candidates[@]} > 0)); then
+        primary_host="${primary_candidates[0]%%|*}"
+        for candidate in "${extra_candidates[@]}"; do
+            if [[ "${candidate%%|*}" == "$primary_host" ]]; then preferred_extra="$candidate"; break; fi
+        done
+        primary_take=$limit
+        [[ -z "$preferred_extra" ]] || primary_take=$((limit - 1))
+        for ((index=0; index<${#primary_candidates[@]} && index<primary_take; index++)); do
+            ordered_candidates+=("${primary_candidates[$index]}")
+        done
+        [[ -z "$preferred_extra" ]] || ordered_candidates+=("$preferred_extra")
+        for ((; index<${#primary_candidates[@]}; index++)); do ordered_candidates+=("${primary_candidates[$index]}"); done
+        for candidate in "${extra_candidates[@]}"; do
+            [[ "$candidate" == "$preferred_extra" ]] || ordered_candidates+=("$candidate")
+        done
+    fi
+    for candidate in "${ordered_candidates[@]}"; do
+        [[ -n "$candidate" ]] || continue
+        PUBLIC_PEER_CANDIDATES+=("$candidate")
+        IFS='|' read -r host port rtt region provider <<< "$candidate"
+        if (( ${#PUBLIC_PEER_CANDIDATES[@]} == 1 )); then
+            log OK "公共对端已通过 iperf3 预检: $host:$port ($region/$provider, RTT ${rtt}ms)"
+        else
+            log INFO "已保留备用公共对端: $host:$port ($region/$provider, RTT ${rtt}ms)"
+        fi
+        (( ${#PUBLIC_PEER_CANDIDATES[@]} < limit )) || break
+    done
+    ((${#PUBLIC_PEER_CANDIDATES[@]} > 0)) || { die "${max_rtt}ms 内没有可用公共 iperf3 节点；请使用自有对端"; return 1; }
 }
 
 interface_counter() { cat "/sys/class/net/$1/statistics/$2" 2>/dev/null || printf '0\n'; }
+
+measure_set_latency_baseline() {
+    local peer="$1" value=""
+    MEASURE_IDLE_RTT_MS="na"
+    [[ "$(uname -s 2>/dev/null || true)" == Linux ]] || return 0
+    command_exists ping || return 0
+    value=$(median_ping_ms "$peer" 2>/dev/null || true)
+    if is_decimal "$value"; then
+        MEASURE_IDLE_RTT_MS="$value"
+        log INFO "空闲 RTT 基线: ${value} ms"
+    else
+        log WARN "未取得空闲 RTT；吞吐和重传仍会测量，但负载延迟与置信度会降级"
+    fi
+}
 
 measure_begin() {
     local iface="$1"
@@ -1216,18 +1618,155 @@ iperf_peer_usable() {
     return "$rc"
 }
 
+iperf_failure_is_unavailable() {
+    local reason="${1,,}"
+    case "$reason" in
+        *server*busy*|*busy*running*a*test*|*unable*to*connect*|*connection*refused*|*connection*timed*out*|*connection*reset*|*control*socket*closed*|*network*is*unreachable*|*no*route*to*host*|*broken*pipe*|*temporarily*unavailable*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+percentile_95_numbers() {
+    sort -n | awk '{a[NR]=$1} END {if(NR) {i=int((NR*95+99)/100); if(i<1)i=1; if(i>NR)i=NR; print a[i]}}'
+}
+
+max_numbers() { sort -n | tail -n 1; }
+
+median_or_na() {
+    if (($#)); then printf '%s\n' "$@" | median_numbers; else printf 'na\n'; fi
+}
+
+max_or_na() {
+    if (($#)); then printf '%s\n' "$@" | max_numbers; else printf 'na\n'; fi
+}
+
+latency_stats_from_file() {
+    local file="$1" values median p95
+    values=$(sed -n -E 's/.*time[=<]([0-9]+([.][0-9]+)?)[[:space:]]*ms.*/\1/p' "$file" 2>/dev/null || true)
+    if [[ -z "$values" ]]; then
+        printf 'na\tna\n'
+        return 0
+    fi
+    median=$(median_numbers <<< "$values")
+    p95=$(percentile_95_numbers <<< "$values")
+    printf '%s\t%s\n' "$median" "$p95"
+}
+
+cpu_snapshot() {
+    local _ user nice system idle iowait irq softirq steal total idle_all value
+    [[ -r /proc/stat ]] || { printf 'na\tna\tna\n'; return 0; }
+    read -r _ user nice system idle iowait irq softirq steal _ _ < /proc/stat || {
+        printf 'na\tna\tna\n'
+        return 0
+    }
+    for value in "$user" "$nice" "$system" "$idle" "$iowait" "$irq" "$softirq" "${steal:-0}"; do
+        is_uint "$value" || { printf 'na\tna\tna\n'; return 0; }
+    done
+    total=$((user + nice + system + idle + iowait + irq + softirq + ${steal:-0}))
+    idle_all=$((idle + iowait))
+    printf '%s\t%s\t%s\n' "$total" "$idle_all" "${steal:-0}"
+}
+
+cpu_delta_metrics() {
+    local before="$1" after="$2" total_before idle_before steal_before total_after idle_after steal_after
+    local total_delta idle_delta steal_delta
+    IFS=$'\t' read -r total_before idle_before steal_before <<< "$before"
+    IFS=$'\t' read -r total_after idle_after steal_after <<< "$after"
+    if ! is_uint "$total_before" || ! is_uint "$idle_before" || ! is_uint "$steal_before" ||
+       ! is_uint "$total_after" || ! is_uint "$idle_after" || ! is_uint "$steal_after" ||
+       (( total_after <= total_before )); then
+        printf 'na\tna\n'
+        return 0
+    fi
+    total_delta=$((total_after - total_before)); idle_delta=$((idle_after - idle_before)); steal_delta=$((steal_after - steal_before))
+    (( idle_delta < 0 )) && idle_delta=0; (( steal_delta < 0 )) && steal_delta=0
+    awk -v t="$total_delta" -v i="$idle_delta" -v s="$steal_delta" 'BEGIN {
+        busy=(t-i)*100/t; if(busy<0)busy=0; if(busy>100)busy=100;
+        steal=s*100/t; if(steal<0)steal=0; if(steal>100)steal=100;
+        printf "%.2f\t%.2f\n", busy, steal
+    }'
+}
+
+cpu_core_snapshot() {
+    awk '/^cpu[0-9]+[[:space:]]/ {
+        total=$2+$3+$4+$5+$6+$7+$8+$9; idle=$5+$6; steal=$9;
+        printf "%s\t%.0f\t%.0f\t%.0f\n", $1, total, idle, steal
+    }' /proc/stat 2>/dev/null || true
+}
+
+cpu_core_delta_metrics() {
+    local before="$1" after="$2"
+    awk -v before="$before" -v after="$after" 'BEGIN {
+        nb=split(before, b, "\n"); na=split(after, a, "\n"); found=0; peak_busy=0; peak_steal=0;
+        for(i=1;i<=nb;i++) {n=split(b[i], f, "\t"); if(n==4) {bt[f[1]]=f[2]; bi[f[1]]=f[3]; bs[f[1]]=f[4]}}
+        for(i=1;i<=na;i++) {
+            n=split(a[i], f, "\t"); key=f[1]; if(n!=4 || !(key in bt)) continue;
+            total=f[2]-bt[key]; idle=f[3]-bi[key]; steal=f[4]-bs[key]; if(total<=0) continue;
+            busy=(total-idle)*100/total; if(busy<0)busy=0; if(busy>100)busy=100;
+            stealp=steal*100/total; if(stealp<0)stealp=0; if(stealp>100)stealp=100;
+            if(!found || busy>peak_busy)peak_busy=busy; if(!found || stealp>peak_steal)peak_steal=stealp; found=1;
+        }
+        if(found) printf "%.2f\t%.2f\n", peak_busy, peak_steal; else print "na\tna"
+    }'
+}
+
+background_tx_percent() {
+    local before="$1" after="$2" payload="$3"
+    if ! is_uint "$before" || ! is_uint "$after" || ! is_uint "$payload" || (( after < before )); then
+        printf 'na\n'
+        return 0
+    fi
+    awk -v tx="$((after-before))" -v payload="$payload" 'BEGIN {
+        # Permit link/IP/TCP overhead plus a small fixed control-traffic allowance.
+        allowed=payload*1.12+65536;
+        if(tx<=allowed || tx<=0) {printf "0.00\n"; exit}
+        printf "%.2f\n", (tx-allowed)*100/tx
+    }'
+}
+
+sample_is_contaminated() {
+    local background="$1" steal="$2" busy="${3:-na}"
+    local max_background="${BBRV3_MAX_BACKGROUND_TX_PERCENT:-15}" max_steal="${BBRV3_MAX_CPU_STEAL_PERCENT:-15}"
+    local max_busy="${BBRV3_MAX_CPU_BUSY_PERCENT:-98}"
+    is_decimal "$max_background" || max_background=15
+    is_decimal "$max_steal" || max_steal=15
+    is_decimal "$max_busy" || max_busy=98
+    if is_decimal "$background" && awk -v v="$background" -v m="$max_background" 'BEGIN {exit !(v>m)}'; then return 0; fi
+    if is_decimal "$steal" && awk -v v="$steal" -v m="$max_steal" 'BEGIN {exit !(v>m)}'; then return 0; fi
+    if is_decimal "$busy" && awk -v v="$busy" -v m="$max_busy" 'BEGIN {exit !(v>m)}'; then return 0; fi
+    return 1
+}
+
 iperf_sample() {
-    local peer="$1" port="$2" duration="$3" parallel="$4" json error_file rc=0 reason="" bps bytes retrans goodput ratio
+    local peer="$1" port="$2" duration="$3" parallel="$4" json error_file latency_file latency_pid=""
+    local rc=0 reason="" bps bytes retrans goodput ratio retrans_per_gib loaded_median="na" loaded_p95="na"
+    local tx_before=0 tx_after=0 background="na" cpu_before cpu_after cpu_busy="na" cpu_steal="na" contaminated=0
+    local core_before core_after core_busy="na" core_steal="na" reason_parse_rc=0 cpu_metrics core_metrics latency_metrics
     json=$(mktemp) || return 1
     error_file=$(mktemp) || { rm -f -- "$json"; return 1; }
+    latency_file=$(mktemp) || { rm -f -- "$json" "$error_file"; return 1; }
+    if [[ "$(uname -s 2>/dev/null || true)" == Linux ]] && command_exists ping; then
+        ping -n -i 0.2 -W 1 -c "$((duration * 5))" -- "$peer" > "$latency_file" 2>/dev/null &
+        latency_pid=$!
+    fi
+    if [[ -n "$MEASURE_IFACE" ]]; then tx_before=$(interface_counter "$MEASURE_IFACE" tx_bytes); fi
+    cpu_before=$(cpu_snapshot)
+    core_before=$(cpu_core_snapshot)
     if timeout "$((duration + 20))" iperf3 -c "$peer" -p "$port" -t "$duration" -P "$parallel" -J > "$json" 2> "$error_file"; then
-        reason=$(jq -r '.error // empty' "$json" 2>/dev/null || true)
+        if [[ -s "$json" ]]; then reason=$(jq -r '.error // empty' "$json" 2>/dev/null) || reason_parse_rc=$?; fi
         [[ -z "$reason" ]] || rc=1
     else
         rc=$?
-        reason=$(jq -r '.error // empty' "$json" 2>/dev/null || true)
+        if [[ -s "$json" ]]; then reason=$(jq -r '.error // empty' "$json" 2>/dev/null) || reason_parse_rc=$?; fi
         [[ -n "$reason" ]] || reason=$(<"$error_file")
         [[ -n "$reason" ]] || { if (( rc == 124 )); then reason="连接或测试超时"; else reason="iperf3 退出码 $rc"; fi; }
+    fi
+    cpu_after=$(cpu_snapshot)
+    core_after=$(cpu_core_snapshot)
+    if [[ -n "$MEASURE_IFACE" ]]; then tx_after=$(interface_counter "$MEASURE_IFACE" tx_bytes); fi
+    if [[ -n "$latency_pid" ]]; then
+        if (( rc != 0 )); then kill "$latency_pid" 2>/dev/null || true; fi
+        wait "$latency_pid" 2>/dev/null || true
     fi
     rm -f -- "$error_file"
     if (( rc != 0 )); then
@@ -1235,48 +1774,207 @@ iperf_sample() {
         reason=${reason//$'\r'/}
         reason=${reason:0:240}
         log WARN "iperf3 $peer:$port 测试失败: $reason"
-        rm -f -- "$json"
+        rm -f -- "$json" "$latency_file"
+        if (( rc == 124 )) || iperf_failure_is_unavailable "$reason"; then return "$IPERF_UNAVAILABLE_RC"; fi
         return 1
     fi
-    bps=$(jq -r '.end.sum_sent.bits_per_second // .end.sum.bits_per_second // 0' "$json")
-    bytes=$(jq -r '.end.sum_sent.bytes // .end.sum.bytes // 0' "$json")
-    retrans=$(jq -r '.end.sum_sent.retransmits // ([.end.streams[]?.sender.retransmits // 0] | add) // 0' "$json")
+    if (( reason_parse_rc != 0 )); then
+        log WARN "iperf3 $peer:$port 返回的 JSON 无法解析"
+        rm -f -- "$json" "$latency_file"
+        return "$IPERF_DATA_RC"
+    fi
+    if ! bps=$(jq -r '.end.sum_sent.bits_per_second // .end.sum.bits_per_second // 0' "$json") ||
+       ! bytes=$(jq -r '.end.sum_sent.bytes // .end.sum.bytes // 0' "$json") ||
+       ! retrans=$(jq -r '.end.sum_sent.retransmits // ([.end.streams[]?.sender.retransmits // 0] | add) // 0' "$json"); then
+        log WARN "iperf3 $peer:$port 返回的 JSON 无法解析"
+        rm -f -- "$json" "$latency_file"
+        return "$IPERF_DATA_RC"
+    fi
     rm -f -- "$json"
     if ! is_decimal "$bps" || ! is_uint "$bytes" || ! is_uint "$retrans" || (( bytes == 0 )) || ! awk -v b="$bps" 'BEGIN {exit !(b>0)}'; then
         log WARN "iperf3 $peer:$port 返回的 JSON 结果不完整"
-        return 1
+        rm -f -- "$latency_file"
+        return "$IPERF_DATA_RC"
     fi
     goodput=$(awk -v b="$bps" 'BEGIN {printf "%.2f", b/1000000}')
     # An estimate, not packet loss: iperf retransmits / estimated MSS-sized segments.
     ratio=$(awk -v r="$retrans" -v b="$bytes" 'BEGIN {n=b/1448; if(n<1)n=1; printf "%.5f", r*100/n}')
-    printf '%s\t%s\t%s\t%s\n' "$goodput" "$retrans" "$bytes" "$ratio"
+    retrans_per_gib=$(awk -v r="$retrans" -v b="$bytes" 'BEGIN {printf "%.3f", r*1073741824/b}')
+    latency_metrics=$(latency_stats_from_file "$latency_file"); rm -f -- "$latency_file"
+    IFS=$'\t' read -r loaded_median loaded_p95 <<< "$latency_metrics"
+    cpu_metrics=$(cpu_delta_metrics "$cpu_before" "$cpu_after")
+    IFS=$'\t' read -r cpu_busy cpu_steal <<< "$cpu_metrics"
+    core_metrics=$(cpu_core_delta_metrics "$core_before" "$core_after")
+    IFS=$'\t' read -r core_busy core_steal <<< "$core_metrics"
+    if is_decimal "$core_busy"; then
+        if is_decimal "$cpu_busy"; then cpu_busy=$(printf '%s\n%s\n' "$cpu_busy" "$core_busy" | max_numbers); else cpu_busy="$core_busy"; fi
+    fi
+    if is_decimal "$core_steal"; then
+        if is_decimal "$cpu_steal"; then cpu_steal=$(printf '%s\n%s\n' "$cpu_steal" "$core_steal" | max_numbers); else cpu_steal="$core_steal"; fi
+    fi
+    if [[ -n "$MEASURE_IFACE" ]]; then background=$(background_tx_percent "$tx_before" "$tx_after" "$bytes"); fi
+    sample_is_contaminated "$background" "$cpu_steal" "$cpu_busy" && contaminated=1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$goodput" "$retrans" "$bytes" "$ratio" "$retrans_per_gib" "$loaded_median" "$loaded_p95" \
+        "$background" "$cpu_busy" "$cpu_steal" "$contaminated"
 }
 
 median_numbers() { sort -n | awk '{a[NR]=$1} END {if(NR) {if(NR%2) print a[(NR+1)/2]; else printf "%.5f\n", (a[NR/2]+a[NR/2+1])/2}}'; }
 
+relative_spread_percent() {
+    local count values median deviations
+    values=$(printf '%s\n' "$@" | sort -n); count=$#
+    median=$(median_numbers <<< "$values")
+    if (( count < 3 )); then
+        awk -v lo="$(head -n 1 <<< "$values")" -v hi="$(tail -n 1 <<< "$values")" -v m="$median" \
+            'BEGIN {if(m<=0) print "999.00"; else printf "%.2f\n", (hi-lo)*100/m}'
+        return 0
+    fi
+    deviations=$(awk -v m="$median" '{d=$1-m; if(d<0)d=-d; print d}' <<< "$values")
+    awk -v mad="$(median_numbers <<< "$deviations")" -v m="$median" \
+        'BEGIN {if(m<=0) print "999.00"; else printf "%.2f\n", mad*1.4826*100/m}'
+}
+
+bufferbloat_delta_ms() {
+    local idle="$1" loaded="$2"
+    if ! is_decimal "$idle" || ! is_decimal "$loaded"; then printf 'na\n'; return 0; fi
+    awk -v i="$idle" -v l="$loaded" 'BEGIN {d=l-i; if(d<0)d=0; printf "%.2f\n", d}'
+}
+
+measurement_confidence() {
+    local sample_count="$1" spread="$2" loaded_p95="$3" contaminated="$4" failovers="${5:-0}"
+    local score=100 grade reason
+    local -a reasons=()
+    is_uint "$sample_count" || sample_count=0
+    if ! is_uint "$contaminated"; then
+        contaminated=0; score=$((score - 15)); reasons+=(contamination-unknown)
+    fi
+    is_uint "$failovers" || failovers=0
+    if (( sample_count < 2 )); then score=$((score - 25)); reasons+=(single-sample); fi
+    if ! is_decimal "$spread"; then
+        score=$((score - 20)); reasons+=(spread-unknown)
+    elif awk -v s="$spread" 'BEGIN {exit !(s>10)}'; then
+        score=$((score - 40)); reasons+=(very-unstable)
+    elif awk -v s="$spread" 'BEGIN {exit !(s>6)}'; then
+        score=$((score - 20)); reasons+=(unstable)
+    fi
+    if ! is_decimal "$loaded_p95"; then score=$((score - 15)); reasons+=(loaded-rtt-unavailable); fi
+    if (( contaminated )); then score=$((score - 50)); reasons+=(contaminated); fi
+    if (( failovers > 0 )); then score=$((score - 10)); reasons+=(peer-failover); fi
+    (( score < 0 )) && score=0
+    if (( score >= 90 )); then grade=high; elif (( score >= 65 )); then grade=medium; else grade=low; fi
+    if ((${#reasons[@]})); then
+        local IFS=,
+        reason="${reasons[*]}"
+    else
+        reason=clean
+    fi
+    printf '%s\t%s\t%s\n' "$score" "$grade" "$reason"
+}
+
+compare_verdict() {
+    local fq_goodput="$1" shaped_goodput="$2" fq_bloat="$3" shaped_bloat="$4" fq_retrans_gib="$5" shaped_retrans_gib="$6"
+    if awk -v f="$fq_goodput" -v s="$shaped_goodput" 'BEGIN {exit !(f>0 && s<f*0.90)}'; then
+        printf 'regressed\n'
+    elif is_decimal "$fq_bloat" && is_decimal "$shaped_bloat" &&
+         awk -v f="$fq_bloat" -v s="$shaped_bloat" -v fg="$fq_goodput" -v sg="$shaped_goodput" \
+             'BEGIN {exit !(fg>0 && sg>=fg*0.90 && ((f>=5 && s<=f*0.80) || (f<5 && s<f)))}'; then
+        printf 'improved\n'
+    elif is_decimal "$fq_retrans_gib" && is_decimal "$shaped_retrans_gib" &&
+         awk -v f="$fq_retrans_gib" -v s="$shaped_retrans_gib" -v fg="$fq_goodput" -v sg="$shaped_goodput" \
+             'BEGIN {exit !(fg>0 && sg>=fg*0.90 && f>0 && s<=f*0.70)}'; then
+        printf 'improved\n'
+    else
+        printf 'neutral\n'
+    fi
+}
+
 sample_repeated() {
     local peer="$1" port="$2" duration="$3" parallel="$4" count="$5" label="$6"
-    local -a goodputs=() retrans=() bytes=() ratios=()
-    local row i attempt attempts="${BBRV3_IPERF_ATTEMPTS:-3}"
+    local max_count="${7:-$count}" stability_threshold="${8:-0}"
+    local -a goodputs=() retrans=() bytes=() ratios=() retrans_gib=() loaded_medians=() loaded_p95s=()
+    local -a backgrounds=() cpu_busies=() cpu_steals=() contaminations=()
+    local row i attempt sample_rc=0 attempts="${BBRV3_IPERF_ATTEMPTS:-3}" target_count="$count" contamination_retry
+    local contamination_retries="${BBRV3_CONTAMINATION_RETRIES:-1}"
+    local g r b l rpg loaded_med loaded_tail background cpu_busy cpu_steal contaminated spread="0.00" bloat
     is_uint "$attempts" && (( attempts >= 1 && attempts <= 5 )) || attempts=3
-    for ((i=1; i<=count; i++)); do
-        log INFO "$label: ${duration}s × ${parallel} flow(s), sample ${i}/${count}"
-        row=""
-        for ((attempt=1; attempt<=attempts; attempt++)); do
-            if row=$(iperf_sample "$peer" "$port" "$duration" "$parallel"); then break; fi
-            (( attempt < attempts )) && { log WARN "2 秒后重试（${attempt}/${attempts}）"; sleep 2; }
+    is_uint "$contamination_retries" && (( contamination_retries <= 3 )) || contamination_retries=1
+    is_uint "$max_count" && (( max_count >= count && max_count <= 5 )) || max_count="$count"
+    is_decimal "$stability_threshold" || stability_threshold=0
+    for ((i=1; i<=target_count; i++)); do
+        log INFO "$label: ${duration}s × ${parallel} flow(s), sample ${i}/${target_count}"
+        contamination_retry=0
+        while true; do
+            row=""
+            for ((attempt=1; attempt<=attempts; attempt++)); do
+                if row=$(iperf_sample "$peer" "$port" "$duration" "$parallel"); then
+                    sample_rc=0
+                    break
+                else
+                    sample_rc=$?
+                fi
+                if (( sample_rc != IPERF_UNAVAILABLE_RC )); then
+                    die "iperf3 本地执行或结果解析失败（exit $sample_rc），不会切换公共对端"
+                    return "$sample_rc"
+                fi
+                (( attempt < attempts )) && { log WARN "2 秒后重试（${attempt}/${attempts}）"; sleep 2; }
+            done
+            [[ -n "$row" ]] || {
+                if (( sample_rc == 0 )); then
+                    die "iperf3 成功退出但没有产生样本"
+                    return "$IPERF_DATA_RC"
+                fi
+                die "当前 iperf3 对端连续 ${attempts} 次不可用"
+                return "$sample_rc"
+            }
+            IFS=$'\t' read -r g r b l rpg loaded_med loaded_tail background cpu_busy cpu_steal contaminated <<< "$row"
+            rpg="${rpg:-$(awk -v rv="$r" -v bv="$b" 'BEGIN {if(bv>0) printf "%.3f", rv*1073741824/bv; else print "0.000"}')}"
+            loaded_med="${loaded_med:-na}"; loaded_tail="${loaded_tail:-na}"; background="${background:-na}"
+            cpu_busy="${cpu_busy:-na}"; cpu_steal="${cpu_steal:-na}"; contaminated="${contaminated:-0}"
+            bloat=$(bufferbloat_delta_ms "$MEASURE_IDLE_RTT_MS" "$loaded_tail")
+            [[ -n "$MEASURE_RESULT_FILE" ]] && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(utc_now)" "$label" "$g" "$r" "$b" "$l" "$rpg" "$MEASURE_IDLE_RTT_MS" "$loaded_med" "$loaded_tail" \
+                "$bloat" "$background" "$cpu_busy" "$cpu_steal" "$contaminated" >> "$MEASURE_RESULT_FILE"
+            if [[ "$contaminated" == 1 && "$contamination_retry" -lt "$contamination_retries" ]]; then
+                ((contamination_retry+=1))
+                log WARN "样本受到后台流量、CPU 饱和或 steal 污染，2 秒后重采（${contamination_retry}/${contamination_retries}）"
+                sleep 2
+                continue
+            fi
+            break
         done
-        [[ -n "$row" ]] || { die "iperf3 连续 ${attempts} 次失败；请稍后重试或更换对端"; return 1; }
-        IFS=$'\t' read -r g r b l <<< "$row"
-        goodputs+=("$g"); retrans+=("$r"); bytes+=("$b"); ratios+=("$l")
-        [[ -n "$MEASURE_RESULT_FILE" ]] && printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(utc_now)" "$label" "$g" "$r" "$b" "$l" >> "$MEASURE_RESULT_FILE"
-        (( i < count )) && sleep 2
+        if [[ "$contaminated" == 1 ]]; then
+            die "连续样本受到后台流量、CPU 饱和或 steal 污染；停止测量以避免误判拐点"
+            return "$IPERF_CONTAMINATED_RC"
+        fi
+        goodputs+=("$g"); retrans+=("$r"); bytes+=("$b"); ratios+=("$l"); retrans_gib+=("$rpg")
+        is_decimal "$loaded_med" && loaded_medians+=("$loaded_med")
+        is_decimal "$loaded_tail" && loaded_p95s+=("$loaded_tail")
+        is_decimal "$background" && backgrounds+=("$background")
+        is_decimal "$cpu_busy" && cpu_busies+=("$cpu_busy")
+        is_decimal "$cpu_steal" && cpu_steals+=("$cpu_steal")
+        contaminations+=("$contaminated")
+        spread=$(relative_spread_percent "${goodputs[@]}")
+        if (( i >= count && i < max_count )) && awk -v s="$spread" -v t="$stability_threshold" 'BEGIN {exit !(t>0 && s>t)}'; then
+            target_count=$((i + 1))
+            log WARN "吞吐离散度 ${spread}% 超过 ${stability_threshold}%，追加第 ${target_count} 个样本"
+        fi
+        (( i < target_count )) && sleep 2
     done
-    printf '%s\t%s\t%s\t%s\n' \
+    if awk -v s="$spread" -v t="$stability_threshold" 'BEGIN {exit !(t>0 && s>t)}'; then
+        die "${target_count} 个样本后吞吐离散度仍为 ${spread}%（上限 ${stability_threshold}%）；停止测量以避免使用不稳定结果"
+        return "$IPERF_UNSTABLE_RC"
+    fi
+    bloat=$(bufferbloat_delta_ms "$MEASURE_IDLE_RTT_MS" "$(median_or_na "${loaded_p95s[@]}")")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$(printf '%s\n' "${goodputs[@]}" | median_numbers)" \
         "$(printf '%s\n' "${retrans[@]}" | median_numbers)" \
         "$(printf '%s\n' "${bytes[@]}" | median_numbers)" \
-        "$(printf '%s\n' "${ratios[@]}" | median_numbers)"
+        "$(printf '%s\n' "${ratios[@]}" | median_numbers)" \
+        "$(printf '%s\n' "${retrans_gib[@]}" | median_numbers)" \
+        "$(median_or_na "${loaded_medians[@]}")" "$(median_or_na "${loaded_p95s[@]}")" \
+        "$(max_or_na "${backgrounds[@]}")" "$(max_or_na "${cpu_busies[@]}")" "$(max_or_na "${cpu_steals[@]}")" \
+        "$(printf '%s\n' "${contaminations[@]}" | max_numbers)" "$spread" "$target_count" "$bloat"
 }
 
 loss_spike() {
@@ -1331,16 +2029,17 @@ new_measure_run() {
     chmod 0700 "$dir"
     MEASURE_RESULT_FILE="$dir/samples.tsv"
     MEASURE_RUN_DIR="$dir"
-    printf 'TIME\tLABEL\tGOODPUT_MBIT\tRETRANSMITS\tBYTES\tRETRANS_RATIO_EST_PERCENT\n' > "$MEASURE_RESULT_FILE"
+    printf 'TIME\tLABEL\tGOODPUT_MBIT\tRETRANSMITS\tBYTES\tRETRANS_RATIO_EST_PERCENT\tRETRANS_PER_GIB\tIDLE_RTT_MS\tLOADED_RTT_MEDIAN_MS\tLOADED_RTT_P95_MS\tBUFFERBLOAT_P95_MS\tBACKGROUND_TX_PERCENT\tCPU_BUSY_PERCENT\tCPU_STEAL_PERCENT\tCONTAMINATED\n' > "$MEASURE_RESULT_FILE"
 }
 
 measure_probe() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" duration="$4" parallel="$5" iface dir row rc=0 speed estimate
+    local confidence confidence_score confidence_grade confidence_reasons
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && is_uint "$parallel" && ((duration>=3 && duration<=120 && parallel>=1 && parallel<=32)) || { die "duration/parallel 超出安全范围"; return 1; }
-    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return 1; }
+    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return "$IPERF_UNAVAILABLE_RC"; }
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
     speed=$(detect_link_speed "$iface")
@@ -1350,11 +2049,18 @@ measure_probe() {
     fi
     new_measure_run probe || return 1
     dir="$MEASURE_RUN_DIR"
+    measure_set_latency_baseline "$peer"
     measure_begin "$iface" || return 1
-    if apply_fq "$iface" && row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 3 unshaped); then
-        printf 'TYPE\tprobe\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nGOODPUT_MBIT\t%s\nRETRANS_RATIO_EST_PERCENT\t%s\n' \
-            "$peer" "$port" "$iface" "$(cut -f1 <<< "$row")" "$(cut -f4 <<< "$row")" > "$dir/summary.tsv"
-        log OK "可用带宽中位数: $(cut -f1 <<< "$row") Mbit/s，重传比例估算: $(cut -f4 <<< "$row")%"
+    if apply_fq "$iface" && row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 unshaped 3 6); then
+        confidence=$(measurement_confidence "$(cut -f13 <<< "$row")" "$(cut -f12 <<< "$row")" "$(cut -f7 <<< "$row")" "$(cut -f11 <<< "$row")" 0)
+        IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
+        printf 'TYPE\tprobe\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nGOODPUT_MBIT\t%s\nRETRANS_RATIO_EST_PERCENT\t%s\nRETRANS_PER_GIB\t%s\nIDLE_RTT_MS\t%s\nLOADED_RTT_P95_MS\t%s\nBUFFERBLOAT_P95_MS\t%s\nGOODPUT_SPREAD_PERCENT\t%s\nSAMPLE_COUNT\t%s\nBACKGROUND_TX_PERCENT_MAX\t%s\nCPU_BUSY_PERCENT_MAX\t%s\nCPU_STEAL_PERCENT_MAX\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
+            "$peer" "$port" "$iface" "$(cut -f1 <<< "$row")" "$(cut -f4 <<< "$row")" "$(cut -f5 <<< "$row")" \
+            "$MEASURE_IDLE_RTT_MS" "$(cut -f7 <<< "$row")" "$(cut -f14 <<< "$row")" "$(cut -f12 <<< "$row")" "$(cut -f13 <<< "$row")" \
+            "$(cut -f8 <<< "$row")" "$(cut -f9 <<< "$row")" "$(cut -f10 <<< "$row")" \
+            "$confidence_score" "$confidence_grade" "$confidence_reasons" > "$dir/summary.tsv"
+        log OK "可用带宽中位数: $(cut -f1 <<< "$row") Mbit/s，重传 $(cut -f5 <<< "$row") 次/GiB，负载 RTT p95 $(cut -f7 <<< "$row") ms"
+        log INFO "测量置信度: ${confidence_grade} (${confidence_score}/100, ${confidence_reasons})"
         log INFO "结果: $dir"
     else rc=$?; fi
     traffic_report "$iface"
@@ -1371,34 +2077,68 @@ measure_sweep() {
     local iface dir baseline_row baseline_gp baseline_loss base_row base_gp base_loss rate row gp loss
     local last_ok="" last_ok_gp="" broke_at="" fine_start fine_step recommend="" candidate="" confirm_row confirm_gp="" confirm_loss=""
     local min_efficiency="0.90" confirmed=0 reject_reason="" estimated tests rc=0 no_knee=0 above_cap=0 baseline_duration
+    local auto_cap=0 nominal_was_auto=0 observed_cap
+    local confidence_row confidence confidence_score confidence_grade confidence_reasons
     validate_peer "$peer" "$port" || return 1
     [[ "$result_mode" == manual || "$result_mode" == auto ]] || { die "扫描结果模式只支持 manual/auto"; return 1; }
     for value in "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$force_scan" "$cap"; do is_uint "$value" || { die "扫描参数必须为非负整数"; return 1; }; done
     is_decimal "$threshold" || { die "loss threshold 必须是数字"; return 1; }
+    (( nominal == 0 )) && nominal_was_auto=1
+    if (( cap == 0 )) || [[ "$result_mode" == auto ]]; then auto_cap=1; fi
+    if (( cap == 0 )); then cap=$(recommended_scan_cap "$requested" "$nominal") || return 1; fi
     (( duration >= 3 && duration <= 120 && parallel >= 1 && parallel <= 32 && margin <= 25 && force_scan <= 1 && cap >= 100 && cap <= 1000000 )) || { die "扫描参数超出安全范围"; return 1; }
-    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return 1; }
+    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return "$IPERF_UNAVAILABLE_RC"; }
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
+    hardware_profile_values "$iface" "$nominal" || return 1
     new_measure_run sweep || return 1
     dir="$MEASURE_RUN_DIR"
+    measure_set_latency_baseline "$peer"
     measure_begin "$iface" || return 1
 
     baseline_duration="$duration"; ((baseline_duration>5)) && baseline_duration=5
     if ! apply_fq "$iface"; then
         rc=1
-    elif ! baseline_row=$(sample_repeated "$peer" "$port" "$baseline_duration" 1 2 unshaped); then
-        rc=1
-    else
+    elif baseline_row=$(sample_repeated "$peer" "$port" "$baseline_duration" 1 2 unshaped 3 6); then
         baseline_gp=$(cut -f1 <<< "$baseline_row"); baseline_loss=$(cut -f4 <<< "$baseline_row")
-        if awk -v g="$baseline_gp" -v c="$cap" 'BEGIN {exit !(g>c)}'; then
-            above_cap=1; no_knee=1
-            log WARN "不限速单流达到 ${baseline_gp} Mbit/s，超过扫描上限 ${cap} Mbit/s；跳过整形扫描"
+        if (( auto_cap )); then
+            if observed_cap=$(expanded_scan_cap "$cap" "$baseline_gp"); then
+                if (( observed_cap > cap )); then
+                    log INFO "根据不限速基准将扫描上限从 ${cap} 调整为 ${observed_cap} Mbit/s"
+                    cap="$observed_cap"
+                fi
+            else
+                rc=$?
+            fi
         fi
-        (( nominal > 0 )) || nominal=$(awk -v g="$baseline_gp" 'BEGIN {printf "%d", g+0.5}')
-        (( low > 0 )) || low=$(awk -v g="$baseline_gp" 'BEGIN {v=g*0.80; if(v<1)v=1; printf "%d", v}')
-        (( high > 0 )) || high=$(awk -v g="$baseline_gp" 'BEGIN {v=g*1.30; if(v<2)v=2; printf "%d", v}')
-        (( step > 0 )) || { step=$((nominal / 20)); ((step < 5)) && step=5; }
-        (( high > low )) || { die "扫描上界必须大于下界"; rc=1; }
+        if (( rc == 0 )); then
+            if awk -v g="$baseline_gp" -v c="$cap" 'BEGIN {exit !(g>c)}'; then
+                above_cap=1; no_knee=1
+                log WARN "不限速单流达到 ${baseline_gp} Mbit/s，超过扫描上限 ${cap} Mbit/s；跳过整形扫描"
+            fi
+            (( nominal > 0 )) || nominal=$(awk -v g="$baseline_gp" 'BEGIN {printf "%d", g+0.5}')
+            if (( nominal_was_auto )) && [[ "$result_mode" == auto ]]; then
+                if duration=$(recommended_measure_duration "$iface" "$nominal"); then :; else rc=$?; fi
+            fi
+        fi
+        if (( rc == 0 )); then
+            (( low > 0 )) || low=$(awk -v g="$baseline_gp" 'BEGIN {v=g*0.80; if(v<1)v=1; printf "%d", v}')
+            (( high > 0 )) || high=$(awk -v g="$baseline_gp" 'BEGIN {v=g*1.30; if(v<2)v=2; printf "%d", v}')
+            (( step > 0 )) || { step=$((nominal / 20)); ((step < 5)) && step=5; }
+            if (( ! above_cap && high > cap )); then
+                log WARN "扫描上界 ${high} Mbit/s 超过硬上限 ${cap} Mbit/s，已收敛到硬上限"
+                high="$cap"
+            fi
+            if (( ! above_cap && low >= cap )); then
+                die "扫描下界 ${low} Mbit/s 必须低于硬上限 ${cap} Mbit/s"
+                rc=1
+            elif (( high <= low )); then
+                die "扫描上界必须大于下界"
+                rc=1
+            fi
+        fi
+    else
+        rc=$?
     fi
 
     if (( rc == 0 && (step <= 0 || high <= low) )); then
@@ -1407,7 +2147,9 @@ measure_sweep() {
     fi
 
     if (( rc == 0 )); then
-        tests=$((2 + 2 + (high-low)/step + 4 + 2))
+        # Baseline, low-rate reference and confirmation may each add a third
+        # sample when the first pair is unstable.
+        tests=$((3 + 3 + (high-low)/step + 4 + 3))
         estimated=$(estimate_sweep_bytes "$high" "$duration" "$tests")
         log INFO "计划最多采集 $tests 个样本、产生约 $(human_bytes "$estimated") 出站流量（不含失败重试）"
 
@@ -1419,7 +2161,7 @@ measure_sweep() {
         else
             apply_shaping "$iface" "$low" || rc=$?
             if (( rc == 0 )); then
-                base_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "rate-${low}") || rc=$?
+                base_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "rate-${low}" 3 6) || rc=$?
                 base_gp=$(cut -f1 <<< "${base_row:-$'0\t0\t0\t0'}")
                 base_loss=$(cut -f4 <<< "${base_row:-$'0\t0\t0\t0'}")
                 min_efficiency=$(minimum_efficiency_ratio "$base_gp" "$low")
@@ -1469,7 +2211,7 @@ measure_sweep() {
                 candidate=$(( last_ok * (100-margin) / 100 )); ((candidate < 1)) && candidate=1
                 apply_shaping "$iface" "$candidate" || rc=$?
                 if (( rc == 0 )); then
-                    confirm_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "confirm-${candidate}") || rc=$?
+                    confirm_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "confirm-${candidate}" 3 6) || rc=$?
                     confirm_gp=$(cut -f1 <<< "${confirm_row:-$'0\t0\t0\t999'}")
                     confirm_loss=$(cut -f4 <<< "${confirm_row:-$'0\t0\t0\t999'}")
                     if (( rc == 0 )) && measurement_sample_acceptable "$confirm_gp" "$confirm_loss" "$candidate" "$min_efficiency" "$threshold" "$base_loss"; then
@@ -1487,8 +2229,23 @@ measure_sweep() {
     fi
 
     if (( rc == 0 )); then
-        printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nCLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nMIN_EFFICIENCY_RATIO\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nCANDIDATE\t%s\nCONFIRM_MBIT\t%s\nCONFIRM_RETRANS_RATIO_EST_PERCENT\t%s\nCONFIRMED\t%s\nREJECT_REASON\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nABOVE_CAP\t%s\n' \
-            "$peer" "$port" "$iface" "${baseline_gp:-}" "${baseline_loss:-}" "${base_loss:-0}" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$above_cap" > "$dir/summary.tsv"
+        printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nHARDWARE_CLASS\t%s\nLINK_MBIT\t%s\nRX_QUEUES\t%s\nTX_QUEUES\t%s\nSCAN_CAP_MBIT\t%s\nSAMPLE_DURATION_SECONDS\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nCLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nMIN_EFFICIENCY_RATIO\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nCANDIDATE\t%s\nCONFIRM_MBIT\t%s\nCONFIRM_RETRANS_RATIO_EST_PERCENT\t%s\nCONFIRMED\t%s\nREJECT_REASON\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nABOVE_CAP\t%s\n' \
+            "$peer" "$port" "$iface" "$HARDWARE_CLASS" "$HARDWARE_LINK_MBIT" "$HARDWARE_RX_QUEUES" "$HARDWARE_TX_QUEUES" "$cap" "$duration" \
+            "${baseline_gp:-}" "${baseline_loss:-}" "${base_loss:-0}" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$above_cap" > "$dir/summary.tsv"
+        confidence_row="${confirm_row:-${baseline_row:-}}"
+        if [[ -n "$confidence_row" ]]; then
+            confidence=$(measurement_confidence "$(cut -f13 <<< "$confidence_row")" "$(cut -f12 <<< "$confidence_row")" "$(cut -f7 <<< "$confidence_row")" "$(cut -f11 <<< "$confidence_row")" 0)
+            IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
+        else
+            confidence_score=0; confidence_grade=low; confidence_reasons=no-usable-sample
+        fi
+        printf 'IDLE_RTT_MS\t%s\nUNSHAPED_RETRANS_PER_GIB\t%s\nUNSHAPED_LOADED_RTT_P95_MS\t%s\nUNSHAPED_BUFFERBLOAT_P95_MS\t%s\nUNSHAPED_BACKGROUND_TX_PERCENT_MAX\t%s\nUNSHAPED_CPU_BUSY_PERCENT_MAX\t%s\nUNSHAPED_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_RETRANS_PER_GIB\t%s\nCONFIRM_LOADED_RTT_P95_MS\t%s\nCONFIRM_BUFFERBLOAT_P95_MS\t%s\nCONFIRM_BACKGROUND_TX_PERCENT_MAX\t%s\nCONFIRM_CPU_BUSY_PERCENT_MAX\t%s\nCONFIRM_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_GOODPUT_SPREAD_PERCENT\t%s\nCONFIRM_SAMPLE_COUNT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
+            "$MEASURE_IDLE_RTT_MS" "$(cut -f5 <<< "${baseline_row:-}")" "$(cut -f7 <<< "${baseline_row:-}")" "$(cut -f14 <<< "${baseline_row:-}")" \
+            "$(cut -f8 <<< "${baseline_row:-}")" "$(cut -f9 <<< "${baseline_row:-}")" "$(cut -f10 <<< "${baseline_row:-}")" \
+            "$(cut -f5 <<< "${confirm_row:-}")" "$(cut -f7 <<< "${confirm_row:-}")" "$(cut -f14 <<< "${confirm_row:-}")" \
+            "$(cut -f8 <<< "${confirm_row:-}")" "$(cut -f9 <<< "${confirm_row:-}")" "$(cut -f10 <<< "${confirm_row:-}")" \
+            "$(cut -f12 <<< "${confirm_row:-}")" "$(cut -f13 <<< "${confirm_row:-}")" \
+            "$confidence_score" "$confidence_grade" "$confidence_reasons" >> "$dir/summary.tsv"
         if [[ -n "${recommend:-}" ]]; then
             log OK "扫描完成: last clean=${last_ok} Mbit, break=${broke_at:-above-range} Mbit, 推荐=${recommend} Mbit"
             if [[ "$result_mode" == auto ]]; then
@@ -1497,6 +2254,7 @@ measure_sweep() {
                 log INFO "确认业务表现后执行: ${0##*/} tc enable ${recommend} --knee ${broke_at:-0} --margin ${margin} --interface ${requested}"
             fi
         fi
+        log INFO "扫描置信度: ${confidence_grade} (${confidence_score}/100, ${confidence_reasons})"
         log INFO "完整结果: $dir"
     fi
     traffic_report "$iface"
@@ -1517,9 +2275,12 @@ measure_path_check() {
     is_uint "$rate" && (( rate > 0 )) || { die "路径检查速率无效"; return 1; }
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
+    measure_set_latency_baseline "$peer"
     measure_begin "$iface" || return 1
     log INFO "路径预检: 临时整形 ${rate} Mbit/s，检查对端是否足以承载测量"
-    if apply_shaping "$iface" "$rate" && row=$(sample_repeated "$peer" "$port" 5 1 1 path-check); then
+    if ! apply_shaping "$iface" "$rate"; then
+        rc=1
+    elif row=$(sample_repeated "$peer" "$port" 5 1 1 path-check); then
         gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
         if awk -v g="$gp" -v r="$rate" 'BEGIN {exit !(g < r*0.60)}'; then
             log ERR "路径预检仅达到 ${gp} Mbit/s，明显低于 ${rate} Mbit/s；更换更近对端后重试"
@@ -1531,7 +2292,7 @@ measure_path_check() {
             log OK "路径预检通过: ${gp} Mbit/s，重传估算 ${loss}%"
         fi
     else
-        rc=1
+        rc=$?
     fi
     measure_restore || rc=$?
     return "$rc"
@@ -1542,6 +2303,9 @@ measure_verify() {
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" duration="${4:-8}" expected_rate="${5:-0}" min_efficiency="${6:-0.90}"
     local baseline_loss="${7:-0}" threshold="${8:-0.1}" iface dir one multi one_gp one_loss multi_gp multi_loss rc=0 accepted=1 reject_reason=""
+    local multi_parallel
+    local one_count multi_count combined_count one_spread multi_spread combined_spread combined_loaded combined_contaminated
+    local confidence confidence_score confidence_grade confidence_reasons
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && (( duration >= 3 && duration <= 120 )) || { die "verify duration 超出安全范围"; return 1; }
     is_uint "$expected_rate" && (( expected_rate <= 1000000 )) || { die "verify 期望速率无效"; return 1; }
@@ -1550,13 +2314,15 @@ measure_verify() {
         die "verify 验收参数超出安全范围"
         return 1
     }
-    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return 1; }
+    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return "$IPERF_UNAVAILABLE_RC"; }
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
+    multi_parallel=$(recommended_verify_flows "$iface" "$expected_rate") || return 1
     new_measure_run verify || return 1; dir="$MEASURE_RUN_DIR"
+    measure_set_latency_baseline "$peer"
     measure_begin "$iface" || return 1
-    one=$(sample_repeated "$peer" "$port" "$duration" 1 1 verify-single) || rc=$?
-    if (( rc == 0 )); then multi=$(sample_repeated "$peer" "$port" "$duration" 4 1 verify-four) || rc=$?; fi
+    one=$(sample_repeated "$peer" "$port" "$duration" 1 2 verify-single 3 6) || rc=$?
+    if (( rc == 0 )); then multi=$(sample_repeated "$peer" "$port" "$duration" "$multi_parallel" 2 "verify-multi-${multi_parallel}" 3 6) || rc=$?; fi
     if (( rc == 0 )); then
         one_gp=$(cut -f1 <<< "$one"); one_loss=$(cut -f4 <<< "$one")
         multi_gp=$(cut -f1 <<< "$multi"); multi_loss=$(cut -f4 <<< "$multi")
@@ -1564,18 +2330,108 @@ measure_verify() {
             if ! measurement_sample_acceptable "$one_gp" "$one_loss" "$expected_rate" "$min_efficiency" "$threshold" "$baseline_loss"; then
                 accepted=0; reject_reason="single-flow-below-threshold"
             elif ! measurement_sample_acceptable "$multi_gp" "$multi_loss" "$expected_rate" "$min_efficiency" "$threshold" "$baseline_loss"; then
-                accepted=0; reject_reason="four-flow-below-threshold"
+                accepted=0; reject_reason="multi-flow-below-threshold"
             fi
         fi
-        printf 'TYPE\tverify\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nEXPECTED_RATE_MBIT\t%s\nMIN_EFFICIENCY_RATIO\t%s\nSINGLE_MBIT\t%s\nSINGLE_RETRANS_EST_PERCENT\t%s\nFOUR_MBIT\t%s\nFOUR_RETRANS_EST_PERCENT\t%s\nACCEPTED\t%s\nREJECT_REASON\t%s\n' \
-            "$peer" "$port" "$iface" "$expected_rate" "$min_efficiency" "$one_gp" "$one_loss" "$multi_gp" "$multi_loss" "$accepted" "$reject_reason" > "$dir/summary.tsv"
+        one_count=$(cut -f13 <<< "$one"); multi_count=$(cut -f13 <<< "$multi")
+        is_uint "$one_count" || one_count=0; is_uint "$multi_count" || multi_count=0
+        if (( one_count < multi_count )); then combined_count="$one_count"; else combined_count="$multi_count"; fi
+        one_spread=$(cut -f12 <<< "$one"); multi_spread=$(cut -f12 <<< "$multi")
+        if is_decimal "$one_spread" && is_decimal "$multi_spread"; then
+            combined_spread=$(printf '%s\n%s\n' "$one_spread" "$multi_spread" | max_numbers)
+        else
+            combined_spread=na
+        fi
+        if is_decimal "$(cut -f7 <<< "$one")" && is_decimal "$(cut -f7 <<< "$multi")"; then
+            combined_loaded=$(printf '%s\n%s\n' "$(cut -f7 <<< "$one")" "$(cut -f7 <<< "$multi")" | max_numbers)
+        else
+            combined_loaded=na
+        fi
+        combined_contaminated=$(printf '%s\n%s\n' "$(cut -f11 <<< "$one")" "$(cut -f11 <<< "$multi")" | max_numbers)
+        confidence=$(measurement_confidence "$combined_count" "$combined_spread" "$combined_loaded" "$combined_contaminated" 0)
+        IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
+        printf 'TYPE\tverify\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nEXPECTED_RATE_MBIT\t%s\nMIN_EFFICIENCY_RATIO\t%s\nIDLE_RTT_MS\t%s\nSINGLE_MBIT\t%s\nSINGLE_RETRANS_EST_PERCENT\t%s\nSINGLE_RETRANS_PER_GIB\t%s\nSINGLE_LOADED_RTT_P95_MS\t%s\nSINGLE_BUFFERBLOAT_P95_MS\t%s\nSINGLE_GOODPUT_SPREAD_PERCENT\t%s\nSINGLE_SAMPLE_COUNT\t%s\nMULTI_FLOWS\t%s\nMULTI_MBIT\t%s\nMULTI_RETRANS_EST_PERCENT\t%s\nMULTI_RETRANS_PER_GIB\t%s\nMULTI_LOADED_RTT_P95_MS\t%s\nMULTI_BUFFERBLOAT_P95_MS\t%s\nMULTI_GOODPUT_SPREAD_PERCENT\t%s\nMULTI_SAMPLE_COUNT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\nACCEPTED\t%s\nREJECT_REASON\t%s\n' \
+            "$peer" "$port" "$iface" "$expected_rate" "$min_efficiency" "$MEASURE_IDLE_RTT_MS" \
+            "$one_gp" "$one_loss" "$(cut -f5 <<< "$one")" "$(cut -f7 <<< "$one")" "$(cut -f14 <<< "$one")" "$one_spread" "$one_count" \
+            "$multi_parallel" "$multi_gp" "$multi_loss" "$(cut -f5 <<< "$multi")" "$(cut -f7 <<< "$multi")" "$(cut -f14 <<< "$multi")" "$multi_spread" "$multi_count" \
+            "$confidence_score" "$confidence_grade" "$confidence_reasons" "$accepted" "$reject_reason" > "$dir/summary.tsv"
         if (( accepted )); then
-            log OK "验证完成: 单流 ${one_gp} Mbit/s，多流 ${multi_gp} Mbit/s"
+            log OK "验证完成: 单流 ${one_gp} Mbit/s，多流(${multi_parallel}) ${multi_gp} Mbit/s"
+            log INFO "负载 RTT p95: 单流 $(cut -f7 <<< "$one") ms，多流 $(cut -f7 <<< "$multi") ms；置信度 ${confidence_grade} (${confidence_score}/100)"
         else
             log ERR "最终复验未通过（$reject_reason）：单流 ${one_gp} Mbit/s，多流 ${multi_gp} Mbit/s"
             rc=2
         fi
         log INFO "验证结果: $dir"
+    fi
+    traffic_report "$iface"
+    measure_restore || rc=$?
+    return "$rc"
+}
+
+measure_compare() {
+    require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
+    require_commands iperf3 jq timeout || return 1
+    local peer="$1" port="$2" requested="$3" rate="$4" duration="${5:-6}" rounds="${6:-2}"
+    local iface dir speed estimate_rate estimate rc=0 round mode row verdict confidence
+    local fq_gp shaped_gp fq_rpg shaped_rpg fq_bloat shaped_bloat fq_spread shaped_spread combined_spread combined_loaded
+    local confidence_score confidence_grade confidence_reasons throughput_delta
+    local -a fq_goodputs=() shaped_goodputs=() fq_retrans_gib=() shaped_retrans_gib=() fq_bloats=() shaped_bloats=()
+    validate_peer "$peer" "$port" || return 1
+    is_uint "$rate" && (( rate >= 1 && rate <= 1000000 )) || { die "compare rate 必须是 1–1000000 的整数"; return 1; }
+    is_uint "$duration" && (( duration >= 3 && duration <= 30 )) || { die "compare duration 必须是 3–30 秒"; return 1; }
+    is_uint "$rounds" && (( rounds >= 2 && rounds <= 5 )) || { die "compare rounds 必须是 2–5"; return 1; }
+    peer_port_open "$peer" "$port" || { die "无法连接 $peer:$port"; return "$IPERF_UNAVAILABLE_RC"; }
+    iface=$(detect_interface "$requested") || return 1
+    qdisc_guard "$iface" || return 1
+    new_measure_run compare || return 1; dir="$MEASURE_RUN_DIR"
+    measure_set_latency_baseline "$peer"
+    speed=$(detect_link_speed "$iface"); estimate_rate="$rate"
+    if is_uint "$speed" && (( speed > estimate_rate )); then estimate_rate="$speed"; fi
+    estimate=$(estimate_sweep_bytes "$estimate_rate" "$duration" "$((rounds * 2))")
+    log INFO "A/B 对照将交错执行 FQ 与 ${rate} Mbit HTB/FQ，各 ${rounds} 轮；最多约 $(human_bytes "$estimate") 出站流量"
+    measure_begin "$iface" || return 1
+    for ((round=1; round<=rounds; round++)); do
+        if (( round % 2 )); then local -a modes=(fq shaped); else local -a modes=(shaped fq); fi
+        for mode in "${modes[@]}"; do
+            if [[ "$mode" == fq ]]; then
+                apply_fq "$iface" || { rc=$?; break 2; }
+            else
+                apply_shaping "$iface" "$rate" || { rc=$?; break 2; }
+            fi
+            row=$(sample_repeated "$peer" "$port" "$duration" 1 1 "compare-${mode}-r${round}") || { rc=$?; break 2; }
+            if [[ "$mode" == fq ]]; then
+                fq_goodputs+=("$(cut -f1 <<< "$row")"); fq_retrans_gib+=("$(cut -f5 <<< "$row")")
+                is_decimal "$(cut -f14 <<< "$row")" && fq_bloats+=("$(cut -f14 <<< "$row")")
+            else
+                shaped_goodputs+=("$(cut -f1 <<< "$row")"); shaped_retrans_gib+=("$(cut -f5 <<< "$row")")
+                is_decimal "$(cut -f14 <<< "$row")" && shaped_bloats+=("$(cut -f14 <<< "$row")")
+            fi
+            sleep 2
+        done
+    done
+    if (( rc == 0 )); then
+        fq_gp=$(median_numbers < <(printf '%s\n' "${fq_goodputs[@]}")); shaped_gp=$(median_numbers < <(printf '%s\n' "${shaped_goodputs[@]}"))
+        fq_rpg=$(median_numbers < <(printf '%s\n' "${fq_retrans_gib[@]}")); shaped_rpg=$(median_numbers < <(printf '%s\n' "${shaped_retrans_gib[@]}"))
+        fq_bloat=$(median_or_na "${fq_bloats[@]}"); shaped_bloat=$(median_or_na "${shaped_bloats[@]}")
+        fq_spread=$(relative_spread_percent "${fq_goodputs[@]}"); shaped_spread=$(relative_spread_percent "${shaped_goodputs[@]}")
+        combined_spread=$(printf '%s\n%s\n' "$fq_spread" "$shaped_spread" | max_numbers)
+        if is_decimal "$fq_bloat" && is_decimal "$shaped_bloat"; then
+            combined_loaded=$(printf '%s\n%s\n' "$fq_bloat" "$shaped_bloat" | max_numbers)
+        else
+            combined_loaded=na
+        fi
+        verdict=$(compare_verdict "$fq_gp" "$shaped_gp" "$fq_bloat" "$shaped_bloat" "$fq_rpg" "$shaped_rpg")
+        confidence=$(measurement_confidence "$rounds" "$combined_spread" "$combined_loaded" 0 0)
+        IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
+        throughput_delta=$(awk -v f="$fq_gp" -v s="$shaped_gp" 'BEGIN {if(f<=0) print "na"; else printf "%.2f", (s-f)*100/f}')
+        printf 'TYPE\tcompare\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nRATE_MBIT\t%s\nDURATION_SECONDS\t%s\nROUNDS\t%s\nORDER\tinterleaved\nIDLE_RTT_MS\t%s\nFQ_GOODPUT_MBIT\t%s\nFQ_RETRANS_PER_GIB\t%s\nFQ_BUFFERBLOAT_P95_MS\t%s\nFQ_GOODPUT_SPREAD_PERCENT\t%s\nSHAPED_GOODPUT_MBIT\t%s\nSHAPED_RETRANS_PER_GIB\t%s\nSHAPED_BUFFERBLOAT_P95_MS\t%s\nSHAPED_GOODPUT_SPREAD_PERCENT\t%s\nSHAPED_THROUGHPUT_DELTA_PERCENT\t%s\nVERDICT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\nPERSISTED\t0\n' \
+            "$peer" "$port" "$iface" "$rate" "$duration" "$rounds" "$MEASURE_IDLE_RTT_MS" \
+            "$fq_gp" "$fq_rpg" "$fq_bloat" "$fq_spread" "$shaped_gp" "$shaped_rpg" "$shaped_bloat" "$shaped_spread" \
+            "$throughput_delta" "$verdict" "$confidence_score" "$confidence_grade" "$confidence_reasons" > "$dir/summary.tsv"
+        log OK "A/B 完成: FQ ${fq_gp} Mbit/s / ${fq_bloat} ms，整形 ${shaped_gp} Mbit/s / ${shaped_bloat} ms，结论 ${verdict}"
+        log INFO "对照置信度: ${confidence_grade} (${confidence_score}/100, ${confidence_reasons})；未写入配置或服务"
+        log INFO "结果: $dir"
     fi
     traffic_report "$iface"
     measure_restore || rc=$?
@@ -1932,6 +2788,7 @@ install_base_tuning() {
     local requested="$1" profile="$2" role="$3" bandwidth="$4" rtt="$5" iface
     iface=$(detect_interface "$requested") || return 1
     qdisc_guard "$iface" || return 1
+    BANDWIDTH_MBIT="$bandwidth"; network_tuning_preflight "$iface" 1 || return 1
     run_action_transaction "$iface" install_base_tuning_steps "$iface" "$requested" "$profile" "$role" "$bandwidth" "$rtt"
 }
 
@@ -1971,7 +2828,7 @@ restore_baseline_qdisc() {
     local iface kind
     iface=$(awk -F'\t' '$1=="INTERFACE" {print $2}' "$BASELINE_DIR/manifest" 2>/dev/null)
     [[ -n "$iface" && -e "/sys/class/net/$iface" ]] || return 0
-    kind=$(awk '$1=="qdisc" && $0~/ root / {print $2; exit}' "$BASELINE_DIR/qdisc.txt" 2>/dev/null)
+    kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$BASELINE_DIR/qdisc.txt" 2>/dev/null)
     if ! restore_qdisc_text_snapshot "$iface" "$BASELINE_DIR/qdisc.txt"; then
         log WARN "基线 root qdisc 为 '$kind'，文本快照无法无损重放；已保留快照供人工恢复"
         return 1
@@ -2163,6 +3020,7 @@ verify_persistence_artifacts() {
 
 show_status() {
     local iface="" cc available profile_state service_state service_active shaping=off config_state baseline_state buffer_state="unavailable" script_state
+    local hardware_state="unavailable" queue_state="unavailable" backlog_state="unavailable" scaling_state="unavailable"
     load_config || return 1
     iface=$(detect_interface "$TC_INTERFACE" 2>/dev/null || true)
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
@@ -2174,17 +3032,28 @@ show_status() {
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then service_active=active; else service_active=inactive; fi
     config_state=$([[ -f "$CONFIG_FILE" ]] && echo present || echo absent)
     if [[ -f "$BASELINE_DIR/manifest" ]]; then baseline_state="recorded ($(baseline_provenance))"; else baseline_state=missing; fi
-    if buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" 2>/dev/null; then
+    if buffer_profile_values "$SYSCTL_PROFILE" "$ROLE" "$BANDWIDTH_MBIT" "$RTT_MS" "${iface:-${TC_INTERFACE:-auto}}" 2>/dev/null; then
         buffer_state="$(human_bytes "$BUFFER_MAX") ($BUFFER_REASON)"
+        hardware_state="$HARDWARE_CLASS / ${HARDWARE_CPU_COUNT} CPU / ${HARDWARE_MEMORY_MB} MiB"
+        queue_state="${HARDWARE_DRIVER} / RX ${HARDWARE_RX_QUEUES} / TX ${HARDWARE_TX_QUEUES} / MTU ${HARDWARE_MTU} / link ${HARDWARE_LINK_MBIT} (${HARDWARE_LINK_TRUST})"
+        backlog_state="listen/SYN ${SOMAXCONN}/${TCP_MAX_SYN_BACKLOG} / netdev ${NETDEV_BACKLOG}"
+        scaling_state=$(hardware_scaling_note)
     fi
     script_state=$(persistence_script_state)
     printf '%-20s %s\n' "Version" "v${SCRIPT_VERSION}"
     printf '%-20s %s\n' "Kernel" "$(uname -r)"
     printf '%-20s %s\n' "Congestion control" "$cc (available: $available)"
     printf '%-20s %s\n' "BBR generation" "$(bbr_generation_status "$cc")"
+    printf '%-20s %s\n' "BBR compatibility" "$(bbr_compatibility_status "$cc" "$available")"
     printf '%-20s %s\n' "Sysctl profile" "$SYSCTL_PROFILE ($profile_state)"
     printf '%-20s %s\n' "Tuning model" "$ROLE / ${BANDWIDTH_MBIT} Mbit / ${RTT_MS} ms"
+    printf '%-20s %s\n' "Hardware model" "$hardware_state"
+    printf '%-20s %s\n' "NIC model" "$queue_state"
+    if [[ -n "$iface" ]]; then printf '%-20s %s\n' "NIC offloads" "$(detect_offload_summary "$iface")"; fi
+    printf '%-20s %s\n' "Effective bandwidth" "${EFFECTIVE_BANDWIDTH_MBIT:-unknown} Mbit (${EFFECTIVE_BANDWIDTH_SOURCE:-unknown})"
     printf '%-20s %s\n' "Buffer ceiling" "$buffer_state"
+    printf '%-20s %s\n' "Queue budgets" "$backlog_state"
+    printf '%-20s %s\n' "Scaling note" "$scaling_state"
     printf '%-20s %s\n' "Persistence" "$service_state / $service_active"
     printf '%-20s %s\n' "Persistence script" "$script_state"
     printf '%-20s %s\n' "Config" "$config_state ($CONFIG_FILE)"
@@ -2202,10 +3071,10 @@ bbr_generation_status() {
     [[ "$cc" == bbr ]] || { printf 'inactive\n'; return 0; }
     module_version=$(modinfo tcp_bbr 2>/dev/null | awk '/^version:/ {print $2; exit}')
     kernel=$(uname -r)
-    if [[ "$module_version" =~ ^3([.-]|$) ]]; then
-        printf 'v3 verified (module %s)\n' "$module_version"
-    elif [[ "$kernel" == *xanmod* ]]; then
-        printf 'likely v3 (XanMod; kernel API cannot prove generation)\n'
+    if [[ "$kernel" == *xanmod* ]]; then
+        printf 'v3 expected (XanMod default; runtime API cannot prove generation)\n'
+    elif [[ -n "$module_version" ]]; then
+        printf 'unknown (vendor module version %s is not BBR generation proof)\n' "$module_version"
     else
         printf 'unknown (BBR active; not proof of BBRv3)\n'
     fi
@@ -2234,12 +3103,30 @@ secure_boot_enabled() {
     mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'
 }
 
+cpu_flags_line() {
+    grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true
+}
+
+cpu_has_any_flag() {
+    local flags="$1" flag; shift
+    for flag in "$@"; do grep -qw "$flag" <<< "$flags" && return 0; done
+    return 1
+}
+
 detect_x86_level() {
     local flags
     [[ "$(uname -m)" == x86_64 ]] || { printf 'unknown\n'; return 1; }
-    flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)
-    if all_cpu_flags "$flags" avx avx2 bmi1 bmi2 fma movbe xsave; then printf '3\n'
-    elif all_cpu_flags "$flags" cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3; then printf '2\n'
+    flags=$(cpu_flags_line)
+    # x86-64-v3 additionally requires F16C and LZCNT. Linux commonly exposes
+    # BMI1 as bmi/bmi1, LZCNT as abm/lzcnt, and SSE3 as pni. AVX is hidden by
+    # Linux when the OS has not enabled the XSAVE state, so avx+xsave is the
+    # practical /proc/cpuinfo proxy for the psABI OSXSAVE requirement.
+    if all_cpu_flags "$flags" avx avx2 bmi2 f16c fma movbe xsave &&
+        cpu_has_any_flag "$flags" bmi bmi1 && cpu_has_any_flag "$flags" abm lzcnt; then
+        printf '3\n'
+    elif all_cpu_flags "$flags" cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3 &&
+        cpu_has_any_flag "$flags" pni sse3; then
+        printf '2\n'
     else printf '1\n'; fi
 }
 
@@ -2249,13 +3136,23 @@ all_cpu_flags() {
 }
 
 xanmod_candidates() {
-    local level="$1" track="$2" prefix="linux-xanmod"
-    [[ "$track" == lts ]] && prefix="linux-xanmod-lts"
-    case "$level" in
-        3) printf '%s\n' "${prefix}-x64v3" "${prefix}-x64v2" "linux-xanmod-lts-x64v1" ;;
-        2) printf '%s\n' "${prefix}-x64v2" "linux-xanmod-lts-x64v1" ;;
-        *) printf '%s\n' "linux-xanmod-lts-x64v1" ;;
-    esac
+    local level="$1" track="$2"
+    if [[ "$track" == lts ]]; then
+        case "$level" in
+            3) printf '%s\n' linux-xanmod-lts-x64v3 linux-xanmod-lts-x64v2 linux-xanmod-lts-x64v1 ;;
+            2) printf '%s\n' linux-xanmod-lts-x64v2 linux-xanmod-lts-x64v1 ;;
+            *) printf '%s\n' linux-xanmod-lts-x64v1 ;;
+        esac
+    else
+        # XanMod Main currently has x64v2/x64v3 packages only. Never satisfy a
+        # Main request with an LTS package: that silently changes the lifecycle
+        # track the operator explicitly selected.
+        case "$level" in
+            3) printf '%s\n' linux-xanmod-x64v3 linux-xanmod-x64v2 ;;
+            2) printf '%s\n' linux-xanmod-x64v2 ;;
+            *) return 0 ;;
+        esac
+    fi
 }
 
 select_xanmod_package() {
@@ -2282,7 +3179,8 @@ kernel_status() {
     printf '%-18s %s\n' "Architecture" "$(uname -m)"
     printf '%-18s %s\n' "x86-64 level" "$(detect_x86_level 2>/dev/null || echo n/a)"
     printf '%-18s %s\n' "Secure Boot" "$(secure_boot_enabled && echo enabled || echo disabled/unknown)"
-    printf '%-18s %s\n' "BBR module" "$(modinfo tcp_bbr 2>/dev/null | awk '/^version:/ {print $2; found=1} END{if(!found)print "available/unknown version"}')"
+    printf '%-18s %s\n' "BBR support" "$(bbr_kernel_support_status)"
+    printf '%-18s %s\n' "BBR compatibility" "$(bbr_compatibility_status "$cc")"
     printf '%-18s %s\n' "BBR generation" "$(bbr_generation_status "$cc")"
     dpkg-query -W -f='${Package}\t${Version}\n' 'linux-*xanmod*' 2>/dev/null || true
 }
@@ -2780,9 +3678,10 @@ Usage:
   ${0##*/} measure deps
   ${0##*/} measure probe --peer HOST [--port 5201] [--duration 10] [--parallel 4]
   ${0##*/} measure verify --peer HOST [--port 5201] [--duration 10]
+  ${0##*/} measure compare --peer HOST --rate MBIT [--port 5201] [--duration 6] [--rounds 2]
   ${0##*/} measure sweep --peer HOST [--nominal MBIT] [--low MBIT --high MBIT]
                          [--step MBIT] [--duration 8] [--parallel 1]
-                         [--margin 3] [--loss-threshold 0.1] [--cap 5000] [--force-scan]
+                         [--margin 3] [--loss-threshold 0.1] [--cap MBIT] [--force-scan]
   ${0##*/} kernel status|install [--track lts|main]|remove
   ${0##*/} dns status|apply [auto|dot|plain]|restore
   ${0##*/} ipv6 status|disable [temporary|permanent]|restore
@@ -2853,7 +3752,7 @@ cmd_detect() {
 cmd_install() { parse_common_profile_options "$@" || return 1; install_base_tuning "$CLI_INTERFACE" "$CLI_PROFILE" "$CLI_ROLE" "$CLI_BANDWIDTH" "$CLI_RTT"; }
 cmd_explain() {
     parse_common_profile_options "$@" || return 1
-    reset_config; SYSCTL_PROFILE="$CLI_PROFILE"; ROLE="$CLI_ROLE"; BANDWIDTH_MBIT="$CLI_BANDWIDTH"; RTT_MS="$CLI_RTT"
+    reset_config; SYSCTL_PROFILE="$CLI_PROFILE"; ROLE="$CLI_ROLE"; BANDWIDTH_MBIT="$CLI_BANDWIDTH"; RTT_MS="$CLI_RTT"; TC_INTERFACE="$CLI_INTERFACE"
     explain_sysctl_profile
 }
 
@@ -2903,14 +3802,16 @@ cmd_tc() {
 
 cmd_measure() {
     local action="${1:-}"; shift || true
-    local peer="" port=5201 iface=auto duration=10 parallel=4 nominal=0 low=0 high=0 step=0 margin=3 threshold=0.1 force=0 cap=5000
+    local peer="" port=5201 iface=auto duration=10 parallel=4 nominal=0 low=0 high=0 step=0 margin=3 threshold=0.1 force=0 cap=0
+    local rate=0 rounds=2
     if [[ "$action" == deps ]]; then
         require_no_arguments "measure deps" "$@" || return 1
         install_measure_dependencies
         return
     fi
-    [[ "$action" == probe || "$action" == sweep || "$action" == verify ]] || { die "measure 子命令应为 deps/probe/sweep/verify"; return 1; }
+    [[ "$action" == probe || "$action" == sweep || "$action" == verify || "$action" == compare ]] || { die "measure 子命令应为 deps/probe/sweep/verify/compare"; return 1; }
     [[ "$action" == sweep ]] && { duration=8; parallel=1; }
+    [[ "$action" == compare ]] && { duration=6; parallel=1; }
     while (($#)); do
         case "$1" in
             --peer) require_option_value "$@" || return 1; peer="$2"; shift 2 ;;
@@ -2918,8 +3819,14 @@ cmd_measure() {
             --interface) require_option_value "$@" || return 1; iface="$2"; shift 2 ;;
             --duration) require_option_value "$@" || return 1; duration="$2"; shift 2 ;;
             --parallel)
-                [[ "$action" != verify ]] || { die "measure verify 固定执行单流/四流，不接受 --parallel"; return 1; }
+                [[ "$action" != verify && "$action" != compare ]] || { die "measure $action 使用固定流数，不接受 --parallel"; return 1; }
                 require_option_value "$@" || return 1; parallel="$2"; shift 2
+                ;;
+            --rate|--rounds)
+                [[ "$action" == compare ]] || { die "measure $action 不支持参数: $1"; return 1; }
+                require_option_value "$@" || return 1
+                case "$1" in --rate) rate="$2" ;; --rounds) rounds="$2" ;; esac
+                shift 2
                 ;;
             --nominal|--low|--high|--step|--margin|--loss-threshold|--cap)
                 [[ "$action" == sweep ]] || { die "measure $action 不支持参数: $1"; return 1; }
@@ -2938,8 +3845,14 @@ cmd_measure() {
         esac
     done
     [[ -n "$peer" ]] || { die "需要 --peer HOST"; return 1; }
+    if [[ "$action" == compare ]]; then
+        is_uint "$rate" && (( rate >= 1 && rate <= 1000000 )) || { die "measure compare 需要 --rate 1–1000000"; return 1; }
+        is_uint "$rounds" && (( rounds >= 2 && rounds <= 5 )) || { die "measure compare --rounds 必须是 2–5"; return 1; }
+        is_uint "$duration" && (( duration >= 3 && duration <= 30 )) || { die "measure compare --duration 必须是 3–30 秒"; return 1; }
+    fi
     if [[ "$action" == probe ]]; then measure_probe "$peer" "$port" "$iface" "$duration" "$parallel"
     elif [[ "$action" == verify ]]; then measure_verify "$peer" "$port" "$iface" "$duration"
+    elif [[ "$action" == compare ]]; then measure_compare "$peer" "$port" "$iface" "$rate" "$duration" "$rounds"
     else measure_sweep "$peer" "$port" "$iface" "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$threshold" "$force" "$cap"; fi
 }
 
@@ -3009,24 +3922,117 @@ ensure_interactive_measure_dependencies() {
     require_commands iperf3 jq ping timeout || return 1
 }
 
+activate_public_peer_candidate() {
+    local index="$1" candidate host port rtt region provider
+    is_uint "$index" && (( index < ${#PUBLIC_PEER_CANDIDATES[@]} )) || return 1
+    candidate="${PUBLIC_PEER_CANDIDATES[$index]}"
+    IFS='|' read -r host port rtt region provider <<< "$candidate"
+    validate_peer "$host" "$port" || return 1
+    WIZARD_PEER="$host"; WIZARD_PORT="$port"; WIZARD_PEER_RTT="$rtt"
+    WIZARD_PEER_REGION="$region"; WIZARD_PEER_PROVIDER="$provider"; WIZARD_PUBLIC_INDEX="$index"
+}
+
 interactive_select_peer() {
     local choice spec
     printf '%s\n' '测速对端：' '  1) 自动选择公共节点（Leaseweb / OVH / Clouvider）' '  2) 自有 iperf3 服务器（推荐）'
     read -r -p '选择 [1]: ' choice || return 1
     case "${choice:-1}" in
-        1) spec=$(auto_pick_peer) || return 1 ;;
-        2) read -r -p '对端 HOST[:PORT]（IPv6 用 [ADDR]:PORT）: ' spec || return 1 ;;
+        1)
+            auto_pick_peer || return 1
+            WIZARD_PUBLIC_PEER=1; WIZARD_FAILOVERS=0
+            activate_public_peer_candidate 0 || return 1
+            return 0
+            ;;
+        2)
+            read -r -p '对端 HOST[:PORT]（IPv6 用 [ADDR]:PORT）: ' spec || return 1
+            ;;
         *) die "无效对端选择"; return 1 ;;
     esac
     parse_peer_spec "$spec" || return 1
     peer_port_open "$PEER_HOST" "$PEER_PORT" || { die "无法连接 $PEER_HOST:$PEER_PORT"; return 1; }
-    WIZARD_PEER="$PEER_HOST"; WIZARD_PORT="$PEER_PORT"
+    WIZARD_PUBLIC_PEER=0; WIZARD_PEER="$PEER_HOST"; WIZARD_PORT="$PEER_PORT"
+    WIZARD_PEER_RTT=0; WIZARD_PUBLIC_INDEX=0; WIZARD_FAILOVERS=0
+}
+
+auto_measure_with_peer_failover() {
+    local iface="$1" nominal="$2" index=0 count=1 rc path_rate
+    local duration="${WIZARD_SAMPLE_DURATION:-5}" cap="${WIZARD_SCAN_CAP:-5000}"
+    if (( ${WIZARD_PUBLIC_PEER:-0} )); then count=${#PUBLIC_PEER_CANDIDATES[@]}; fi
+    for ((index=0; index<count; index++)); do
+        if (( ${WIZARD_PUBLIC_PEER:-0} )); then
+            activate_public_peer_candidate "$index" || return 1
+            if (( index > 0 )); then
+                ((WIZARD_FAILOVERS+=1))
+                log WARN "切换到备用公共对端 $((index + 1))/${count}: $WIZARD_PEER:$WIZARD_PORT（$WIZARD_PEER_REGION/$WIZARD_PEER_PROVIDER，RTT ${WIZARD_PEER_RTT}ms）"
+            fi
+        fi
+        if (( nominal > 0 )); then
+            path_rate=$((nominal * 40 / 100)); ((path_rate < 1)) && path_rate=1
+            if measure_path_check "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$path_rate"; then
+                :
+            else
+                rc=$?
+                if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == 2) )); then
+                    (( index + 1 < count )) && continue
+                    break
+                fi
+                return "$rc"
+            fi
+        fi
+        if measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$nominal" 0 0 0 "$duration" 1 3 0.1 0 "$cap" auto; then
+            WIZARD_SWEEP_PEER="$WIZARD_PEER"
+            WIZARD_SWEEP_PORT="$WIZARD_PORT"
+            return 0
+        else
+            rc=$?
+        fi
+        if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == 2) )); then
+            (( index + 1 < count )) && continue
+            break
+        fi
+        return "$rc"
+    done
+    die "所有已预检的公共 iperf3 对端都不可用或不适合当前路径；请稍后重试或使用自有服务器"
+    return 1
+}
+
+auto_verify_with_peer_failover() {
+    local iface="$1" duration="$2" expected_rate="$3" min_efficiency="$4" baseline_loss="$5"
+    local sweep_peer="${WIZARD_SWEEP_PEER:-$WIZARD_PEER}" current_index="${WIZARD_PUBLIC_INDEX:-0}"
+    local candidate host index rc
+    if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1; then
+        return 0
+    else
+        rc=$?
+    fi
+    (( ${WIZARD_PUBLIC_PEER:-0} && rc == IPERF_UNAVAILABLE_RC )) || return "$rc"
+
+    # The acceptance thresholds come from the sweep path. A different host may
+    # have a different bottleneck, so final verification may only change ports
+    # on the same host. Cross-host failover must restart the complete sweep.
+    for ((index=0; index<${#PUBLIC_PEER_CANDIDATES[@]}; index++)); do
+        (( index != current_index )) || continue
+        candidate="${PUBLIC_PEER_CANDIDATES[$index]}"
+        host="${candidate%%|*}"
+        [[ "$host" == "$sweep_peer" ]] || continue
+        activate_public_peer_candidate "$index" || return 1
+        ((WIZARD_FAILOVERS+=1))
+        log WARN "最终复验切换到同主机备用端口: $WIZARD_PEER:$WIZARD_PORT"
+        if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1; then
+            return 0
+        else
+            rc=$?
+        fi
+        (( rc == IPERF_UNAVAILABLE_RC )) || return "$rc"
+    done
+    die "扫描主机 $sweep_peer 的可用端口在最终复验阶段全部不可用；为保持同路径基线，不会切换到其他主机"
+    return "$IPERF_UNAVAILABLE_RC"
 }
 
 auto_tune_execute() {
     local iface="$1" profile="$2" role="$3" nominal="$4" tuning_rtt="$5" peer_rtt="${6:-0}"
-    local path_rate summary recommend knee measured no_knee confirmed reject_reason min_efficiency baseline_loss expected_rate=0
-    local role_floor rtt_source
+    local summary recommend knee measured no_knee confirmed reject_reason min_efficiency baseline_loss expected_rate=0
+    local role_floor rtt_source verify_summary verify_confidence_score verify_confidence_grade verify_confidence_reasons
     prepare_auto_tuning_runtime "$iface" auto "$profile" "$role" "$nominal" "$tuning_rtt" || return 1
     if [[ -z "${WIZARD_PEER:-}" ]]; then
         verify_runtime_tuning "$iface" || return 1
@@ -3036,11 +4042,11 @@ auto_tune_execute() {
         show_status
         return 0
     fi
-    if (( nominal > 0 )); then
-        path_rate=$((nominal * 40 / 100)); ((path_rate < 1)) && path_rate=1
-        measure_path_check "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$path_rate" || return 1
+    auto_measure_with_peer_failover "$iface" "$nominal" || return 1
+    if (( ${WIZARD_PUBLIC_PEER:-0} )); then
+        peer_rtt="${WIZARD_PEER_RTT:-0}"
+        tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
     fi
-    measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$nominal" 0 0 0 5 1 3 0.1 0 5000 auto || return 1
     summary="$MEASURE_RUN_DIR/summary.tsv"
     recommend=$(summary_value "$summary" RECOMMEND)
     knee=$(summary_value "$summary" BROKE_AT); knee="${knee:-0}"
@@ -3052,8 +4058,8 @@ auto_tune_execute() {
     baseline_loss=$(summary_value "$summary" CLEAN_BASE_RETRANS_RATIO_EST_PERCENT); baseline_loss="${baseline_loss:-0}"
     role_floor=$(role_tuning_rtt_floor "$role") || return 1
     if (( peer_rtt > role_floor )); then rtt_source="observed-peer"; else rtt_source="role-floor"; fi
-    printf 'PEER_RTT_MS\t%s\nTUNING_RTT_MS\t%s\nTUNING_RTT_SOURCE\t%s\nROLE\t%s\n' \
-        "$peer_rtt" "$tuning_rtt" "$rtt_source" "$role" >> "$summary" || return 1
+    printf 'SWEEP_PEER\t%s\nSWEEP_PORT\t%s\nPEER_RTT_MS\t%s\nTUNING_RTT_MS\t%s\nTUNING_RTT_SOURCE\t%s\nROLE\t%s\nPUBLIC_PEER_FAILOVERS\t%s\n' \
+        "${WIZARD_SWEEP_PEER:-$WIZARD_PEER}" "${WIZARD_SWEEP_PORT:-$WIZARD_PORT}" "$peer_rtt" "$tuning_rtt" "$rtt_source" "$role" "${WIZARD_FAILOVERS:-0}" >> "$summary" || return 1
 
     if [[ -n "$reject_reason" || ( -n "$knee" && "$knee" != 0 && "$confirmed" != 1 ) ]]; then
         die "扫描候选值未通过确认测试（${reject_reason:-unconfirmed}），不会应用或持久化"
@@ -3073,10 +4079,27 @@ auto_tune_execute() {
         log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
     fi
     verify_runtime_tuning "$iface" || return 1
-    measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1 || return 1
+    auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss" || return 1
+    verify_summary="$MEASURE_RUN_DIR/summary.tsv"
+    verify_confidence_score=$(summary_value "$verify_summary" CONFIDENCE_SCORE); verify_confidence_score="${verify_confidence_score:-0}"
+    verify_confidence_grade=$(summary_value "$verify_summary" CONFIDENCE_GRADE); verify_confidence_grade="${verify_confidence_grade:-unknown}"
+    verify_confidence_reasons=$(summary_value "$verify_summary" CONFIDENCE_REASONS); verify_confidence_reasons="${verify_confidence_reasons:-unavailable}"
+    if (( ${WIZARD_FAILOVERS:-0} > 0 )) && is_uint "$verify_confidence_score"; then
+        verify_confidence_score=$((verify_confidence_score - 10)); (( verify_confidence_score < 0 )) && verify_confidence_score=0
+        if (( verify_confidence_score >= 90 )); then verify_confidence_grade=high
+        elif (( verify_confidence_score >= 65 )); then verify_confidence_grade=medium
+        else verify_confidence_grade=low
+        fi
+        if [[ "$verify_confidence_reasons" == clean ]]; then verify_confidence_reasons="peer-failover"
+        else verify_confidence_reasons="${verify_confidence_reasons},peer-failover"
+        fi
+    fi
+    printf 'FINAL_VERIFY_PEER\t%s\nFINAL_VERIFY_PORT\t%s\nTOTAL_PUBLIC_PEER_FAILOVERS\t%s\nFINAL_VERIFY_CONFIDENCE_SCORE\t%s\nFINAL_VERIFY_CONFIDENCE_GRADE\t%s\nFINAL_VERIFY_CONFIDENCE_REASONS\t%s\n' \
+        "$WIZARD_PEER" "$WIZARD_PORT" "${WIZARD_FAILOVERS:-0}" "$verify_confidence_score" "$verify_confidence_grade" "$verify_confidence_reasons" >> "$summary" || return 1
     persist_current_tuning || return 1
     printf '\n'
     log OK "自动调优、复验和持久化提交完成"
+    log INFO "最终复验置信度: ${verify_confidence_grade} (${verify_confidence_score}/100, ${verify_confidence_reasons})"
     show_status
     log INFO "扫描记录: $summary"
 }
@@ -3087,7 +4110,8 @@ auto_tune_wizard() {
     require_systemd_runtime || return 1
     [[ -t 0 ]] || { die "auto 向导需要交互终端"; return 1; }
     local bandwidth_input nominal=0 role_choice role=mixed peer_rtt=0 tuning_rtt=0 profile=balanced estimate="动态估算" iface rc rollback_rc=0
-    WIZARD_PEER=""; WIZARD_PORT=5201
+    WIZARD_PEER=""; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PUBLIC_INDEX=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0
+    WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SCAN_CAP=5000; WIZARD_SAMPLE_DURATION=5
     printf '\n%s v%s 自动调优\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
     printf '首次修改前会保存不可覆盖的基线：%s\n' "$BASELINE_DIR"
     printf '包含本工具涉及的 sysctl、配置/服务、qdisc/class，以及 IPv4/IPv6 路由快照。\n\n'
@@ -3102,35 +4126,44 @@ auto_tune_wizard() {
 
     if [[ "$nominal" != 0 || "$bandwidth_input" == a || "$bandwidth_input" == auto ]]; then
         interactive_select_peer || return 1
-        peer_rtt=$(median_ping_ms "$WIZARD_PEER"); [[ -n "$peer_rtt" ]] || peer_rtt=0
+        peer_rtt="${WIZARD_PEER_RTT:-0}"
+        if (( peer_rtt == 0 )); then peer_rtt=$(median_ping_ms "$WIZARD_PEER"); [[ -n "$peer_rtt" ]] || peer_rtt=0; fi
     fi
 
     printf '%s\n' '用途：1) 混合业务  2) 代理/转发  3) 大文件吞吐'
     read -r -p '选择 [1]: ' role_choice || return 1
     case "${role_choice:-1}" in 1) role=mixed ;; 2) role=proxy ;; 3) role=bulk ;; *) die "无效用途"; return 1 ;; esac
     tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
+    iface=$(detect_interface auto) || return 1
+    WIZARD_SCAN_CAP=$(recommended_scan_cap "$iface" "$nominal") || return 1
+    WIZARD_SAMPLE_DURATION=$(recommended_measure_duration "$iface" "$nominal") || return 1
     if (( nominal > 0 && tuning_rtt > 0 )); then
         profile=adaptive
-        estimate="约 $(human_bytes "$(estimate_sweep_bytes "$((nominal * 13 / 10))" 5 20)") 上行"
+        estimate="约 $(human_bytes "$(estimate_sweep_bytes "$((nominal * 13 / 10))" "$WIZARD_SAMPLE_DURATION" 20)") 上行"
     elif [[ -n "${WIZARD_PEER:-}" ]]; then
-        estimate="将按实测带宽动态计算，扫描上限 5000 Mbit/s"
+        estimate="将按实测带宽动态计算，扫描上限 ${WIZARD_SCAN_CAP} Mbit/s"
     else
         estimate="不运行测速"
     fi
 
     printf '\n执行摘要\n'
-    printf '  网卡/用途       auto / %s\n' "$role"
+    hardware_profile_values "$iface" "$nominal" || return 1
+    printf '  网卡/用途       %s / %s\n' "$iface" "$role"
+    printf '  硬件模型        %s / %s CPU / %s MiB / RX:TX %s:%s\n' "$HARDWARE_CLASS" "$HARDWARE_CPU_COUNT" "$HARDWARE_MEMORY_MB" "$HARDWARE_RX_QUEUES" "$HARDWARE_TX_QUEUES"
+    printf '  链路/采样       %s Mbit（%s）/ %ss\n' "$HARDWARE_LINK_MBIT" "$HARDWARE_LINK_TRUST" "$WIZARD_SAMPLE_DURATION"
+    printf '  扫描策略        初始上限 %s Mbit；自动测量后可按基准扩展\n' "$WIZARD_SCAN_CAP"
     printf '  标称带宽        %s\n' "$([[ "$bandwidth_input" == a || "$bandwidth_input" == auto ]] && echo 自动测量 || echo "${nominal} Mbit/s")"
     if [[ -n "${WIZARD_PEER:-}" ]]; then
         printf '  iperf3 对端     %s:%s（测速 RTT %sms）\n' "$WIZARD_PEER" "$WIZARD_PORT" "${peer_rtt:-unknown}"
+        if (( WIZARD_PUBLIC_PEER )); then printf '  公共备用对端    %s 个（正式采样不可用时自动切换）\n' "$(( ${#PUBLIC_PEER_CANDIDATES[@]} - 1 ))"; fi
         printf '  缓冲区调优 RTT  %sms（按用途下限与测速 RTT 取较大值）\n' "$tuning_rtt"
     fi
     printf '  预计时间/流量   约 3–8 分钟 / %s\n' "$estimate"
     printf '  持久化位置      %s + %s\n' "$CONFIG_FILE" "$SERVICE_FILE"
     confirm "确认开始？" || { log INFO "已取消，未修改系统"; return 0; }
 
-    iface=$(detect_interface auto) || return 1
     qdisc_guard "$iface" || return 1
+    BANDWIDTH_MBIT="$nominal"; network_tuning_preflight "$iface" 1 || return 1
     action_transaction_begin "$iface" || return 1
     if auto_tune_execute "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" "$peer_rtt"; then
         action_transaction_commit
@@ -3177,13 +4210,17 @@ invalid_menu_choice() {
 }
 
 measurement_action() {
-    local choice="$1"
+    local choice="$1" rate
     ensure_interactive_measure_dependencies || return 1
     interactive_select_peer || return 1
     case "$choice" in
-        1) measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto 0 0 0 0 5 1 3 0.1 0 5000 ;;
+        1) measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" auto 0 0 0 0 5 1 3 0.1 0 0 ;;
         2) measure_probe "$WIZARD_PEER" "$WIZARD_PORT" auto 8 4 ;;
         3) measure_verify "$WIZARD_PEER" "$WIZARD_PORT" auto 8 ;;
+        4)
+            read -r -p 'A/B 整形速率 Mbit/s: ' rate || return 1
+            measure_compare "$WIZARD_PEER" "$WIZARD_PORT" auto "$rate" 6 2
+            ;;
     esac
 }
 
@@ -3191,10 +4228,10 @@ measurement_menu() {
     local choice
     while true; do
         ui_clear
-        printf '%s\n' '测量与复验' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/四流复验' '0) 返回主菜单'
+        printf '%s\n' '测量与复验' '1) 自动拐点扫描' '2) 单次带宽探测' '3) 单流/硬件自适应多流复验' '4) FQ 与整形 A/B 对照' '0) 返回主菜单'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
-            1|2|3) submenu_run measurement_action "$choice" || return 90 ;;
+            1|2|3|4) submenu_run measurement_action "$choice" || return 90 ;;
             0) return 0 ;;
             *) invalid_menu_choice ;;
         esac
