@@ -476,7 +476,7 @@ test_measure_compare_is_temporary_and_auditable() {
             MEASURE_PEER_HOST="$1"; MEASURE_PEER_ADDRESS=203.0.113.10
             MEASURE_PEER_SOURCE=192.0.2.10; MEASURE_PEER_FAMILY=4; MEASURE_PEER_IFACE="$2"
             path_state_reset
-            PATH_PROFILE_SCORE=100; PATH_PROFILE_GRADE=high; PATH_DECISION=accept; PATH_RISK_FLAGS=none
+            PATH_PROFILE_SCORE=100; PATH_PROFILE_GRADE=high; PATH_DECISION=trusted; PATH_RISK_FLAGS=clean
         }
         measure_require_locked_port() { :; }
         detect_link_speed() { printf '100\n'; }; measure_set_latency_baseline() { MEASURE_IDLE_RTT_MS=10; }
@@ -1299,7 +1299,18 @@ test_repeated_sample_classifies_peer_unavailable() {
         if iperf_failure_is_unavailable 'invalid JSON output'; then fail "local parse error was classified as unavailable"; fi
 
         require_root() { :; }; acquire_lock() { :; }; tc_dependencies() { :; }; require_commands() { :; }
+        detect_interface() { printf 'eth0\n'; }
+        measure_lock_peer() {
+            MEASURE_PEER_HOST="$1"; MEASURE_PEER_ADDRESS=203.0.113.10
+            MEASURE_PEER_SOURCE=192.0.2.10; MEASURE_PEER_FAMILY=4; MEASURE_PEER_IFACE="$2"
+        }
         peer_port_open() { return 1; }
+        measure_require_locked_port() {
+            peer_port_open "$MEASURE_PEER_ADDRESS" "$2" || {
+                measure_clear_peer_lock
+                return "$IPERF_UNAVAILABLE_RC"
+            }
+        }
         if measure_sweep closed.example 5201 auto 0 0 0 0 5 1 3 0.1 0 5000 >/dev/null 2>&1; then
             fail "closed public port reported sweep success"
         else
@@ -1323,6 +1334,17 @@ test_sweep_without_knee_does_not_recommend_ceiling() {
     local summary
     require_root() { :; }; acquire_lock() { :; }; tc_dependencies() { :; }; require_commands() { :; }
     peer_port_open() { :; }; detect_interface() { printf 'eth0\n'; }; qdisc_guard() { :; }
+    # Sweep arithmetic is a pure unit test here.  Freeze a synthetic route so
+    # GitHub-hosted runners with DNS AAAA answers but no IPv6 route cannot
+    # change the result or prevent the intended assertions from running.
+    measure_lock_peer() {
+        MEASURE_PEER_HOST="$1"; MEASURE_PEER_ADDRESS=203.0.113.10
+        MEASURE_PEER_SOURCE=192.0.2.10; MEASURE_PEER_FAMILY=4; MEASURE_PEER_IFACE="$2"
+        path_state_reset
+        PATH_PROFILE_SCORE=100; PATH_PROFILE_GRADE=high; PATH_DECISION=trusted; PATH_RISK_FLAGS=clean
+    }
+    measure_require_locked_port() { :; }
+    measure_set_latency_baseline() { MEASURE_IDLE_RTT_MS=1; }
     measure_begin() { MEASURE_IFACE=eth0; }; measure_restore() { :; }; traffic_report() { :; }
     apply_fq() { :; }; apply_shaping() { :; }
     sample_repeated() {
@@ -1334,6 +1356,7 @@ test_sweep_without_knee_does_not_recommend_ceiling() {
     summary="$MEASURE_RUN_DIR/summary.tsv"
     assert_eq 1 "$(summary_value "$summary" NO_KNEE)" "no-knee marker"
     assert_eq '' "$(summary_value "$summary" RECOMMEND)" "no-knee recommendation"
+    assert_eq 203.0.113.10 "$(summary_value "$summary" LOCKED_ADDRESS)" "sweep locked peer audit"
 }
 
 test_refine_preserves_throughput_stall_and_confirmation_gate() {
