@@ -36,8 +36,9 @@ tcp_baseline_test_sysctl_value() {
         net.core.default_qdisc) printf 'fq\n' ;;
         net.ipv4.tcp_congestion_control) printf 'cubic\n' ;;
         net.core.rmem_max|net.core.wmem_max) printf '16777216\n' ;;
-        net.ipv4.tcp_rmem) printf '4096 131072 16777216\n' ;;
-        net.ipv4.tcp_wmem) printf '4096 16384 16777216\n' ;;
+        # Real Debian/Ubuntu procfs commonly exposes these triplets with TABs.
+        net.ipv4.tcp_rmem) printf '4096\t131072\t16777216\n' ;;
+        net.ipv4.tcp_wmem) printf '4096\t16384\t16777216\n' ;;
         net.ipv4.tcp_mtu_probing) printf '0\n' ;;
         net.ipv4.tcp_fastopen) printf '1\n' ;;
         net.core.somaxconn) printf '4096\n' ;;
@@ -45,6 +46,13 @@ tcp_baseline_test_sysctl_value() {
         net.core.netdev_max_backlog) printf '1000\n' ;;
         *) return 1 ;;
     esac
+}
+
+tcp_baseline_test_snapshot() {
+    local key
+    while IFS= read -r key; do
+        printf '%s\t%s\n' "$key" "$(tcp_baseline_test_sysctl_value "$key")"
+    done < <(tcp_baseline_sysctl_keys)
 }
 
 write_valid_v1_tcp_baseline() {
@@ -790,9 +798,9 @@ test_self_update_rolls_back_split_install() {
         local update_root="$TEST_ROOT/self-update" installed_path candidate valid_candidate output_path="" url="" update_output="" fail_persist=1
         mkdir -p "$update_root"
         installed_path="$update_root/bbr"; candidate="$update_root/new.sh"; valid_candidate="$update_root/new.valid.sh"; PERSIST_SCRIPT="$update_root/persist.sh"
-        sed 's/^SCRIPT_VERSION="8.0.0"$/SCRIPT_VERSION="7.0.6"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
+        sed 's/^SCRIPT_VERSION="8.0.1"$/SCRIPT_VERSION="8.0.0"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
         cp "$installed_path" "$PERSIST_SCRIPT"; chmod 0755 "$installed_path" "$PERSIST_SCRIPT"
-        sed 's/^SCRIPT_VERSION="8.0.0"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
+        sed 's/^SCRIPT_VERSION="8.0.1"$/SCRIPT_VERSION="8.0.2"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
         cp "$candidate" "$valid_candidate"
         require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
         current_script_path() { printf '%s\n' "$installed_path"; }
@@ -807,7 +815,7 @@ test_self_update_rolls_back_split_install() {
                 esac
             done
             case "$url" in
-                */releases/latest) printf '{"tag_name":"v8.0.1"}\n' ;;
+                */releases/latest) printf '{"tag_name":"v8.0.2"}\n' ;;
                 */net-tcp-tune.sh) cp "$candidate" "$output_path" ;;
                 */SHA256SUMS)
                     printf '%s  net-tcp-tune.sh\n' "$(sha256sum "$candidate" | awk '{print $1}')" > "$output_path"
@@ -820,19 +828,19 @@ test_self_update_rolls_back_split_install() {
             [[ "$target" != "$PERSIST_SCRIPT" || "$fail_persist" == 0 ]] || return 9
             cp "$source" "$target"; chmod 0755 "$target"
         }
-        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.1"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
+        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.2"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
         if self_update >/dev/null 2>&1; then fail "checksum-matching false-marker update was accepted"; fi
-        grep -Fq 'SCRIPT_VERSION="7.0.6"' "$installed_path" || fail "rejected false-marker update changed current command"
+        grep -Fq 'SCRIPT_VERSION="8.0.0"' "$installed_path" || fail "rejected false-marker update changed current command"
         cp "$valid_candidate" "$candidate"
         if update_output=$(self_update 2>&1); then fail "split self-update failure reported success"; fi
-        grep -Fq 'SCRIPT_VERSION="7.0.6"' "$installed_path" || fail "current command was not rolled back"
-        grep -Fq 'SCRIPT_VERSION="7.0.6"' "$PERSIST_SCRIPT" || fail "persistent copy changed after failed update"
-        grep -Fq 'SCRIPT_VERSION="7.0.6"' "$installed_path.previous" || fail "previous-version backup missing: $update_output"
+        grep -Fq 'SCRIPT_VERSION="8.0.0"' "$installed_path" || fail "current command was not rolled back"
+        grep -Fq 'SCRIPT_VERSION="8.0.0"' "$PERSIST_SCRIPT" || fail "persistent copy changed after failed update"
+        grep -Fq 'SCRIPT_VERSION="8.0.0"' "$installed_path.previous" || fail "previous-version backup missing: $update_output"
 
         fail_persist=0
         self_update >/dev/null
-        grep -Fq 'SCRIPT_VERSION="8.0.1"' "$installed_path" || fail "successful update did not replace current command"
-        grep -Fq 'SCRIPT_VERSION="8.0.1"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
+        grep -Fq 'SCRIPT_VERSION="8.0.2"' "$installed_path" || fail "successful update did not replace current command"
+        grep -Fq 'SCRIPT_VERSION="8.0.2"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
     )
 }
 
@@ -906,6 +914,62 @@ test_uninstall_restores_before_removal() (
     assert_eq ' tcp dns ipv6 cli' "$events" "uninstall restore/delete order"
 )
 
+test_tcp_sysctl_snapshot_whitespace_portability() (
+    local root="$TEST_ROOT/tcp-sysctl-whitespace" snapshot legacy invalid writes key before_hash
+    root="$TEST_ROOT/tcp-sysctl-whitespace"
+    snapshot="$root/canonical.tsv"; legacy="$root/legacy-tabs.tsv"; invalid="$root/invalid.tsv"; writes="$root/writes"
+    mkdir -p "$root"
+    : > "$writes"
+    sysctl() {
+        if [[ "$1" == -n ]]; then
+            tcp_baseline_test_sysctl_value "$2"
+            return
+        fi
+        [[ "$1" == -q && "$2" == -w ]] || return 1
+        printf '%s\n' "$3" >> "$writes"
+    }
+
+    capture_runtime_sysctls > "$snapshot" || fail "TAB-separated kernel sysctls could not be captured"
+    tcp_baseline_sysctl_validate "$snapshot" || fail "canonical sysctl snapshot did not validate"
+    awk -F '\t' 'NF != 2 {exit 1}' "$snapshot" || fail "captured sysctl snapshot retained ambiguous TAB fields"
+    grep -Fxq $'net.ipv4.tcp_rmem\t4096 131072 16777216' "$snapshot" || fail "tcp_rmem was not canonicalized"
+    grep -Fxq $'net.ipv4.tcp_wmem\t4096 16384 16777216' "$snapshot" || fail "tcp_wmem was not canonicalized"
+
+    # Complete v7.2+/v8 snapshots captured before this fix may contain the
+    # original procfs TAB triplets.  They remain strictly validated and replay
+    # as canonical space-separated assignments.
+    while IFS= read -r key; do
+        printf '%s\t%s\n' "$key" "$(tcp_baseline_test_sysctl_value "$key")"
+    done < <(tcp_baseline_sysctl_keys) > "$legacy"
+    tcp_baseline_sysctl_validate "$legacy" || fail "safe historical TAB snapshot was rejected"
+    restore_tcp_sysctl_snapshot_file "$legacy" || fail "safe historical TAB snapshot was not replayable"
+    grep -Fxq 'net.ipv4.tcp_rmem=4096 131072 16777216' "$writes" || fail "tcp_rmem restore was not canonicalized"
+    grep -Fxq 'net.ipv4.tcp_wmem=4096 16384 16777216' "$writes" || fail "tcp_wmem restore was not canonicalized"
+
+    cp "$legacy" "$invalid"
+    sed -i $'s/^net.core.somaxconn\t.*/net.core.somaxconn\t4096\t1/' "$invalid"
+    if tcp_baseline_sysctl_validate "$invalid" >/dev/null 2>&1; then fail "extra scalar TAB field was accepted"; fi
+    before_hash=$(sha256sum "$writes" | awk '{print $1}')
+    if restore_tcp_sysctl_snapshot_file "$invalid" >/dev/null 2>&1; then fail "invalid snapshot restore reported success"; fi
+    [[ "$(sha256sum "$writes" | awk '{print $1}')" == "$before_hash" ]] || fail "invalid snapshot caused partial sysctl replay"
+
+    cp "$legacy" "$invalid"
+    sed -i $'s/^net.ipv4.tcp_rmem\t.*/net.ipv4.tcp_rmem\t4096\t131072\t16777216\t1/' "$invalid"
+    if tcp_baseline_sysctl_validate "$invalid" >/dev/null 2>&1; then fail "four-value TCP buffer snapshot was accepted"; fi
+
+    cp "$legacy" "$invalid"
+    sed -i $'s/^net.ipv4.tcp_wmem\t.*/net.ipv4.tcp_wmem\t4096\tinvalid\t16777216/' "$invalid"
+    if tcp_baseline_sysctl_validate "$invalid" >/dev/null 2>&1; then fail "non-numeric TCP buffer snapshot was accepted"; fi
+
+    cp "$legacy" "$invalid"
+    sed -i $'s/^net.core.somaxconn\t.*/\t4096/' "$invalid"
+    if tcp_baseline_sysctl_validate "$invalid" >/dev/null 2>&1; then fail "empty sysctl key was accepted"; fi
+
+    cp "$legacy" "$invalid"
+    sed -i $'s/^net.core.somaxconn\t.*/net.core.somaxconn\t/' "$invalid"
+    if tcp_baseline_sysctl_validate "$invalid" >/dev/null 2>&1; then fail "empty sysctl value was accepted"; fi
+)
+
 test_tcp_baseline_validation_is_write_free() (
     local root="$TEST_ROOT/tcp-baseline-invalid" case_name expected events=""
     local live_config='live-config' live_sysctl='live-sysctl' live_service='live-service' live_persist='live-persist'
@@ -925,7 +989,7 @@ test_tcp_baseline_validation_is_write_free() (
     ip() { events+=" ip:$*"; return 1; }
     remove_cli_command() { events+=" cli"; }
 
-    for case_name in manifest-only missing-qdisc state-payload-mismatch duplicate-sysctl illegal-sysctl; do
+    for case_name in manifest-only missing-qdisc state-payload-mismatch duplicate-sysctl illegal-sysctl extra-field-sysctl invalid-buffer-triplet empty-sysctl-key empty-sysctl-value unknown-sysctl-key missing-sysctl-key; do
         write_valid_v1_tcp_baseline "$BASELINE_DIR" eth0
         case "$case_name" in
             manifest-only)
@@ -937,6 +1001,12 @@ test_tcp_baseline_validation_is_write_free() (
             state-payload-mismatch) printf 'absent\n' > "$BASELINE_DIR/config.state" ;;
             duplicate-sysctl) printf 'net.core.somaxconn\t8192\n' >> "$BASELINE_DIR/sysctl.tsv" ;;
             illegal-sysctl) sed -i 's/^net.core.somaxconn\t.*/net.core.somaxconn\tnot-a-number/' "$BASELINE_DIR/sysctl.tsv" ;;
+            extra-field-sysctl) sed -i $'s/^net.core.somaxconn\t.*/net.core.somaxconn\t4096\t1/' "$BASELINE_DIR/sysctl.tsv" ;;
+            invalid-buffer-triplet) sed -i $'s/^net.ipv4.tcp_rmem\t.*/net.ipv4.tcp_rmem\t4096\t131072\tbad/' "$BASELINE_DIR/sysctl.tsv" ;;
+            empty-sysctl-key) sed -i $'s/^net.core.somaxconn\t.*/\t4096/' "$BASELINE_DIR/sysctl.tsv" ;;
+            empty-sysctl-value) sed -i $'s/^net.core.somaxconn\t.*/net.core.somaxconn\t/' "$BASELINE_DIR/sysctl.tsv" ;;
+            unknown-sysctl-key) sed -i $'s/^net.core.somaxconn\t.*/kernel.hostname\t1/' "$BASELINE_DIR/sysctl.tsv" ;;
+            missing-sysctl-key) sed -i $'/^net.core.somaxconn\t/d' "$BASELINE_DIR/sysctl.tsv" ;;
         esac
         rm -rf -- "$root/expected"; cp -a -- "$BASELINE_DIR" "$root/expected"
         printf '%s\n' "$live_config" > "$CONFIG_FILE"
@@ -1223,9 +1293,13 @@ test_peer_parser() {
 }
 
 test_public_peer_requires_real_iperf_preflight() {
-    peer_port_open() { :; }
-    iperf_peer_usable() { [[ "$2" == 5203 ]]; }
-    assert_eq 5203 "$(public_peer_ports example.com 1)" "public iperf preflight"
+    measure_lock_peer() {
+        [[ "$3" == 5203 ]] || return "$IPERF_UNAVAILABLE_RC"
+        MEASURE_PEER_HOST="$1"; MEASURE_PEER_ADDRESS=203.0.113.10
+        MEASURE_PEER_SOURCE=192.0.2.10; MEASURE_PEER_FAMILY=4; MEASURE_PEER_IFACE=eth0; MEASURE_PEER_PORT="$3"
+    }
+    median_ping_ms() { printf '7\n'; }
+    assert_eq $'5203\t203.0.113.10\t4\t192.0.2.10\teth0\t7' "$(public_peer_ports example.com 1 auto)" "public iperf preflight"
 }
 
 test_public_peer_pool_and_formal_failover() {
@@ -1233,15 +1307,21 @@ test_public_peer_pool_and_formal_failover() {
         local events="" rc=0
         require_commands() { :; }
         PUBLIC_PEER_POOL=$'near.example|近端|ProviderA\nbackup.example|备用|ProviderB'
-        median_ping_ms() { [[ "$1" == near.example ]] && printf '1\n' || printf '8\n'; }
+        peer_route_rtt() { [[ "$1" == near.example ]] && printf '1\n' || printf '8\n'; }
         public_peer_ports() {
-            if [[ "$1" == near.example ]]; then printf '5201\n5202\n'; else printf '5203\n5204\n'; fi
+            if [[ "$1" == near.example ]]; then
+                printf '5201\t203.0.113.10\t4\t192.0.2.10\teth0\t1\n'
+                printf '5202\t203.0.113.10\t4\t192.0.2.10\teth0\t1\n'
+            else
+                printf '5203\t198.51.100.10\t4\t192.0.2.10\teth0\t8\n'
+                printf '5204\t198.51.100.10\t4\t192.0.2.10\teth0\t8\n'
+            fi
         }
         BBRV3_PUBLIC_PEER_CANDIDATES=4 BBRV3_PUBLIC_PORTS_PER_HOST=2 auto_pick_peer
         assert_eq 4 "${#PUBLIC_PEER_CANDIDATES[@]}" "public peer reserve count"
-        assert_eq 'near.example|5201|1|近端|ProviderA' "${PUBLIC_PEER_CANDIDATES[0]}" "primary public candidate"
-        assert_eq 'backup.example|5203|8|备用|ProviderB' "${PUBLIC_PEER_CANDIDATES[1]}" "public pool host diversity"
-        assert_eq 'near.example|5202|1|近端|ProviderA' "${PUBLIC_PEER_CANDIDATES[2]}" "same-host fallback ordering"
+        assert_eq 'near.example|203.0.113.10|4|192.0.2.10|eth0|5201|1|近端|ProviderA' "${PUBLIC_PEER_CANDIDATES[0]}" "primary public candidate"
+        assert_eq 'backup.example|198.51.100.10|4|192.0.2.10|eth0|5203|8|备用|ProviderB' "${PUBLIC_PEER_CANDIDATES[1]}" "public pool host diversity"
+        assert_eq 'near.example|203.0.113.10|4|192.0.2.10|eth0|5202|1|近端|ProviderA' "${PUBLIC_PEER_CANDIDATES[2]}" "same-host fallback ordering"
 
         WIZARD_PUBLIC_PEER=1; WIZARD_PUBLIC_INDEX=0; WIZARD_FAILOVERS=0
         activate_public_peer_candidate 0
@@ -1267,7 +1347,8 @@ test_public_peer_pool_and_formal_failover() {
         assert_eq 5204 "$WIZARD_PORT" "final verification backup port"
 
         activate_public_peer_candidate 0
-        WIZARD_SWEEP_PEER=near.example; WIZARD_SWEEP_PORT=5201; events=""
+        WIZARD_SWEEP_PEER=near.example; WIZARD_SWEEP_PORT=5201
+        WIZARD_SWEEP_ADDRESS="$WIZARD_PEER_ADDRESS"; WIZARD_SWEEP_SOURCE="$WIZARD_PEER_SOURCE"; WIZARD_SWEEP_IFACE="$WIZARD_PEER_IFACE"; events=""
         measure_verify() {
             events+=" $1:$2"
             [[ "$1" == backup.example ]] && return 0
@@ -1280,6 +1361,21 @@ test_public_peer_pool_and_formal_failover() {
         fi
         assert_eq "$IPERF_UNAVAILABLE_RC" "$rc" "same-path verification failure status"
         assert_eq ' near.example:5201 near.example:5202' "$events" "final verification attempted a different host"
+
+        PUBLIC_PEER_CANDIDATES=(
+            'first.example|203.0.113.10|4|192.0.2.10|eth0|5201|1|首选|ProviderA'
+            'other-iface.example|198.51.100.20|4|192.0.2.20|eth1|5201|2|异网卡|ProviderB'
+            'same-iface.example|198.51.100.30|4|192.0.2.30|eth0|5201|3|备用|ProviderC'
+        )
+        WIZARD_PUBLIC_PEER=1; WIZARD_PUBLIC_INDEX=0; WIZARD_FAILOVERS=0; events=""
+        measure_sweep() {
+            events+=" $1:$2"
+            [[ "$1" == first.example || "$1" == self.example ]] && return "$IPERF_UNAVAILABLE_RC"
+            return 0
+        }
+        auto_measure_with_peer_failover eth0 0 >/dev/null
+        assert_eq ' first.example:5201 same-iface.example:5201' "$events" "cross-interface backup was executed"
+        assert_eq 1 "$WIZARD_FAILOVERS" "skipped cross-interface candidate counted as a failover"
 
         WIZARD_PUBLIC_PEER=0; WIZARD_PEER=self.example; WIZARD_PORT=5201; events=""
         if auto_measure_with_peer_failover eth0 0 >/dev/null 2>&1; then fail "private peer failure reported success"; else rc=$?; fi
@@ -1531,6 +1627,20 @@ test_measurement_acceptance_gate() {
     if measurement_sample_acceptable 95 1.0 100 0.94 0.1 0; then fail "high-retrans confirmation accepted"; fi
 }
 
+test_action_transaction_capture_failure_clears_state() (
+    local root="$TEST_ROOT/transaction-capture-failure"
+    STATE_DIR="$root/state"; HISTORY_DIR="$STATE_DIR/history"
+    ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+    action_qdisc_snapshot() { printf 'KIND\tfq\nRATE\t\nARGS\t\n' > "$2"; }
+    capture_runtime_sysctls() { return 1; }
+
+    if action_transaction_begin eth0 >/dev/null 2>&1; then fail "failed sysctl capture created a transaction"; fi
+    assert_eq '' "$ACTION_TRANSACTION_DIR" "failed capture transaction directory state"
+    assert_eq '' "$ACTION_TRANSACTION_IFACE" "failed capture transaction interface state"
+    assert_eq '' "$ACTION_TRANSACTION_INTERFACES" "failed capture transaction interface-set state"
+    [[ -z "$(find "$STATE_DIR" -maxdepth 1 -name '.transaction.*' -print -quit 2>/dev/null)" ]] || fail "failed capture left a transaction directory"
+)
+
 test_action_transaction_rolls_back_failed_step() {
     local events="" config_before='config-before' sysctl_before='sysctl-before' legacy_sysctl_before='legacy-sysctl-before'
     local service_before='service-before' persist_before='persist-before'
@@ -1555,7 +1665,7 @@ test_action_transaction_rolls_back_failed_step() {
     MULTI_NIC_ENABLED=0; TC_INTERFACE=auto
     action_qdisc_snapshot() { printf 'KIND\tfq\nRATE\t\nARGS\t\n' > "$2"; }
     restore_action_qdisc() { events+=" qdisc:$1"; }
-    capture_runtime_sysctls() { printf 'net.test.key\tbefore\n'; }
+    capture_runtime_sysctls() { tcp_baseline_test_snapshot; }
     sysctl() { [[ "$1" == -q && "$2" == -w ]] && events+=" sysctl:${3}"; }
     ip() { case "$*" in '-4 route show default') printf 'default via 192.0.2.1 dev eth0\n' ;; '-6 route show default') : ;; *) events+=" ip:$*" ;; esac; }
     systemctl() {
@@ -1602,7 +1712,7 @@ test_action_transaction_rolls_back_failed_step() {
     assert_eq "$legacy_sysctl_before" "$(<"$LEGACY_SYSCTL_FILE")" "transaction legacy sysctl restore"
     assert_eq "$service_before" "$(<"$SERVICE_FILE")" "transaction service restore"
     assert_eq "$persist_before" "$(<"$PERSIST_SCRIPT")" "transaction persistent script restore"
-    [[ "$events" == *'sysctl:net.test.key=before'* && "$events" == *'qdisc:eth0'* && "$events" == *'systemctl:start bbrv3-lite.service'* ]] ||
+    [[ "$events" == *'sysctl:net.core.somaxconn=4096'* && "$events" == *'qdisc:eth0'* && "$events" == *'systemctl:start bbrv3-lite.service'* ]] ||
         fail "transaction runtime/service restore events missing: $events"
     assert_eq '' "$ACTION_TRANSACTION_DIR" "transaction snapshot cleanup"
 }
@@ -1853,6 +1963,7 @@ run_test test_legacy_sysctl_retirement_requires_baseline_and_transaction
 run_test test_cli_command_removal_is_scoped
 run_test test_uninstall_purge_preflight_is_write_free
 run_test test_uninstall_restores_before_removal
+run_test test_tcp_sysctl_snapshot_whitespace_portability
 run_test test_tcp_baseline_validation_is_write_free
 run_test test_tcp_baseline_capture_is_atomic_and_replayable
 run_test test_valid_v1_tcp_baseline_restores
@@ -1878,6 +1989,7 @@ run_test test_container_mutation_guard
 run_test test_install_failure_is_not_success
 run_test test_force_scan_requires_explicit_flag
 run_test test_measurement_acceptance_gate
+run_test test_action_transaction_capture_failure_clears_state
 run_test test_auto_tune_commits_only_after_final_verify
 run_test test_dns_apply_failure_restores_action_snapshot
 run_test test_ipv6_malformed_baseline_is_immutable_and_write_free

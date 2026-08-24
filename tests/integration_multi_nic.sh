@@ -46,7 +46,7 @@ MULTI_NIC_ENABLED=1
 # sysctl and route-window rollback are covered by unit tests and must not alter
 # the Docker host while these namespace-local qdiscs are exercised.
 apply_sysctl_profile() { [[ "$1" == runtime ]]; }
-capture_runtime_sysctls() { printf 'net.test.key\tbefore\n'; }
+capture_runtime_sysctls() { printf 'net.core.somaxconn\t4096\n'; }
 apply_initial_windows() { :; }
 nic_restore_runtime_snapshot() { :; }
 

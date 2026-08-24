@@ -28,6 +28,62 @@ tcp_baseline_regular_file() {
     [[ -f "$1" && ! -L "$1" ]]
 }
 
+# procfs represents the TCP buffer triplets as whitespace-separated values.
+# Depending on the kernel/procps combination, `sysctl -n` may preserve the
+# procfs TABs or print spaces.  Snapshot files use TAB as the key/value
+# delimiter, so normalize every value before writing it and again before
+# replay.  This keeps the on-disk format unambiguous without weakening the
+# restore whitelist.
+tcp_sysctl_snapshot_value_normalize() {
+    local key="$1" value="$2" first="" second="" third="" extra=""
+    [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+    case "$key" in
+        net.core.default_qdisc|net.ipv4.tcp_congestion_control)
+            [[ "$value" =~ ^[A-Za-z0-9_.+-]+$ ]] || return 1
+            printf '%s\n' "$value"
+            ;;
+        net.ipv4.tcp_rmem|net.ipv4.tcp_wmem)
+            IFS=$' \t' read -r first second third extra <<< "$value"
+            is_uint "$first" && is_uint "$second" && is_uint "$third" && [[ -z "$extra" ]] || return 1
+            printf '%s %s %s\n' "$first" "$second" "$third"
+            ;;
+        net.core.rmem_max|net.core.wmem_max|net.ipv4.tcp_mtu_probing|net.ipv4.tcp_fastopen|\
+        net.core.somaxconn|net.ipv4.tcp_max_syn_backlog|net.core.netdev_max_backlog)
+            is_uint "$value" || return 1
+            printf '%s\n' "$value"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+restore_tcp_sysctl_snapshot_file() {
+    local file="$1" line key raw_value value rc=0
+    tcp_baseline_regular_file "$file" || return 1
+    if ! tcp_baseline_sysctl_validate "$file"; then
+        log WARN "拒绝恢复不完整或非法的 sysctl 快照: $file"
+        return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" != *$'\t'* ]]; then
+            log WARN "无法恢复格式非法的 sysctl 快照行"
+            rc=1
+            continue
+        fi
+        key="${line%%$'\t'*}"
+        raw_value="${line#*$'\t'}"
+        if ! value=$(tcp_sysctl_snapshot_value_normalize "$key" "$raw_value"); then
+            log WARN "无法恢复非法 sysctl 快照值: ${key:-empty}"
+            rc=1
+            continue
+        fi
+        if ! sysctl -q -w "$key=$value"; then
+            log WARN "无法恢复 sysctl: $key"
+            rc=1
+        fi
+    done < "$file"
+    return "$rc"
+}
+
 # A removable/delegated executable must be an assembled bbrv3-lite script,
 # not merely an arbitrary file containing one easy-to-forge marker.  Keep this
 # signature version-agnostic so a trustworthy baseline captured by an older
@@ -102,33 +158,24 @@ tcp_baseline_manifest_validate() {
 }
 
 tcp_baseline_sysctl_validate() {
-    local file="$1" line key value first second third extra
+    local file="$1" line key value
     local -A allowed=() seen=()
     tcp_baseline_regular_file "$file" || { tcp_baseline_invalid "sysctl 快照缺失或类型非法"; return 1; }
     [[ -s "$file" ]] || { tcp_baseline_invalid "sysctl 快照为空"; return 1; }
     while IFS= read -r key; do allowed[$key]=1; done < <(tcp_baseline_sysctl_keys)
     while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" != *$'\t'* || "${line#*$'\t'}" == *$'\t'* ]]; then
+        if [[ "$line" != *$'\t'* ]]; then
             tcp_baseline_invalid "sysctl 快照含非法字段行"
             return 1
         fi
         key="${line%%$'\t'*}"; value="${line#*$'\t'}"
+        [[ -n "$key" && -n "$value" ]] || { tcp_baseline_invalid "sysctl 快照含空字段"; return 1; }
+        tcp_sysctl_snapshot_value_normalize "$key" "$value" >/dev/null || {
+            tcp_baseline_invalid "sysctl key 或值非法: $key"
+            return 1
+        }
         [[ -n "${allowed[$key]+x}" ]] || { tcp_baseline_invalid "sysctl key 不在恢复白名单: ${key:-empty}"; return 1; }
         [[ -z "${seen[$key]+x}" ]] || { tcp_baseline_invalid "sysctl key 重复: $key"; return 1; }
-        case "$key" in
-            net.core.default_qdisc|net.ipv4.tcp_congestion_control)
-                [[ "$value" =~ ^[A-Za-z0-9_.+-]+$ ]] || { tcp_baseline_invalid "sysctl token 值非法: $key"; return 1; }
-                ;;
-            net.ipv4.tcp_rmem|net.ipv4.tcp_wmem)
-                first=""; second=""; third=""; extra=""
-                read -r first second third extra <<< "$value"
-                is_uint "$first" && is_uint "$second" && is_uint "$third" && [[ -z "$extra" ]] || {
-                    tcp_baseline_invalid "sysctl 三元组非法: $key"
-                    return 1
-                }
-                ;;
-            *) is_uint "$value" || { tcp_baseline_invalid "sysctl 数值非法: $key"; return 1; } ;;
-        esac
         seen[$key]=1
     done < "$file"
     (( ${#seen[@]} == ${#allowed[@]} )) || { tcp_baseline_invalid "sysctl 快照没有覆盖全部受管 key"; return 1; }
@@ -312,17 +359,20 @@ backup_path() {
 }
 
 capture_runtime_sysctls() {
-    local key value
+    local key raw_value value
     for key in \
         net.core.default_qdisc net.ipv4.tcp_congestion_control \
         net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
         net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen net.core.somaxconn \
         net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog; do
-        value=$(sysctl -n "$key" 2>/dev/null) || {
+        raw_value=$(sysctl -n "$key" 2>/dev/null) || {
             log WARN "无法读取受管 sysctl，拒绝创建不完整快照: $key"
             return 1
         }
-        [[ -n "$value" ]] || { log WARN "受管 sysctl 返回空值: $key"; return 1; }
+        if ! value=$(tcp_sysctl_snapshot_value_normalize "$key" "$raw_value"); then
+            log WARN "受管 sysctl 返回不可安全序列化的值: $key"
+            return 1
+        fi
         printf '%s\t%s\n' "$key" "$value"
     done
     return 0
@@ -412,12 +462,8 @@ restore_backed_path() {
 }
 
 restore_runtime_sysctls() {
-    local key value rc=0
     tcp_baseline_regular_file "$BASELINE_DIR/sysctl.tsv" || return 1
-    while IFS=$'\t' read -r key value; do
-        if [[ -n "$key" ]] && ! sysctl -q -w "$key=$value"; then log WARN "无法恢复 sysctl: $key"; rc=1; fi
-    done < "$BASELINE_DIR/sysctl.tsv"
-    return "$rc"
+    restore_tcp_sysctl_snapshot_file "$BASELINE_DIR/sysctl.tsv"
 }
 
 baseline_info() {

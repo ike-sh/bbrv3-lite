@@ -177,6 +177,25 @@ auto_tune_route_guard() {
     local route_family address iface first_iface=""
     validate_interface_name "$expected_iface" || { die "自动调优选中了非法网卡: $expected_iface"; return 1; }
 
+    # Once endpoint discovery has frozen a literal address, only that address
+    # and family can influence the formal measurement. An unrelated broken
+    # AAAA/default IPv6 path must not veto a proven IPv4 endpoint (and vice
+    # versa). The literal still goes through the full route-get/fibmatch gate.
+    if [[ -n "$target" ]] && { [[ "$target" == *:* ]] || [[ "$target" =~ ^[0-9]+([.][0-9]+){3}$ ]]; }; then
+        records=$(target_route_records "$target") || return 1
+        IFS=$'\t' read -r route_family address iface <<< "$records"
+        [[ -n "$route_family" && -n "$address" && -n "$iface" ]] || {
+            die "测速地址 $target 没有返回完整路由记录"
+            return 1
+        }
+        [[ "$iface" == "$expected_iface" ]] || {
+            die "测速地址 $address 实际通过 $iface，但自动调优选中 $expected_iface；拒绝在错误网卡上应用 TC"
+            return 1
+        }
+        log INFO "测速目标路由检查通过: $address (IPv${route_family}) -> $expected_iface"
+        return 0
+    fi
+
     for family in -4 -6; do
         output=$(default_route_output "$family") || return 1
         count=$(awk '$1=="default" {count++} END {print count+0}' <<< "$output")

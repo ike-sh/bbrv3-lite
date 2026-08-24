@@ -589,12 +589,9 @@ nic_policy_ownership_preflight() {
 }
 
 nic_restore_runtime_snapshot() {
-    local directory="$1" key value rc=0
+    local directory="$1" rc=0
     [[ -f "$directory/sysctl.tsv" ]] || return 1
-    while IFS=$'\t' read -r key value; do
-        [[ -n "$key" ]] || continue
-        sysctl -q -w "$key=$value" || rc=1
-    done < "$directory/sysctl.tsv"
+    restore_tcp_sysctl_snapshot_file "$directory/sysctl.tsv" || rc=1
     restore_default_route_windows_snapshot "$directory" || rc=1
     return "$rc"
 }

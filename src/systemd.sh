@@ -519,7 +519,7 @@ action_transaction_begin() {
     mkdir -p "$dir/files" "$dir/qdiscs" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
     action_qdisc_snapshot "$iface" "$dir/qdisc.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
     cp -- "$dir/qdisc.snapshot" "$dir/qdiscs/$iface.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
-    capture_runtime_sysctls > "$dir/sysctl.tsv" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; return 1; }
+    capture_runtime_sysctls > "$dir/sysctl.tsv" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
     ip -4 route show default > "$dir/default-route-v4.txt" 2>/dev/null || true
     ip -6 route show default > "$dir/default-route-v6.txt" 2>/dev/null || true
     if ! action_transaction_snapshot_path "$CONFIG_FILE" config ||
@@ -613,7 +613,7 @@ action_transaction_commit() {
 }
 
 action_transaction_rollback() {
-    local dir="$ACTION_TRANSACTION_DIR" iface="$ACTION_TRANSACTION_IFACE" file key value rc=0 had_lock="$LOCK_HELD"
+    local dir="$ACTION_TRANSACTION_DIR" iface="$ACTION_TRANSACTION_IFACE" file rc=0 had_lock="$LOCK_HELD"
     [[ -n "$dir" ]] || return 0
     (( ACTION_TRANSACTION_ROLLING_BACK == 0 )) || return 1
     ACTION_TRANSACTION_ROLLING_BACK=1
@@ -628,9 +628,7 @@ action_transaction_rollback() {
     action_transaction_restore_tree "$NIC_POLICY_DIR" nic-policy-dir || rc=1
     rmdir "$PERSIST_DIR" 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1 || rc=1
-    while IFS=$'\t' read -r key value; do
-        if [[ -n "$key" ]] && ! sysctl -q -w "$key=$value"; then rc=1; fi
-    done < "$dir/sysctl.tsv"
+    restore_tcp_sysctl_snapshot_file "$dir/sysctl.tsv" || rc=1
     action_transaction_restore_routes || rc=1
     if [[ -d "$dir/qdiscs" ]]; then
         for file in "$dir/qdiscs"/*.snapshot; do

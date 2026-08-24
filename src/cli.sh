@@ -377,22 +377,27 @@ ensure_interactive_measure_dependencies() {
 }
 
 activate_public_peer_candidate() {
-    local index="$1" candidate host port rtt region provider
+    local index="$1" candidate host address family source iface port rtt region provider
     is_uint "$index" && (( index < ${#PUBLIC_PEER_CANDIDATES[@]} )) || return 1
     candidate="${PUBLIC_PEER_CANDIDATES[$index]}"
-    IFS='|' read -r host port rtt region provider <<< "$candidate"
+    IFS='|' read -r host address family source iface port rtt region provider <<< "$candidate"
     validate_peer "$host" "$port" || return 1
+    [[ "$family" == 4 || "$family" == 6 ]] || return 1
+    measure_source_address_is_valid "$family" "$address" || return 1
+    measure_source_address_is_valid "$family" "$source" || return 1
+    validate_interface_name "$iface" || return 1
     WIZARD_PEER="$host"; WIZARD_PORT="$port"; WIZARD_PEER_RTT="$rtt"
     WIZARD_PEER_REGION="$region"; WIZARD_PEER_PROVIDER="$provider"; WIZARD_PUBLIC_INDEX="$index"
+    WIZARD_PEER_ADDRESS="$address"; WIZARD_PEER_FAMILY="$family"; WIZARD_PEER_SOURCE="$source"; WIZARD_PEER_IFACE="$iface"
 }
 
 interactive_select_peer() {
-    local choice spec
+    local choice spec rtt
     printf '%s\n' '测速对端：' '  1) 自动选择公共节点（Leaseweb / OVH / Clouvider）' '  2) 自有 iperf3 服务器（推荐）'
     read -r -p '选择 [1]: ' choice || return 1
     case "${choice:-1}" in
         1)
-            auto_pick_peer || return 1
+            auto_pick_peer auto || return 1
             WIZARD_PUBLIC_PEER=1; WIZARD_FAILOVERS=0
             activate_public_peer_candidate 0 || return 1
             return 0
@@ -403,9 +408,13 @@ interactive_select_peer() {
         *) die "无效对端选择"; return 1 ;;
     esac
     parse_peer_spec "$spec" || return 1
-    peer_port_open "$PEER_HOST" "$PEER_PORT" || { die "无法连接 $PEER_HOST:$PEER_PORT"; return 1; }
+    measure_lock_peer "$PEER_HOST" auto "$PEER_PORT" || return $?
     WIZARD_PUBLIC_PEER=0; WIZARD_PEER="$PEER_HOST"; WIZARD_PORT="$PEER_PORT"
-    WIZARD_PEER_RTT=0; WIZARD_PUBLIC_INDEX=0; WIZARD_FAILOVERS=0
+    WIZARD_PEER_ADDRESS="$MEASURE_PEER_ADDRESS"; WIZARD_PEER_FAMILY="$MEASURE_PEER_FAMILY"
+    WIZARD_PEER_SOURCE="$MEASURE_PEER_SOURCE"; WIZARD_PEER_IFACE="$MEASURE_PEER_IFACE"
+    rtt=$(median_ping_ms "$MEASURE_PEER_ADDRESS" "$MEASURE_PEER_FAMILY" 2>/dev/null || true)
+    WIZARD_PEER_RTT="${rtt:-0}"; WIZARD_PUBLIC_INDEX=0; WIZARD_FAILOVERS=0
+    measure_clear_peer_lock
 }
 
 auto_measure_with_peer_failover() {
@@ -415,17 +424,26 @@ auto_measure_with_peer_failover() {
     for ((index=0; index<count; index++)); do
         if (( ${WIZARD_PUBLIC_PEER:-0} )); then
             activate_public_peer_candidate "$index" || return 1
-            if (( index > 0 )); then
-                ((WIZARD_FAILOVERS+=1))
-                log WARN "切换到备用公共对端 $((index + 1))/${count}: $WIZARD_PEER:$WIZARD_PORT（$WIZARD_PEER_REGION/$WIZARD_PEER_PROVIDER，RTT ${WIZARD_PEER_RTT}ms）"
+        fi
+        if [[ "${WIZARD_PEER_IFACE:-$iface}" != "$iface" ]]; then
+            if (( ${WIZARD_PUBLIC_PEER:-0} )); then
+                log WARN "跳过备用公共端点 $WIZARD_PEER:$WIZARD_PORT：其出口 ${WIZARD_PEER_IFACE:-unknown} 与本轮网卡 $iface 不同"
+                continue
             fi
+            die "测速端点出口 ${WIZARD_PEER_IFACE:-unknown} 与本轮网卡 $iface 不一致"
+            return 1
+        fi
+        if (( ${WIZARD_PUBLIC_PEER:-0} && index > 0 )); then
+            ((WIZARD_FAILOVERS+=1))
+            log WARN "切换到备用公共对端 $((index + 1))/${count}: $WIZARD_PEER:$WIZARD_PORT（$WIZARD_PEER_REGION/$WIZARD_PEER_PROVIDER，RTT ${WIZARD_PEER_RTT}ms）"
         fi
         if (( ${WIZARD_ROUTE_GUARD_ACTIVE:-0} )); then
-            auto_tune_route_guard "$iface" "$WIZARD_PEER" || return 1
+            auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-$WIZARD_PEER}" || return 1
         fi
         if (( nominal > 0 )); then
             path_rate=$((nominal * 40 / 100)); ((path_rate < 1)) && path_rate=1
-            if measure_path_check "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$path_rate"; then
+            if measure_path_check "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$path_rate" \
+                    "${WIZARD_PEER_ADDRESS:-}" "${WIZARD_PEER_SOURCE:-}"; then
                 :
             else
                 rc=$?
@@ -436,9 +454,13 @@ auto_measure_with_peer_failover() {
                 return "$rc"
             fi
         fi
-        if measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$nominal" 0 0 0 "$duration" 1 3 0.1 0 "$cap" auto; then
+        if measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$nominal" 0 0 0 "$duration" 1 3 0.1 0 "$cap" auto \
+                "${WIZARD_PEER_ADDRESS:-}" "${WIZARD_PEER_SOURCE:-}"; then
             WIZARD_SWEEP_PEER="$WIZARD_PEER"
             WIZARD_SWEEP_PORT="$WIZARD_PORT"
+            WIZARD_SWEEP_ADDRESS="${WIZARD_PEER_ADDRESS:-}"
+            WIZARD_SWEEP_SOURCE="${WIZARD_PEER_SOURCE:-}"
+            WIZARD_SWEEP_IFACE="${WIZARD_PEER_IFACE:-$iface}"
             return 0
         else
             rc=$?
@@ -455,9 +477,11 @@ auto_measure_with_peer_failover() {
 
 auto_verify_with_peer_failover() {
     local iface="$1" duration="$2" expected_rate="$3" min_efficiency="$4" baseline_loss="$5"
-    local sweep_peer="${WIZARD_SWEEP_PEER:-$WIZARD_PEER}" current_index="${WIZARD_PUBLIC_INDEX:-0}"
-    local candidate host index rc
-    if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1; then
+    local sweep_peer="${WIZARD_SWEEP_PEER:-$WIZARD_PEER}" sweep_address="${WIZARD_SWEEP_ADDRESS:-${WIZARD_PEER_ADDRESS:-}}"
+    local sweep_source="${WIZARD_SWEEP_SOURCE:-${WIZARD_PEER_SOURCE:-}}" sweep_iface="${WIZARD_SWEEP_IFACE:-${WIZARD_PEER_IFACE:-$iface}}"
+    local current_index="${WIZARD_PUBLIC_INDEX:-0}" candidate host address family source candidate_iface port rtt region provider index rc
+    if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1 \
+            "${WIZARD_PEER_ADDRESS:-}" "${WIZARD_PEER_SOURCE:-}"; then
         return 0
     else
         rc=$?
@@ -470,12 +494,14 @@ auto_verify_with_peer_failover() {
     for ((index=0; index<${#PUBLIC_PEER_CANDIDATES[@]}; index++)); do
         (( index != current_index )) || continue
         candidate="${PUBLIC_PEER_CANDIDATES[$index]}"
-        host="${candidate%%|*}"
+        IFS='|' read -r host address family source candidate_iface port rtt region provider <<< "$candidate"
         [[ "$host" == "$sweep_peer" ]] || continue
+        [[ "$address" == "$sweep_address" && "$source" == "$sweep_source" && "$candidate_iface" == "$sweep_iface" ]] || continue
         activate_public_peer_candidate "$index" || return 1
         ((WIZARD_FAILOVERS+=1))
         log WARN "最终复验切换到同主机备用端口: $WIZARD_PEER:$WIZARD_PORT"
-        if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1; then
+        if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1 \
+                "${WIZARD_PEER_ADDRESS:-}" "${WIZARD_PEER_SOURCE:-}"; then
             return 0
         else
             rc=$?
@@ -500,7 +526,7 @@ auto_tune_execute() {
         show_status
         return 0
     fi
-    auto_measure_with_peer_failover "$iface" "$nominal" || return 1
+    auto_measure_with_peer_failover "$iface" "$nominal" || return $?
     summary="$MEASURE_RUN_DIR/summary.tsv"
     sweep_path_fingerprint=$(summary_value "$summary" PATH_ROUTE_FINGERPRINT)
     [[ "$sweep_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
@@ -550,7 +576,7 @@ auto_tune_execute() {
         log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
     fi
     verify_runtime_tuning "$iface" || return 1
-    auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss" || return 1
+    auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss" || return $?
     verify_summary="$MEASURE_RUN_DIR/summary.tsv"
     verify_path_fingerprint=$(summary_value "$verify_summary" PATH_ROUTE_FINGERPRINT)
     [[ "$verify_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
@@ -586,7 +612,7 @@ auto_tune_execute() {
     printf 'FINAL_VERIFY_PEER\t%s\nFINAL_VERIFY_PORT\t%s\nTOTAL_PUBLIC_PEER_FAILOVERS\t%s\nFINAL_VERIFY_CONFIDENCE_SCORE\t%s\nFINAL_VERIFY_CONFIDENCE_GRADE\t%s\nFINAL_VERIFY_CONFIDENCE_REASONS\t%s\nFINAL_VERIFY_PATH_FINGERPRINT\t%s\nFINAL_VERIFY_ENDPOINT_FINGERPRINT\t%s\n' \
         "$WIZARD_PEER" "$WIZARD_PORT" "${WIZARD_FAILOVERS:-0}" "$verify_confidence_score" "$verify_confidence_grade" "$verify_confidence_reasons" "$verify_path_fingerprint" "$verify_endpoint_fingerprint" >> "$summary" || return 1
     if (( ${WIZARD_ROUTE_GUARD_ACTIVE:-0} )); then
-        auto_tune_route_guard "$iface" "$WIZARD_PEER" || return 1
+        auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-$WIZARD_PEER}" || return 1
     fi
     persist_current_tuning || return 1
     printf '\n'
@@ -602,9 +628,12 @@ auto_tune_wizard() {
     require_systemd_runtime || return 1
     [[ -t 0 ]] || { die "auto 向导需要交互终端"; return 1; }
     local bandwidth_input nominal=0 role_choice role=mixed peer_rtt=0 tuning_rtt=0 profile=balanced estimate="动态估算" iface rc rollback_rc=0
+    local backup_count=0 candidate_index candidate tmp_iface
     WIZARD_PEER=""; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PUBLIC_INDEX=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0; WIZARD_ROUTE_GUARD_ACTIVE=0
+    WIZARD_PEER_ADDRESS=""; WIZARD_PEER_FAMILY=""; WIZARD_PEER_SOURCE=""; WIZARD_PEER_IFACE=""
     nic_auto_policy_reset
-    WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SCAN_CAP=5000; WIZARD_SAMPLE_DURATION=5
+    WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SWEEP_ADDRESS=""; WIZARD_SWEEP_SOURCE=""; WIZARD_SWEEP_IFACE=""
+    WIZARD_SCAN_CAP=5000; WIZARD_SAMPLE_DURATION=5
     printf '\n%s v%s 自动调优\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
     printf '首次修改前会保存不可覆盖的基线：%s\n' "$BASELINE_DIR"
     printf '包含本工具涉及的 sysctl、配置/服务、qdisc/class，以及 IPv4/IPv6 路由快照。\n\n'
@@ -620,15 +649,19 @@ auto_tune_wizard() {
     if [[ "$nominal" != 0 || "$bandwidth_input" == a || "$bandwidth_input" == auto ]]; then
         interactive_select_peer || return 1
         peer_rtt="${WIZARD_PEER_RTT:-0}"
-        if (( peer_rtt == 0 )); then peer_rtt=$(median_ping_ms "$WIZARD_PEER"); [[ -n "$peer_rtt" ]] || peer_rtt=0; fi
+        if (( peer_rtt == 0 )); then
+            peer_rtt=$(median_ping_ms "$WIZARD_PEER_ADDRESS" "$WIZARD_PEER_FAMILY" 2>/dev/null || true)
+            [[ -n "$peer_rtt" ]] || peer_rtt=0
+        fi
     fi
 
     printf '%s\n' '用途：1) 混合业务  2) 代理/转发  3) 大文件吞吐'
     read -r -p '选择 [1]: ' role_choice || return 1
     case "${role_choice:-1}" in 1) role=mixed ;; 2) role=proxy ;; 3) role=bulk ;; *) die "无效用途"; return 1 ;; esac
     tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
-    iface=$(detect_interface auto) || return 1
-    auto_tune_route_guard "$iface" "${WIZARD_PEER:-}" || return 1
+    iface="${WIZARD_PEER_IFACE:-}"
+    [[ -n "$iface" ]] || iface=$(detect_interface auto) || return 1
+    auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-}" || return 1
     shaping_target_preflight "$iface" auto auto || return 1
     WIZARD_ROUTE_GUARD_ACTIVE=1
     WIZARD_SCAN_CAP=$(recommended_scan_cap "$iface" "$nominal") || return 1
@@ -651,7 +684,16 @@ auto_tune_wizard() {
     printf '  标称带宽        %s\n' "$([[ "$bandwidth_input" == a || "$bandwidth_input" == auto ]] && echo 自动测量 || echo "${nominal} Mbit/s")"
     if [[ -n "${WIZARD_PEER:-}" ]]; then
         printf '  iperf3 对端     %s:%s（测速 RTT %sms）\n' "$WIZARD_PEER" "$WIZARD_PORT" "${peer_rtt:-unknown}"
-        if (( WIZARD_PUBLIC_PEER )); then printf '  公共备用对端    %s 个（正式采样不可用时自动切换）\n' "$(( ${#PUBLIC_PEER_CANDIDATES[@]} - 1 ))"; fi
+        printf '  冻结测速端点    %s / IPv%s / src %s / %s\n' "$WIZARD_PEER_ADDRESS" "$WIZARD_PEER_FAMILY" "$WIZARD_PEER_SOURCE" "$WIZARD_PEER_IFACE"
+        if (( WIZARD_PUBLIC_PEER )); then
+            for ((candidate_index=0; candidate_index<${#PUBLIC_PEER_CANDIDATES[@]}; candidate_index++)); do
+                (( candidate_index != WIZARD_PUBLIC_INDEX )) || continue
+                candidate="${PUBLIC_PEER_CANDIDATES[$candidate_index]}"
+                tmp_iface=$(cut -d'|' -f5 <<< "$candidate")
+                if [[ "$tmp_iface" == "$WIZARD_PEER_IFACE" ]]; then ((backup_count+=1)); fi
+            done
+            printf '  公共备用对端    %s 个（同出口候选；正式采样不可用时自动切换）\n' "$backup_count"
+        fi
         printf '  缓冲区调优 RTT  %sms（按用途下限与测速 RTT 取较大值）\n' "$tuning_rtt"
     fi
     printf '  预计时间/流量   约 3–8 分钟 / %s\n' "$estimate"

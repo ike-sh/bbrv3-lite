@@ -27,6 +27,21 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "$3: expected '$1', got '$2'"; }
 expect_failure() { if "$@" >/dev/null 2>&1; then fail "command unexpectedly succeeded: $*"; fi; }
 
+nic_test_sysctl_value() {
+    case "$1" in
+        net.core.default_qdisc) printf 'fq\n' ;;
+        net.ipv4.tcp_congestion_control) printf 'cubic\n' ;;
+        net.core.rmem_max|net.core.wmem_max) printf '16777216\n' ;;
+        net.ipv4.tcp_rmem) printf '4096\t131072\t16777216\n' ;;
+        net.ipv4.tcp_wmem) printf '4096\t16384\t16777216\n' ;;
+        net.ipv4.tcp_mtu_probing) printf '0\n' ;;
+        net.ipv4.tcp_fastopen) printf '1\n' ;;
+        net.core.somaxconn|net.ipv4.tcp_max_syn_backlog) printf '4096\n' ;;
+        net.core.netdev_max_backlog) printf '1000\n' ;;
+        *) return 1 ;;
+    esac
+}
+
 make_iface() {
     local iface="$1" mac="$2" root
     root="$BBRV3_SYS_CLASS_NET_ROOT/$iface"
@@ -196,7 +211,10 @@ test_apply_failure_rolls_back_every_interface_and_global_runtime() (
     event() { printf '%s\n' "$*" >> "$events"; }
     managed_htb_interfaces_strict() { :; }
     qdisc_guard() { :; }
-    capture_runtime_sysctls() { printf 'net.test.key\tbefore\n'; }
+    capture_runtime_sysctls() {
+        local key
+        while IFS= read -r key; do printf '%s\t%s\n' "$key" "$(nic_test_sysctl_value "$key")"; done < <(tcp_baseline_sysctl_keys)
+    }
     action_qdisc_snapshot() { event "snapshot:$1"; printf 'KIND\tnoqueue\nRATE\t\nARGS\t\n' > "$2"; }
     apply_sysctl_profile() { [[ "$1" == runtime ]] || return 1; event apply-sysctl; }
     apply_fq() { event "apply-fq:$1"; }
@@ -212,7 +230,7 @@ test_apply_failure_rolls_back_every_interface_and_global_runtime() (
         grep -Fxq "snapshot:$iface" "$events" || fail "missing qdisc snapshot for $iface"
         grep -Fxq "restore-qdisc:$iface" "$events" || fail "missing qdisc rollback for $iface"
     done
-    grep -Fq 'restore-sysctl:-q -w net.test.key=before' "$events" || fail "sysctl rollback missing"
+    grep -Fq 'restore-sysctl:-q -w net.core.somaxconn=4096' "$events" || fail "sysctl rollback missing"
     grep -Fxq restore-routes "$events" || fail "route-window rollback missing"
     if grep -Fxq apply-routes "$events"; then fail "route mutation continued after qdisc failure"; fi
 )
@@ -224,7 +242,10 @@ test_snapshot_failure_is_write_free() (
     MULTI_NIC_ENABLED=1
     managed_htb_interfaces_strict() { :; }
     qdisc_guard() { :; }
-    capture_runtime_sysctls() { printf 'net.test.key\tbefore\n'; }
+    capture_runtime_sysctls() {
+        local key
+        while IFS= read -r key; do printf '%s\t%s\n' "$key" "$(nic_test_sysctl_value "$key")"; done < <(tcp_baseline_sysctl_keys)
+    }
     action_qdisc_snapshot() { printf 'snapshot:%s\n' "$1" >> "$events"; [[ "$1" != eth1 ]]; }
     apply_sysctl_profile() { printf 'WRITE:sysctl\n' >> "$events"; }
     restore_action_qdisc() { printf 'WRITE:qdisc\n' >> "$events"; }

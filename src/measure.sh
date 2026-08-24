@@ -14,6 +14,7 @@ MEASURE_PEER_ADDRESS=""
 MEASURE_PEER_SOURCE=""
 MEASURE_PEER_FAMILY=""
 MEASURE_PEER_IFACE=""
+MEASURE_PEER_PORT=""
 IPERF_DATA_RC=65
 IPERF_CONTAMINATED_RC=66
 IPERF_UNSTABLE_RC=67
@@ -53,11 +54,15 @@ parse_peer_spec() {
 }
 
 public_peer_ports() {
-    local host="$1" limit="${2:-1}" port found=0
+    local host="$1" limit="${2:-1}" requested_iface="${3:-auto}" port found=0 rtt
     is_uint "$limit" && (( limit >= 1 && limit <= 4 )) || limit=1
     for port in 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200; do
-        if peer_port_open "$host" "$port" && iperf_peer_usable "$host" "$port"; then
-            printf '%s\n' "$port"
+        if measure_lock_peer "$host" "$requested_iface" "$port" "" "" 1; then
+            rtt=$(median_ping_ms "$MEASURE_PEER_ADDRESS" "$MEASURE_PEER_FAMILY" 2>/dev/null || true)
+            [[ -n "$rtt" ]] || rtt=9999
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$port" "$MEASURE_PEER_ADDRESS" \
+                "$MEASURE_PEER_FAMILY" "$MEASURE_PEER_SOURCE" "$MEASURE_PEER_IFACE" "$rtt"
+            measure_clear_peer_lock
             ((found+=1))
             (( found < limit )) || return 0
         fi
@@ -65,12 +70,39 @@ public_peer_ports() {
     (( found > 0 ))
 }
 
+peer_route_rtt() {
+    local host="$1" requested_iface="${2:-auto}" addresses ordered v6_records family address rtt
+    addresses=$(resolve_route_target_addresses "$host") || return 1
+    [[ -n "$addresses" ]] || return 1
+    ordered=$(awk -F'\t' '$1==4 {print}' <<< "$addresses")
+    v6_records=$(awk -F'\t' '$1==6 {print}' <<< "$addresses")
+    if [[ -n "$v6_records" ]]; then
+        if [[ -n "$ordered" ]]; then ordered+=$'\n'; fi
+        ordered+="$v6_records"
+    fi
+    while IFS=$'\t' read -r family address; do
+        [[ "$family" == 4 || "$family" == 6 ]] || continue
+        if measure_lock_peer "$host" "$requested_iface" "" "$address" "" 1 2>/dev/null; then
+            rtt=$(median_ping_ms "$MEASURE_PEER_ADDRESS" "$MEASURE_PEER_FAMILY" 2>/dev/null || true)
+            measure_clear_peer_lock
+            if [[ -n "$rtt" ]]; then
+                printf '%s\n' "$rtt"
+                return 0
+            fi
+        fi
+    done <<< "$ordered"
+    measure_clear_peer_lock
+    return 1
+}
+
 auto_pick_peer() {
-    require_commands ping timeout iperf3 jq || return 1
-    local temp host region provider rtt port max_rtt="${BBRV3_PEER_MAX_RTT:-120}"
+    require_commands ip getent ping timeout iperf3 jq || return 1
+    local requested_iface="${1:-auto}" temp host region provider rtt port address family source iface endpoint_rtt
+    local max_rtt="${BBRV3_PEER_MAX_RTT:-120}"
     local limit="${BBRV3_PUBLIC_PEER_CANDIDATES:-4}" per_host="${BBRV3_PUBLIC_PORTS_PER_HOST:-2}" candidate found rank
     local primary_host="" preferred_extra="" primary_take index
     local -a primary_candidates=() extra_candidates=() ordered_candidates=()
+    is_uint "$max_rtt" && (( max_rtt >= 1 && max_rtt <= 10000 )) || max_rtt=120
     is_uint "$limit" && (( limit >= 2 && limit <= 8 )) || limit=4
     is_uint "$per_host" && (( per_host >= 1 && per_host <= 4 )) || per_host=2
     PUBLIC_PEER_CANDIDATES=()
@@ -79,7 +111,7 @@ auto_pick_peer() {
     while IFS='|' read -r host region provider; do
         [[ -n "$host" ]] || continue
         (
-            rtt=$(median_ping_ms "$host")
+            rtt=$(peer_route_rtt "$host" "$requested_iface")
             [[ -n "$rtt" ]] && printf '%s\t%s\t%s\t%s\n' "$rtt" "$host" "$region" "$provider" > "$temp/${host//[^a-zA-Z0-9]/_}"
         ) &
     done <<< "$PUBLIC_PEER_POOL"
@@ -87,12 +119,16 @@ auto_pick_peer() {
     while IFS=$'\t' read -r rtt host region provider; do
         (( rtt <= max_rtt )) || { log INFO "$host ($region/$provider) RTT ${rtt}ms，过远跳过"; continue; }
         found=0; rank=0
-        while IFS= read -r port; do
-            [[ -n "$port" ]] || continue
-            candidate="$host|$port|$rtt|$region|$provider"
+        while IFS=$'\t' read -r port address family source iface endpoint_rtt; do
+            [[ -n "$port" && -n "$address" && -n "$source" && -n "$iface" ]] || continue
+            if ! is_uint "$endpoint_rtt" || (( endpoint_rtt > max_rtt )); then
+                log INFO "$host:$port -> $address (IPv${family:-?}) RTT ${endpoint_rtt:-unknown}ms，过远或不可测，跳过"
+                continue
+            fi
+            candidate="$host|$address|$family|$source|$iface|$port|$endpoint_rtt|$region|$provider"
             if (( rank == 0 )); then primary_candidates+=("$candidate"); else extra_candidates+=("$candidate"); fi
             ((found+=1)); ((rank+=1))
-        done < <(public_peer_ports "$host" "$per_host")
+        done < <(public_peer_ports "$host" "$per_host" "$requested_iface")
         (( found > 0 )) || log INFO "$host ($region/$provider) 当前无可用测试端口"
         # Prefer distinct hosts before reserving a second port on the same host.
         (( ${#primary_candidates[@]} < limit )) || break
@@ -117,11 +153,11 @@ auto_pick_peer() {
     for candidate in "${ordered_candidates[@]}"; do
         [[ -n "$candidate" ]] || continue
         PUBLIC_PEER_CANDIDATES+=("$candidate")
-        IFS='|' read -r host port rtt region provider <<< "$candidate"
+        IFS='|' read -r host address family source iface port rtt region provider <<< "$candidate"
         if (( ${#PUBLIC_PEER_CANDIDATES[@]} == 1 )); then
-            log OK "公共对端已通过 iperf3 预检: $host:$port ($region/$provider, RTT ${rtt}ms)"
+            log OK "公共对端已通过 IPv${family} iperf3 预检: $host:$port -> $address ($region/$provider, RTT ${rtt}ms)"
         else
-            log INFO "已保留备用公共对端: $host:$port ($region/$provider, RTT ${rtt}ms)"
+            log INFO "已保留备用公共对端: $host:$port -> $address (IPv${family}, $region/$provider, RTT ${rtt}ms)"
         fi
         (( ${#PUBLIC_PEER_CANDIDATES[@]} < limit )) || break
     done
@@ -230,6 +266,7 @@ measure_clear_peer_lock() {
     MEASURE_PEER_SOURCE=""
     MEASURE_PEER_FAMILY=""
     MEASURE_PEER_IFACE=""
+    MEASURE_PEER_PORT=""
     path_state_reset
 }
 
@@ -343,41 +380,168 @@ measure_capture_route_state() {
     printf '%s\t%s\n' "$iface" "$source"
 }
 
-# Resolve exactly once, validate every candidate through the strict platform
-# API, and freeze one literal address for the complete formal operation.
+# Resolve a hostname once, prefer IPv4 for broad public-server compatibility,
+# and fall back to IPv6 only when the exact IPv4 endpoint is not route-safe or
+# cannot complete a low-traffic iperf3 preflight. Explicit literals never
+# change family. A preferred address/source comes from the interactive public
+# preflight and deliberately bypasses DNS so the formal run uses that tuple.
 measure_lock_peer() {
-    local peer="$1" expected_iface="$2" addresses family address state iface source
-    local first_family="" first_address="" first_source="" resolved_count=0
-    validate_interface_name "$expected_iface" || { die "非法测速出口网卡: $expected_iface"; return 1; }
+    local peer="$1" requested_iface="$2" port="${3:-}" preferred_address="${4:-}" preferred_source="${5:-}" quiet="${6:-0}"
+    local addresses ordered family address state iface source record record_family record_address record_iface
+    local is_literal=0 exact_candidate=0 resolved_count=0 route_candidates=0 service_candidates=0
+
+    # A failed re-lock must never leave a previous endpoint looking current.
     measure_clear_peer_lock
-    addresses=$(resolve_route_target_addresses "$peer") || return 1
-    if [[ -z "$addresses" ]]; then
-        die "无法解析测速对端 $peer"
-        return "$IPERF_UNAVAILABLE_RC"
-    fi
-    while IFS=$'\t' read -r family address; do
-        [[ "$family" == 4 || "$family" == 6 ]] || { die "测速对端 $peer 返回非法地址族"; return 1; }
-        [[ -n "$address" ]] || { die "测速对端 $peer 返回空地址"; return 1; }
-        ((resolved_count+=1))
-        state=$(measure_capture_route_state "$family" "$address" "$expected_iface") || return 1
-        IFS=$'\t' read -r iface source <<< "$state"
-        if [[ -z "$first_address" ]]; then
-            first_family="$family"
-            first_address="$address"
-            first_source="$source"
-        fi
-    done <<< "$addresses"
-    (( resolved_count > 0 )) || { die "无法冻结测速对端 $peer 的地址"; return "$IPERF_UNAVAILABLE_RC"; }
-    MEASURE_PEER_HOST="$peer"
-    MEASURE_PEER_ADDRESS="$first_address"
-    MEASURE_PEER_SOURCE="$first_source"
-    MEASURE_PEER_FAMILY="$first_family"
-    MEASURE_PEER_IFACE="$expected_iface"
-    if ! path_lock_route_identity; then
-        measure_clear_peer_lock
+    [[ "$requested_iface" == auto ]] || validate_interface_name "$requested_iface" || {
+        die "非法测速出口网卡: $requested_iface"
         return 1
+    }
+    [[ -z "$port" ]] || { is_uint "$port" && (( port >= 1 && port <= 65535 )); } || {
+        die "非法测速端口: $port"
+        return 1
+    }
+    [[ "$quiet" == 0 || "$quiet" == 1 ]] || return 1
+    if [[ "$peer" == *:* ]]; then
+        is_literal=1
+    elif [[ "$peer" =~ ^[0-9]+([.][0-9]+){3}$ ]]; then
+        is_literal=1
     fi
-    log INFO "已冻结测速路径: $peer -> $MEASURE_PEER_ADDRESS（IPv${MEASURE_PEER_FAMILY}, src $MEASURE_PEER_SOURCE, dev $MEASURE_PEER_IFACE, path ${PATH_ROUTE_FINGERPRINT:0:12}）"
+
+    if [[ -n "$preferred_address" ]]; then
+        exact_candidate=1
+        if measure_source_address_is_valid 4 "$preferred_address"; then family=4
+        elif measure_source_address_is_valid 6 "$preferred_address"; then family=6
+        else
+            die "预选测速地址无效: $preferred_address"
+            return 1
+        fi
+        if (( is_literal )) && [[ "$peer" != "$preferred_address" ]]; then
+            die "显式测速地址 $peer 与预选地址 $preferred_address 不一致"
+            return 1
+        fi
+        addresses=$(printf '%s\t%s\n' "$family" "$preferred_address")
+    else
+        addresses=$(resolve_route_target_addresses "$peer") || return 1
+        [[ -n "$addresses" ]] || {
+            (( quiet )) || die "无法解析测速对端 $peer"
+            return "$IPERF_UNAVAILABLE_RC"
+        }
+    fi
+
+    if (( is_literal || exact_candidate )); then
+        ordered="$addresses"
+    else
+        # Do not inherit libc/getent family order. Public iperf3 coverage is
+        # substantially broader over IPv4, while IPv6 remains a real fallback.
+        ordered=$(awk -F'\t' '$1==4 {print}' <<< "$addresses")
+        record=$(awk -F'\t' '$1==6 {print}' <<< "$addresses")
+        if [[ -n "$record" ]]; then
+            if [[ -n "$ordered" ]]; then ordered+=$'\n'; fi
+            ordered+="$record"
+        fi
+    fi
+
+    while IFS=$'\t' read -r family address; do
+        [[ "$family" == 4 || "$family" == 6 ]] || {
+            measure_clear_peer_lock
+            die "测速对端 $peer 返回非法地址族"
+            return 1
+        }
+        measure_source_address_is_valid "$family" "$address" || {
+            measure_clear_peer_lock
+            die "测速对端 $peer 返回非法 IPv${family} 地址: $address"
+            return 1
+        }
+        ((resolved_count+=1))
+
+        if [[ "$requested_iface" == auto ]]; then
+            if (( is_literal || exact_candidate )); then
+                record=$(target_route_records "$address") || { measure_clear_peer_lock; return 1; }
+            else
+                record=$(target_route_records "$address" 2>/dev/null) || {
+                    (( quiet )) || log WARN "跳过 $address（IPv${family}）：没有可严格核验的唯一出口"
+                    continue
+                }
+            fi
+            IFS=$'\t' read -r record_family record_address record_iface <<< "$record"
+            [[ "$record_family" == "$family" && "$record_address" == "$address" ]] || {
+                measure_clear_peer_lock
+                die "测速地址 $address 的路由记录与解析结果不一致"
+                return 1
+            }
+            iface="$record_iface"
+            validate_interface_name "$iface" || { measure_clear_peer_lock; return 1; }
+            interface_is_excluded "$iface" && {
+                (( quiet )) || log WARN "跳过 $address（IPv${family}）：出口 $iface 是受保护的虚拟接口"
+                continue
+            }
+        else
+            iface="$requested_iface"
+        fi
+
+        if (( is_literal || exact_candidate )); then
+            state=$(measure_capture_route_state "$family" "$address" "$iface" "$preferred_source") || {
+                measure_clear_peer_lock
+                return 1
+            }
+        else
+            state=$(measure_capture_route_state "$family" "$address" "$iface" 2>/dev/null) || {
+                (( quiet )) || log WARN "跳过 $address（IPv${family}）：路由、来源地址或出口 $iface 核验未通过"
+                continue
+            }
+        fi
+        IFS=$'\t' read -r record_iface source <<< "$state"
+        [[ "$record_iface" == "$iface" ]] || { measure_clear_peer_lock; return 1; }
+        ((route_candidates+=1))
+
+        if [[ -n "$port" ]]; then
+            if ! peer_port_open "$address" "$port" || ! iperf_peer_usable "$address" "$port" "$family" "$source"; then
+                (( quiet )) || log WARN "跳过 $address:$port（IPv${family}）：TCP/iperf3 预检不可用"
+                if (( is_literal || exact_candidate )); then
+                    measure_clear_peer_lock
+                    return "$IPERF_UNAVAILABLE_RC"
+                fi
+                continue
+            fi
+            ((service_candidates+=1))
+        fi
+
+        MEASURE_PEER_HOST="$peer"
+        MEASURE_PEER_ADDRESS="$address"
+        MEASURE_PEER_SOURCE="$source"
+        MEASURE_PEER_FAMILY="$family"
+        MEASURE_PEER_IFACE="$iface"
+        MEASURE_PEER_PORT="$port"
+        if ! path_lock_route_identity; then
+            measure_clear_peer_lock
+            return 1
+        fi
+        (( quiet )) || log INFO "已冻结测速路径: $peer -> $MEASURE_PEER_ADDRESS（IPv${MEASURE_PEER_FAMILY}, src $MEASURE_PEER_SOURCE, dev $MEASURE_PEER_IFACE${port:+, port $port}, path ${PATH_ROUTE_FINGERPRINT:0:12}）"
+        return 0
+    done <<< "$ordered"
+
+    measure_clear_peer_lock
+    (( quiet )) || {
+        if [[ -n "$port" && $route_candidates -gt 0 && $service_candidates -eq 0 ]]; then
+            die "测速对端 $peer:$port 没有可用的 IPv4/IPv6 iperf3 端点"
+        else
+            die "测速对端 $peer 没有能通过严格路由与来源地址核验的候选端点"
+        fi
+    }
+    (( resolved_count > 0 )) || return "$IPERF_UNAVAILABLE_RC"
+    return "$IPERF_UNAVAILABLE_RC"
+}
+
+measure_lock_requested_peer() {
+    local peer="$1" port="$2" requested="$3" preferred_address="${4:-}" preferred_source="${5:-}"
+    local expected_iface="$requested"
+    # The wrapper may fail before measure_lock_peer is reached (for example an
+    # invalid explicit interface); stale state must not survive that failure.
+    measure_clear_peer_lock
+    if [[ "$requested" != auto ]]; then
+        expected_iface=$(detect_interface "$requested") || return 1
+    fi
+    measure_lock_peer "$peer" "$expected_iface" "$port" "$preferred_address" "$preferred_source"
 }
 
 measure_peer_route_guard() {
@@ -407,13 +571,18 @@ measure_peer_route_guard() {
 }
 
 measure_require_sample_lock() {
-    local peer="$1" iface
+    local peer="$1" port="${2:-}" iface
     if [[ -z "$MEASURE_PEER_ADDRESS" ]]; then
-        iface="${MEASURE_IFACE:-}"
-        [[ -n "$iface" ]] || iface=$(detect_interface auto) || return 1
-        measure_lock_peer "$peer" "$iface" || return $?
+        iface="${MEASURE_IFACE:-auto}"
+        measure_lock_peer "$peer" "$iface" "$port" || return $?
     elif [[ "$peer" != "$MEASURE_PEER_HOST" && "$peer" != "$MEASURE_PEER_ADDRESS" ]]; then
         die "样本对端 $peer 与冻结对端 $MEASURE_PEER_HOST/$MEASURE_PEER_ADDRESS 不一致"
+        return 1
+    fi
+    if [[ -n "$port" && -z "$MEASURE_PEER_PORT" ]]; then
+        measure_require_locked_port "$peer" "$port" || return $?
+    elif [[ -n "$port" && -n "$MEASURE_PEER_PORT" && "$port" != "$MEASURE_PEER_PORT" ]]; then
+        die "样本端口 $port 与冻结端口 $MEASURE_PEER_PORT 不一致"
         return 1
     fi
     measure_peer_route_guard
@@ -422,19 +591,26 @@ measure_require_sample_lock() {
 measure_require_locked_port() {
     local peer="$1" port="$2"
     measure_peer_route_guard || return 1
-    if ! peer_port_open "$MEASURE_PEER_ADDRESS" "$port"; then
-        die "无法连接 $peer:$port（冻结地址 $MEASURE_PEER_ADDRESS）"
+    if [[ -n "$MEASURE_PEER_PORT" && "$MEASURE_PEER_PORT" != "$port" ]]; then
+        die "请求端口 $port 与冻结端口 $MEASURE_PEER_PORT 不一致"
+        return 1
+    fi
+    if [[ -z "$MEASURE_PEER_PORT" ]] &&
+       { ! peer_port_open "$MEASURE_PEER_ADDRESS" "$port" ||
+         ! iperf_peer_usable "$MEASURE_PEER_ADDRESS" "$port" "$MEASURE_PEER_FAMILY" "$MEASURE_PEER_SOURCE"; }; then
+        die "无法连接 $peer:$port（冻结地址 $MEASURE_PEER_ADDRESS / IPv${MEASURE_PEER_FAMILY}）"
         measure_clear_peer_lock
         return "$IPERF_UNAVAILABLE_RC"
     fi
+    MEASURE_PEER_PORT="$port"
     measure_peer_route_guard
 }
 
 measure_append_locked_peer_summary() {
     local file="$1"
     [[ -f "$file" ]] || return 1
-    printf 'LOCKED_ADDRESS\t%s\nLOCKED_SOURCE\t%s\nLOCKED_INTERFACE\t%s\nLOCKED_FAMILY\t%s\n' \
-        "$MEASURE_PEER_ADDRESS" "$MEASURE_PEER_SOURCE" "$MEASURE_PEER_IFACE" "$MEASURE_PEER_FAMILY" >> "$file"
+    printf 'LOCKED_ADDRESS\t%s\nLOCKED_SOURCE\t%s\nLOCKED_INTERFACE\t%s\nLOCKED_FAMILY\t%s\nLOCKED_PORT\t%s\n' \
+        "$MEASURE_PEER_ADDRESS" "$MEASURE_PEER_SOURCE" "$MEASURE_PEER_IFACE" "$MEASURE_PEER_FAMILY" "${MEASURE_PEER_PORT:-none}" >> "$file"
     path_profile_append_summary "$file"
 }
 
@@ -444,9 +620,13 @@ peer_port_open() {
 }
 
 iperf_peer_usable() {
-    local peer="$1" port="$2" json rc=0 error bps
+    local peer="$1" port="$2" family="${3:-}" source="${4:-}" json rc=0 error bps
+    local -a family_arg=() bind_arg=()
+    [[ -z "$family" || "$family" == 4 || "$family" == 6 ]] || return 1
+    [[ -z "$family" ]] || family_arg=("-$family")
+    [[ -z "$source" ]] || bind_arg=(-B "$source")
     json=$(mktemp) || return 1
-    if timeout 8 iperf3 -c "$peer" -p "$port" -t 1 -P 1 -b 1M -J > "$json" 2>/dev/null; then
+    if timeout 8 iperf3 "${family_arg[@]}" -c "$peer" "${bind_arg[@]}" -p "$port" -t 1 -P 1 -b 1M -J > "$json" 2>/dev/null; then
         error=$(jq -r '.error // empty' "$json" 2>/dev/null || true)
         bps=$(jq -r '.end.sum_sent.bits_per_second // .end.sum.bits_per_second // 0' "$json" 2>/dev/null || printf '0\n')
         [[ -z "$error" ]] && is_decimal "$bps" && awk -v b="$bps" 'BEGIN {exit !(b>0)}' || rc=1
@@ -584,7 +764,7 @@ iperf_sample() {
     local route_guard_rc=0
     local -a family_arg=()
     validate_peer "$peer" "$port" || return 1
-    measure_require_sample_lock "$peer" || return $?
+    measure_require_sample_lock "$peer" "$port" || return $?
     family_arg=("-$MEASURE_PEER_FAMILY")
     json=$(mktemp) || return 1
     error_file=$(mktemp) || { rm -f -- "$json"; return 1; }
@@ -899,8 +1079,8 @@ measure_path_profile() {
     validate_peer "$peer" 5201 || return 1
     is_uint "$samples" && (( samples >= 3 && samples <= 20 )) || { die "路径画像样本数必须是 3–20"; return 1; }
     [[ "$pmtu_enabled" == 0 || "$pmtu_enabled" == 1 ]] || { die "PMTU 开关只能是 0/1"; return 1; }
-    iface=$(detect_interface "$requested") || return 1
-    measure_lock_peer "$peer" "$iface" || return $?
+    measure_lock_requested_peer "$peer" "" "$requested" || return $?
+    iface="$MEASURE_PEER_IFACE"
     new_measure_run path || { measure_clear_peer_lock; return 1; }
     dir="$MEASURE_RUN_DIR"
     rm -f -- "$MEASURE_RESULT_FILE"; MEASURE_RESULT_FILE=""
@@ -921,12 +1101,13 @@ measure_path_profile() {
 measure_probe() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
-    local peer="$1" port="$2" requested="$3" duration="$4" parallel="$5" iface dir row rc=0 speed estimate
+    local peer="$1" port="$2" requested="$3" duration="$4" parallel="$5" preferred_address="${6:-}" preferred_source="${7:-}"
+    local iface dir row rc=0 speed estimate
     local confidence confidence_score confidence_grade confidence_reasons
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && is_uint "$parallel" && ((duration>=3 && duration<=120 && parallel>=1 && parallel<=32)) || { die "duration/parallel 超出安全范围"; return 1; }
-    iface=$(detect_interface "$requested") || return 1
-    measure_lock_peer "$peer" "$iface" || return $?
+    measure_lock_requested_peer "$peer" "$port" "$requested" "$preferred_address" "$preferred_source" || return $?
+    iface="$MEASURE_PEER_IFACE"
     measure_require_locked_port "$peer" "$port" || return $?
     qdisc_guard "$iface" || return 1
     speed=$(detect_link_speed "$iface")
@@ -962,6 +1143,7 @@ measure_sweep() {
     local peer="$1" port="$2" requested="$3" nominal="$4" low="$5" high="$6" step="$7"
     local duration="$8" parallel="$9" margin="${10}" threshold="${11}" force_scan="${12}" cap="${13}"
     local result_mode="${14:-manual}"
+    local preferred_address="${15:-}" preferred_source="${16:-}"
     local iface dir baseline_row baseline_gp baseline_loss base_row base_gp base_loss rate row gp loss
     local last_ok="" last_ok_gp="" broke_at="" fine_start fine_step recommend="" candidate="" confirm_row confirm_gp="" confirm_loss=""
     local min_efficiency="0.90" confirmed=0 reject_reason="" estimated tests rc=0 no_knee=0 above_cap=0 baseline_duration
@@ -975,8 +1157,8 @@ measure_sweep() {
        (cap == 0 || (cap >= 100 && cap <= 1000000)) )) || { die "扫描参数超出安全范围"; return 1; }
     (( nominal == 0 )) && nominal_was_auto=1
     if (( cap == 0 )) || [[ "$result_mode" == auto ]]; then auto_cap=1; fi
-    iface=$(detect_interface "$requested") || return 1
-    measure_lock_peer "$peer" "$iface" || return $?
+    measure_lock_requested_peer "$peer" "$port" "$requested" "$preferred_address" "$preferred_source" || return $?
+    iface="$MEASURE_PEER_IFACE"
     measure_require_locked_port "$peer" "$port" || return $?
     if (( cap == 0 )); then cap=$(recommended_scan_cap "$iface" "$nominal") || return 1; fi
     qdisc_guard "$iface" || return 1
@@ -1166,11 +1348,12 @@ summary_value() {
 measure_path_check() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
-    local peer="$1" port="$2" requested="$3" rate="$4" iface dir row="" gp="" loss="" rc=0 accepted=0
+    local peer="$1" port="$2" requested="$3" rate="$4" preferred_address="${5:-}" preferred_source="${6:-}"
+    local iface dir row="" gp="" loss="" rc=0 accepted=0
     validate_peer "$peer" "$port" || return 1
     is_uint "$rate" && (( rate > 0 )) || { die "路径检查速率无效"; return 1; }
-    iface=$(detect_interface "$requested") || return 1
-    measure_lock_peer "$peer" "$iface" || return $?
+    measure_lock_requested_peer "$peer" "$port" "$requested" "$preferred_address" "$preferred_source" || return $?
+    iface="$MEASURE_PEER_IFACE"
     measure_require_locked_port "$peer" "$port" || return $?
     qdisc_guard "$iface" || return 1
     new_measure_run path-check || return 1; dir="$MEASURE_RUN_DIR"
@@ -1214,6 +1397,7 @@ measure_verify() {
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" duration="${4:-8}" expected_rate="${5:-0}" min_efficiency="${6:-0.90}"
     local baseline_loss="${7:-0}" threshold="${8:-0.1}" iface dir one multi one_gp one_loss multi_gp multi_loss rc=0 accepted=1 reject_reason=""
+    local preferred_address="${9:-}" preferred_source="${10:-}"
     local multi_parallel
     local one_count multi_count combined_count one_spread multi_spread combined_spread combined_loaded combined_contaminated
     local confidence confidence_score confidence_grade confidence_reasons
@@ -1225,8 +1409,8 @@ measure_verify() {
         die "verify 验收参数超出安全范围"
         return 1
     }
-    iface=$(detect_interface "$requested") || return 1
-    measure_lock_peer "$peer" "$iface" || return $?
+    measure_lock_requested_peer "$peer" "$port" "$requested" "$preferred_address" "$preferred_source" || return $?
+    iface="$MEASURE_PEER_IFACE"
     measure_require_locked_port "$peer" "$port" || return $?
     qdisc_guard "$iface" || return 1
     multi_parallel=$(recommended_verify_flows "$iface" "$expected_rate") || return 1
@@ -1291,6 +1475,7 @@ measure_compare() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" rate="$4" duration="${5:-6}" rounds="${6:-2}"
+    local preferred_address="${7:-}" preferred_source="${8:-}"
     local iface dir speed estimate_rate estimate rc=0 round mode row verdict confidence
     local fq_gp shaped_gp fq_rpg shaped_rpg fq_bloat shaped_bloat fq_spread shaped_spread combined_spread combined_loaded
     local confidence_score confidence_grade confidence_reasons throughput_delta
@@ -1299,8 +1484,8 @@ measure_compare() {
     is_uint "$rate" && (( rate >= 1 && rate <= 1000000 )) || { die "compare rate 必须是 1–1000000 的整数"; return 1; }
     is_uint "$duration" && (( duration >= 3 && duration <= 30 )) || { die "compare duration 必须是 3–30 秒"; return 1; }
     is_uint "$rounds" && (( rounds >= 2 && rounds <= 5 )) || { die "compare rounds 必须是 2–5"; return 1; }
-    iface=$(detect_interface "$requested") || return 1
-    measure_lock_peer "$peer" "$iface" || return $?
+    measure_lock_requested_peer "$peer" "$port" "$requested" "$preferred_address" "$preferred_source" || return $?
+    iface="$MEASURE_PEER_IFACE"
     measure_require_locked_port "$peer" "$port" || return $?
     qdisc_guard "$iface" || return 1
     new_measure_run compare || return 1; dir="$MEASURE_RUN_DIR"

@@ -82,6 +82,7 @@ test_hostname_is_resolved_once_and_iperf_is_bound() {
             printf '64 bytes from 203.0.113.10: time=1.0 ms\n'
             printf 'rtt min/avg/max/mdev = 1.000/1.000/1.000/0.000 ms\n'
         }
+        peer_port_open() { :; }
         iperf3() {
             printf '%s\n' "$*" >> "$iperf_args_file"
             printf 'after\n' > "$dns_state_file"
@@ -124,6 +125,7 @@ test_ipv6_literal_and_source_are_bound() {
         mock_success_metrics
         command_exists() { [[ "$1" != ping ]]; }
         timeout() { shift; "$@"; }
+        peer_port_open() { :; }
         iperf3() {
             printf '%s\n' "$*" >> "$iperf_args_file"
             printf '%s\n' '{"end":{"sum_sent":{"bits_per_second":100000000,"bytes":1000000,"retransmits":0}}}'
@@ -150,6 +152,7 @@ test_post_sample_route_drift_fails_and_restores() {
         require_root() { :; }; acquire_lock() { :; }; tc_dependencies() { :; }; require_commands() { :; }
         detect_interface() { printf 'eth0\n'; }
         peer_port_open() { printf '%s\n' "$1" >> "$port_file"; }
+        iperf_peer_usable() { :; }
         qdisc_guard() { :; }; detect_link_speed() { printf 'unknown\n'; }
         measure_set_latency_baseline() { MEASURE_IDLE_RTT_MS=1; }
         measure_begin() { MEASURE_IFACE="$1"; MEASURE_TX_START=0; MEASURE_RX_START=0; }
@@ -254,7 +257,7 @@ assert_formal_entry_locks_before_writes() {
         apply_shaping() { printf 'write\n' >> "$events_file"; }
         if "$@" >/dev/null 2>&1; then fail "$label continued after lock failure"; else rc=$?; fi
         assert_eq 42 "$rc" "$label lock failure status"
-        assert_eq $'detect\nlock' "$(sed '/^$/d' "$events_file")" "$label operation order"
+        assert_eq 'lock' "$(sed '/^$/d' "$events_file")" "$label operation order"
     )
 }
 
@@ -277,6 +280,7 @@ test_summary_keeps_hostname_and_locked_route() {
         require_root() { :; }; acquire_lock() { :; }; tc_dependencies() { :; }; require_commands() { :; }
         detect_interface() { printf 'eth0\n'; }
         peer_port_open() { printf '%s\n' "$1" >> "$port_file"; }
+        iperf_peer_usable() { :; }
         qdisc_guard() { :; }; detect_link_speed() { printf 'unknown\n'; }
         measure_set_latency_baseline() { MEASURE_IDLE_RTT_MS=1; }
         measure_begin() {
