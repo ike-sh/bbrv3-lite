@@ -2,7 +2,7 @@
 
 BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-当前版本：v8.0.1
+当前版本：v8.0.2
 
 项目不追求“sysctl 越多越好”。默认配置保持克制。命令行 `measure` 只给出结果；交互式 `auto` 会在一次总确认后完成测量、决策、应用和复验，未发现可信拐点时保持纯 FQ。
 
@@ -22,6 +22,7 @@ BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原
 - v7.4.0 DNS/IPv6 独立策略引擎：统一提供 `plan/apply/verify/status`，先只读识别当前状态和阻断原因，再调用各自的事务执行器；旧 DNS/IPv6 命令保留兼容映射，但不会绕过新策略门禁。
 - v8.0.0 真正多网卡管理：每张受管网卡拥有独立、严格解析且绑定 MAC 身份的 FQ/HTB-FQ 策略；一个 systemd 服务原子应用全部策略，允许多张网卡同时使用不同速率、不同模式和不同 BDP 元数据。
 - v8.0.1 实机兼容性修复：兼容真实 Linux 将 `tcp_rmem/tcp_wmem` 输出为 TAB 分隔三元组的行为；同时修复双栈域名在预检后重新解析到不可用 IPv6、导致必须关闭 IPv6 才能运行 iperf3 的回归。测速不会修改 IPv6 开关。
+- v8.0.2 qdisc 与路由事务精确恢复：基线和事务同时校验 root/leaf handle、可重放参数、MQ qdisc/class 对应关系和 TX queue 数；内核自动创建的 `0:` qdisc 会在事务内按需临时切换 `default_qdisc`、删除显式 root 完成重建，再恢复原全局默认值并复验两者。任何受管树上的外部 tc filter、扩展 HTB 拓扑或错误 default class 都会在写入前拒绝；IPv6 RA 路由不断递减的 `expires` 与查询 `uid` 不再被误判为换路，但 metric/proto/pref/gateway/device 等真实路由身份仍严格校验。
 - 全局 TCP sysctl 与逐网卡 qdisc 明确分层：Linux TCP 缓冲区是全局资源，脚本按全部策略聚合出一个安全上界；qdisc、速率、原始队列基线和恢复则逐网卡独立处理，不再把“多网卡检测”误称为“多网卡管理”。
 - 全局 `flock`，防止两个进程同时修改 sysctl、qdisc 或配置。
 - 严格 `KEY=VALUE` 白名单解析，配置文件从不被 shell `source`。
@@ -79,7 +80,7 @@ hash -r
 测试尚未发布的 `main` 分支时必须显式选择 channel；它同样校验仓库中的 `SHA256SUMS`：
 
 ```bash
-bash /tmp/install-bbrv3-lite.sh --channel main
+curl -fsSL https://raw.githubusercontent.com/ike-sh/bbrv3-lite/main/install-alias.sh | bash -s -- --channel main
 ```
 
 root 用户默认安装到 `/usr/local/bin/bbr`；普通用户安装到 `~/.local/bin/bbr`。普通用户仍需使用 `sudo bbr ...` 执行会修改系统的命令。
@@ -289,9 +290,10 @@ sudo bbr nic manage --interface enp6s0 --mode fq --profile balanced --role mixed
 
 sudo bbr nic verify
 sudo bbr nic verify --interface ens17
+sudo bbr nic apply
 ```
 
-每次 `manage` 都会先审计所有可见网卡和所有项目形态的 HTB。发现没有策略归属的孤立 HTB、未知 qdisc、损坏/符号链接策略、接口消失或 MAC 身份变化时，会在任何运行时写入前停止。修改过程中任意一张网卡失败，会恢复本轮涉及的全部网卡，而不是只恢复最后失败的一张。
+`nic apply` 通过与 systemd 完全相同的唯一入口重新应用当前持久化状态，可用于人工复验；它不是另一套独立实现。每次 `manage` 或 `apply` 都会先审计所有可见网卡和所有项目形态的 HTB。发现没有策略归属的孤立 HTB、未知 qdisc、损坏/符号链接策略、接口消失或 MAC 身份变化时，会在任何运行时写入前停止。目标 root/class/leaf 树存在外部 tc filter 时同样拒绝接管；独立的 `clsact/ingress` 树会原样保留。MQ 基线只有在当前 TX queue 数与保存时完全一致时才允许恢复。修改过程中任意一张网卡失败，会恢复本轮涉及的全部网卡，而不是只恢复最后失败的一张。
 
 解除单张网卡管理：
 
@@ -308,7 +310,7 @@ sudo bbr nic unmanage --interface enp6s0
 - HTB `burst` 根据 `rate / 内核 CONFIG_HZ`、MTU 和 32 KiB 下限动态计算，绝对上限约 2 GiB，可覆盖 1 Tbit/s@100Hz；普通速率仍只得到对应的小 bucket。无法读取内核配置时保守使用 250Hz，不会用 `getconf CLK_TCK` 的用户态 USER_HZ 代替内核调度频率。
 - `cburst` 使用 `2 × MTU`；单 class 场景的 quantum 使用 `10 × MTU`，最大 60000 字节。
 - 固定 handle 为 `1:`、`1:10`、`10:`，重复执行使用 `replace`，不会不断叠加层级。
-- FQ/FQ-CoDel 会保存并重放 `tc qdisc show` 可恢复的参数；多队列物理网卡的 `mq` 根节点会逐硬件队列保存并重建 FQ/FQ-CoDel/PFIFO 叶子。发现未知 root qdisc（例如自建 CAKE），或 `mq` 下存在无法安全重放的自定义叶子时拒绝覆盖。
+- FQ/FQ-CoDel 会保存并重放 `tc qdisc show` 可恢复的参数；多队列物理网卡的 `mq` 根节点会逐硬件队列保存并重建 `fq`、`fq_codel`、`pfifo_fast`、`pfifo`、`bfifo` 或 `noqueue` 叶子。发现未知 root qdisc（例如自建 CAKE），或 `mq` 下存在无法安全重放的自定义叶子时拒绝覆盖。
 
 本工具只处理 egress，不自动创建 IFB，也不做 ingress shaping。
 
@@ -640,6 +642,20 @@ tag 推送会触发 Release 工作流，验证 tag 与脚本版本一致，并�
 - 修复 v8 双栈测速回归：公共节点预检、正式扫描与最终复验不再各自解析域名并可能选择不同地址族。主机名按 IPv4 优先、IPv6 回退逐端点验证；显式 IPv6 保持 IPv6，不会偷偷降级。
 - 预检成功后冻结并复用地址、地址族、来源地址、实际出口网卡和端口。未使用的坏 AAAA、缺失的 IPv6 默认路由或双栈分流不再阻断可用 IPv4，反向的 IPv6-only 服务也能正常回退；测速不会修改 IPv6 开关。
 - Docker 发布矩阵新增真实 procfs/sysctl 快照，以及真实双栈 veth 中 IPv4-only、IPv6-only、显式 IPv6、错误接口、DNS 答案变化和路由漂移集成测试，避免测试夹具与实机行为不同而再次漏检。
+
+## v8.0.2 qdisc 精确恢复与外部状态保护
+
+- qdisc 基线不再只记录类型。root 和 MQ leaf 的 handle、内核可重放参数、MQ class/leaf 对应关系都会进入严格快照；恢复后逐项复读比对，任何缺项、重复 parent/handle、未知 child 或 class 不一致都按失败处理。
+- Linux 自动 qdisc 的 `0:` handle 不能用 `tc replace handle 0:` 原样创建。若目标类型与当前 `net.core.default_qdisc` 不同，恢复会在事务内临时切换默认类型、删除显式 root，让内核重建并验证类型、`0:` handle 与参数；随后恢复操作前的全局默认值，并再次验证全局值和目标网卡 qdisc。任一步不能证明一致时都不会宣称恢复成功。
+- MQ 恢复同时读取 qdisc、class 和实际 TX queue 数。快照中的 child 数、class 数、leaf handle 与当前队列数必须在任何 root 替换前完全一致，避免网卡队列数量漂移后只恢复一半拓扑。
+- root、class、leaf 上的外部 tc filter 均视为不可无损重放状态：快照、接管、恢复和多网卡预检都会 fail closed；独立的 `clsact/ingress` 树不属于 root 整形树，允许保留且不会被覆盖。
+- 项目 HTB 所有权收紧为唯一闭合拓扑：`htb 1:` 必须以 `1:10` 为 default，且只能存在 `class 1:10` 与 `fq 10:`。额外 class/leaf、错误 default 或残缺拓扑都会被识别为外部漂移，而不是继续按“受管 HTB”修改。
+- HTB 速率验证改为按 tc 的原始单位解析成精确 bit/s 后比较，不再把 `1500 Kbit`、`1999 Kbit` 四舍五入成配置中的 `2 Mbit`；显示层的小数格式不会参与所有权或一致性判断。
+- IPv4/IPv6 默认路由、sysctl、策略文件和接口集合都必须先完整读取，再允许第一次写入。任一地址族查询失败、策略枚举只返回前缀、接口快照缺失/重复或路由身份漂移，都会在零运行时修改阶段停止。
+- 开机持久化的单网卡与多网卡 `apply` 统一使用完整运行时事务。sysctl、全部目标 qdisc 和 IPv4/IPv6 路由窗口要么共同通过并提交，要么共同恢复；失败的 service 不会留下只生效一半的配置。
+- 多网卡 apply 从一次冻结的策略文件全集生成接口清单，快照、应用、验证和回滚全程复用同一集合；事务内的 `interfaces.list` 必须与 qdisc 快照一一对应，producer 中途失败不会提交已枚举到的子集。
+- 完整卸载会在策略目录删除后以非递归 `rmdir` 清理空的 `/etc/bbrv3-lite` 父目录；若其中存在外来文件或路径是符号链接则明确保留，绝不会为追求“干净”而递归删除非项目内容。
+- Docker TC 集成覆盖显式 handle、`0:` 自动重建、外部 filter、`clsact`、闭合 HTB 和多队列 MQ；发布前还会在授权实机上验证安装、服务重放、卸载及原始 qdisc 精确回归。
 
 ## v8 与旧版的差异
 

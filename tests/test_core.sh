@@ -293,29 +293,327 @@ test_qdisc_replay_filters_kernel_runtime_fields() {
         echo 'qdisc fq 8001: root refcnt 2 limit 10000p flow_limit 100p bands 3 priomap 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 weights 589824 196608 65536 quantum 3028b horizon 10s horizon_drop'
     }
     args=$(root_qdisc_replay_args eth0)
-    [[ "$args" == *'limit 10000'* && "$args" == *'flow_limit 100'* && "$args" == *'quantum 3028b'* ]] || fail "stable FQ arguments were not retained: $args"
+    [[ "$args" == *'limit 10000'* && "$args" == *'flow_limit 100'* && "$args" == *'quantum 3028'* ]] || fail "stable FQ arguments were not retained and normalized: $args"
     [[ "$args" != *bands* && "$args" != *priomap* && "$args" != *weights* ]] || fail "kernel runtime FQ fields were replayed: $args"
+}
+
+test_root_qdisc_handle_restore_paths() {
+    (
+        local snapshot="$TEST_ROOT/root-handle-explicit.snapshot"
+        local current_kind=htb current_handle=1: current_args="" events=""
+        TC_SESSION_HTB_IFACE=""
+        printf '%s\n' \
+            $'KIND\tfq_codel' $'RATE\t' $'ARGS\tlimit 2048 target 7ms' \
+            'qdisc fq_codel 123: root limit 2048p target 7ms' > "$snapshot"
+        tc() {
+            case "$*" in
+                'qdisc show dev eth0')
+                    printf 'qdisc %s %s root%s\n' "$current_kind" "$current_handle" "${current_args:+ $current_args}"
+                    ;;
+                'class show dev eth0') : ;;
+                'filter show dev eth0 parent 1:') : ;;
+                'qdisc replace dev eth0 root handle 123: fq_codel limit 2048 target 7ms')
+                    events+=" [$*]"; current_kind=fq_codel; current_handle=123:; current_args='limit 2048p target 7ms'
+                    ;;
+                *) fail "unexpected explicit-handle tc invocation: $*" ;;
+            esac
+        }
+        restore_action_qdisc eth0 "$snapshot" || fail "explicit root handle restore failed"
+        assert_eq fq_codel "$current_kind" "explicit root kind"
+        assert_eq 123: "$current_handle" "explicit root handle"
+        [[ "$events" == *'[qdisc replace dev eth0 root handle 123: fq_codel limit 2048 target 7ms]'* ]] ||
+            fail "explicit root handle was not replayed: $events"
+    )
+
+    (
+        local snapshot="$TEST_ROOT/root-handle-zero.snapshot"
+        local current_kind=htb current_handle=1: current_args="" events=""
+        TC_SESSION_HTB_IFACE=""
+        printf '%s\n' \
+            $'KIND\tfq_codel' $'RATE\t' $'ARGS\tlimit 10240 target 5ms' \
+            'qdisc fq_codel 0: root limit 10240p target 5ms' > "$snapshot"
+        sysctl() {
+            [[ "$*" == '-n net.core.default_qdisc' ]] || return 1
+            printf '%s\n' fq_codel
+        }
+        tc() {
+            case "$*" in
+                'qdisc show dev eth0')
+                    printf 'qdisc %s %s root%s\n' "$current_kind" "$current_handle" "${current_args:+ $current_args}"
+                    ;;
+                'class show dev eth0') : ;;
+                'filter show dev eth0 parent 1:') : ;;
+                'qdisc del dev eth0 root')
+                    events+=" [$*]"; current_kind=fq_codel; current_handle=0:; current_args='limit 10240p target 5ms'
+                    ;;
+                qdisc\ replace*) fail "handle 0 restore used replace instead of the kernel default path: $*" ;;
+                *) fail "unexpected zero-handle tc invocation: $*" ;;
+            esac
+        }
+        restore_action_qdisc eth0 "$snapshot" || fail "kernel-owned handle 0 restore failed"
+        assert_eq 0: "$current_handle" "kernel-owned root handle"
+        [[ "$events" == *'[qdisc del dev eth0 root]'* ]] || fail "handle 0 restore did not delete the explicit root: $events"
+    )
+
+    (
+        local snapshot="$TEST_ROOT/root-handle-zero-mismatch.snapshot"
+        local current_kind=htb current_handle=1: current_args="" mock_default_kind=fq events=""
+        printf '%s\n' \
+            $'KIND\tfq_codel' $'RATE\t' $'ARGS\tlimit 10240 target 5ms' \
+            'qdisc fq_codel 0: root limit 10240p target 5ms' > "$snapshot"
+        sysctl() {
+            case "$*" in
+                '-n net.core.default_qdisc') printf '%s\n' "$mock_default_kind" ;;
+                '-q -w net.core.default_qdisc=fq_codel')
+                    events+=' [default=fq_codel]'; mock_default_kind=fq_codel
+                    ;;
+                '-q -w net.core.default_qdisc=fq')
+                    events+=' [default=fq]'; mock_default_kind=fq
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        tc() {
+            case "$*" in
+                'qdisc show dev eth0')
+                    printf 'qdisc %s %s root%s\n' "$current_kind" "$current_handle" "${current_args:+ $current_args}"
+                    ;;
+                'class show dev eth0') : ;;
+                'filter show dev eth0 parent 1:') : ;;
+                'qdisc del dev eth0 root')
+                    [[ "$mock_default_kind" == fq_codel ]] || fail "handle-0 root was deleted before selecting its saved default kind"
+                    events+=' [qdisc-del]'; current_kind=fq_codel; current_handle=0:; current_args='limit 10240p target 5ms'
+                    ;;
+                *) fail "unexpected mismatched handle-0 tc invocation: $*" ;;
+            esac
+        }
+        restore_action_qdisc eth0 "$snapshot" || fail "handle-0 restore with a different current default_qdisc failed"
+        assert_eq fq "$mock_default_kind" "temporary default_qdisc restoration"
+        assert_eq fq_codel "$current_kind" "temporary handle-0 root kind"
+        assert_eq 0: "$current_handle" "temporary handle-0 root handle"
+        assert_eq ' [default=fq_codel] [qdisc-del] [default=fq]' "$events" "temporary handle-0 restore order"
+    )
+
+    (
+        local snapshot="$TEST_ROOT/noqueue-restore-failure.snapshot"
+        printf '%s\n' $'KIND\tnoqueue' $'RATE\t' $'ARGS\t' 'qdisc noqueue 0: root' > "$snapshot"
+        tc() {
+            case "$*" in
+                'qdisc show dev eth0') printf 'qdisc fq 123: root\n' ;;
+                'class show dev eth0'|'filter show dev eth0 parent 123:') : ;;
+                'qdisc del dev eth0 root') return 2 ;;
+                *) fail "unexpected noqueue restore tc invocation: $*" ;;
+            esac
+        }
+        if restore_action_qdisc eth0 "$snapshot" >/dev/null 2>&1; then
+            fail "failed noqueue deletion was reported as an exact restore"
+        fi
+    )
+}
+
+test_cleanup_core_restores_pending_runtime_transactions_on_signal() {
+    local result="$TEST_ROOT/cleanup-core-signal.result"
+    (
+        local mock_default_kind=fq_codel events=""
+        QDISC_DEFAULT_TRANSACTION_ACTIVE=1
+        QDISC_DEFAULT_TRANSACTION_ORIGINAL=fq
+        NIC_RUNTIME_TRANSACTION_DIR="$TEST_ROOT/mock-nic-runtime-transaction"
+        NIC_RUNTIME_TRANSACTION_PARENT="$TEST_ROOT"
+        NIC_RUNTIME_TRANSACTION_MUTATED=1
+        NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+        TC_TRIAL_IFACE=""; TC_TRIAL_SNAPSHOT=""
+        MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+        DNS_TRANSACTION_DIR=""; IPV6_TRANSACTION_DIR=""
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+        sysctl() {
+            case "$*" in
+                '-q -w net.core.default_qdisc=fq') mock_default_kind=fq; events+=" default-restored" ;;
+                '-n net.core.default_qdisc') printf '%s\n' "$mock_default_kind" ;;
+                *) return 1 ;;
+            esac
+        }
+        nic_runtime_transaction_rollback() {
+            events+=" nic-restored"
+            NIC_RUNTIME_TRANSACTION_DIR=""
+            NIC_RUNTIME_TRANSACTION_PARENT=""
+            NIC_RUNTIME_TRANSACTION_MUTATED=0
+        }
+        release_lock() { events+=" lock-released"; }
+        trap 'cleanup_core; printf "%s\t%s\t%s\n" "$mock_default_kind" "$QDISC_DEFAULT_TRANSACTION_ACTIVE" "$events" > "$result"; exit 0' TERM
+        kill -TERM "$BASHPID"
+        exit 99
+    )
+    [[ -f "$result" ]] || fail "TERM cleanup did not publish its result"
+    IFS=$'\t' read -r default_kind default_active events < "$result"
+    assert_eq fq "$default_kind" "TERM cleanup restored default_qdisc"
+    assert_eq 0 "$default_active" "TERM cleanup cleared default_qdisc transaction"
+    assert_eq ' default-restored nic-restored lock-released' "$events" "TERM cleanup transaction order"
+}
+
+test_cleanup_core_discards_incomplete_action_snapshot_without_writes() {
+    local result="$TEST_ROOT/incomplete-action-signal.result" events="$TEST_ROOT/incomplete-action-signal.events"
+    : > "$events"
+    (
+        ACTION_TRANSACTION_DIR="$STATE_DIR/.transaction.incomplete-action"
+        ACTION_TRANSACTION_IFACE=eth0
+        ACTION_TRANSACTION_INTERFACES=eth0
+        ACTION_TRANSACTION_READY=0
+        ACTION_TRANSACTION_MUTATED=0
+        ACTION_TRANSACTION_ROLLING_BACK=0
+        QDISC_DEFAULT_TRANSACTION_ACTIVE=0
+        NIC_RUNTIME_TRANSACTION_DIR=""
+        TC_TRIAL_IFACE=""; TC_TRIAL_SNAPSHOT=""
+        MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+        DNS_TRANSACTION_DIR=""; IPV6_TRANSACTION_DIR=""
+        mkdir -p "$ACTION_TRANSACTION_DIR/qdiscs"
+        systemctl() { printf 'WRITE:systemctl:%s\n' "$*" >> "$events"; }
+        action_transaction_restore_path() { printf 'WRITE:path\n' >> "$events"; }
+        action_transaction_restore_tree() { printf 'WRITE:tree\n' >> "$events"; }
+        restore_tcp_sysctl_snapshot_file() { printf 'WRITE:sysctl\n' >> "$events"; }
+        action_transaction_restore_routes() { printf 'WRITE:routes\n' >> "$events"; }
+        restore_action_qdisc() { printf 'WRITE:qdisc\n' >> "$events"; }
+        action_transaction_restore_unit() { printf 'WRITE:unit\n' >> "$events"; }
+        release_lock() { :; }
+        trap 'cleanup_core; printf "%s\t%s\n" "${ACTION_TRANSACTION_DIR:-EMPTY}" "$ACTION_TRANSACTION_MUTATED" > "$result"; exit 0' TERM
+        kill -TERM "$BASHPID"
+        exit 99
+    )
+    [[ ! -s "$events" ]] || fail "incomplete read-only action snapshot triggered system writes: $(<"$events")"
+    IFS=$'\t' read -r action_dir action_mutated < "$result"
+    assert_eq EMPTY "$action_dir" "incomplete action transaction cleanup state"
+    assert_eq 0 "$action_mutated" "incomplete action mutation phase"
+    [[ ! -e "$STATE_DIR/.transaction.incomplete-action" ]] || fail "removable incomplete action snapshot was retained"
+}
+
+test_cleanup_failure_changes_successful_process_status() {
+    local events="$TEST_ROOT/cleanup-failure.events" rc
+    : > "$events"
+    if (
+        QDISC_DEFAULT_TRANSACTION_ACTIVE=1
+        QDISC_DEFAULT_TRANSACTION_ORIGINAL=fq
+        NIC_RUNTIME_TRANSACTION_DIR="$TEST_ROOT/pending-nic-cleanup"
+        TC_TRIAL_IFACE=""; TC_TRIAL_SNAPSHOT=""
+        MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+        DNS_TRANSACTION_DIR=""; IPV6_TRANSACTION_DIR=""; ACTION_TRANSACTION_DIR=""
+        qdisc_default_transaction_restore() { printf 'default-failed\n' >> "$events"; return 1; }
+        nic_runtime_transaction_rollback() { printf 'nic-attempted\n' >> "$events"; NIC_RUNTIME_TRANSACTION_DIR=""; }
+        release_lock() { printf 'lock-attempted\n' >> "$events"; }
+        trap cleanup_core_exit EXIT
+        true
+    ); then
+        fail "failed EXIT cleanup preserved a successful process status"
+    fi
+    grep -Fxq default-failed "$events" || fail "default_qdisc cleanup failure was not exercised"
+    grep -Fxq nic-attempted "$events" || fail "cleanup stopped before attempting the later NIC rollback"
+    grep -Fxq lock-attempted "$events" || fail "cleanup stopped before releasing the lock"
+
+    if (
+        QDISC_DEFAULT_TRANSACTION_ACTIVE=0
+        NIC_RUNTIME_TRANSACTION_DIR=""
+        TC_TRIAL_IFACE=""; TC_TRIAL_SNAPSHOT=""
+        MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+        DNS_TRANSACTION_DIR=""; IPV6_TRANSACTION_DIR=""; ACTION_TRANSACTION_DIR=""
+        release_lock() { :; }
+        trap cleanup_core_exit EXIT
+        exit 7
+    ); then rc=0; else rc=$?; fi
+    assert_eq 7 "$rc" "cleanup preserved original command failure status"
+}
+
+test_qdisc_filter_and_managed_topology_guards() {
+    (
+        local mode=clean root_default='default 0x10' class_ceil=100
+        TC_SESSION_HTB_IFACE=""
+        tc() {
+            case "$1 $2 $3 $4" in
+                'qdisc show dev eth0')
+                    printf 'qdisc htb 1: root%s\n' "${root_default:+ $root_default}"
+                    printf '%s\n' 'qdisc fq 10: parent 1:10 limit 10000p'
+                    [[ "$mode" != extra ]] || printf '%s\n' 'qdisc fq_codel 20: parent 1:20 limit 10240p'
+                    ;;
+                'class show dev eth0')
+                    printf 'class htb 1:10 root rate 100Mbit ceil %sMbit\n' "$class_ceil"
+                    [[ "$mode" != extra ]] || printf '%s\n' 'class htb 1:20 root rate 10Mbit ceil 10Mbit'
+                    ;;
+                'filter show dev eth0')
+                    case "$*" in
+                        *' parent 1:') [[ "$mode" != root_filter ]] || printf '%s\n' 'filter protocol ip pref 10 u32 chain 0' ;;
+                        *' parent 1:10') [[ "$mode" != leaf_filter ]] || printf '%s\n' 'filter protocol ip pref 10 u32 chain 0' ;;
+                    esac
+                    ;;
+                *) fail "unexpected topology guard tc invocation: $*" ;;
+            esac
+        }
+
+        managed_htb eth0 || fail "clean managed HTB topology was rejected"
+        qdisc_guard eth0 || fail "clean managed HTB guard failed"
+
+        root_default='default 10'
+        managed_htb eth0 || fail "decimal managed HTB default class was rejected"
+        qdisc_guard eth0 || fail "decimal managed HTB default class failed the guard"
+
+        root_default=''
+        if managed_htb eth0; then fail "managed HTB accepted a missing default class"; fi
+        if qdisc_guard eth0 >/dev/null 2>&1; then fail "qdisc guard accepted HTB without a default class"; fi
+
+        root_default='default 20'
+        if managed_htb eth0; then fail "managed HTB accepted a foreign default class"; fi
+        if qdisc_guard eth0 >/dev/null 2>&1; then fail "qdisc guard accepted HTB defaulting to a foreign class"; fi
+
+        root_default='default 0x10'
+
+        mode=extra
+        if managed_htb eth0; then fail "managed HTB accepted an extra class/leaf"; fi
+        if qdisc_guard eth0 >/dev/null 2>&1; then fail "qdisc guard accepted an extended managed HTB tree"; fi
+
+        mode=root_filter
+        if managed_htb eth0; then fail "managed HTB accepted a root filter"; fi
+        if qdisc_guard eth0 >/dev/null 2>&1; then fail "qdisc guard accepted a root filter"; fi
+
+        mode=leaf_filter
+        if managed_htb eth0; then fail "managed HTB accepted a leaf-class filter"; fi
+        if qdisc_guard eth0 >/dev/null 2>&1; then fail "qdisc guard accepted a leaf-class filter"; fi
+
+        mode=clean; class_ceil=1
+        if managed_htb eth0; then fail "managed HTB accepted a rate/ceil mismatch"; fi
+        if verify_shaping eth0 100 >/dev/null 2>&1; then fail "shaping verifier accepted a rate/ceil mismatch"; fi
+        class_ceil=100
+        if verify_shaping eth0 99 >/dev/null 2>&1; then fail "shaping verifier accepted a policy-rate mismatch"; fi
+    )
 }
 
 test_mq_child_guard_and_restore() {
     (
-        local rows mock_child=fq_codel snapshot="$TEST_ROOT/mq.snapshot" events=""
+        local rows duplicate_rows mock_child=pfifo_fast snapshot="$TEST_ROOT/mq.snapshot" events=""
+        local zero_snapshot="$TEST_ROOT/mq-zero.snapshot" mq_net_root="$TEST_ROOT/mq-sys-class-net"
+        local write_count=0 writes_before mock_class_valid=1 mock_default_kind=pfifo_fast
+        local mock_root_kind=htb mock_root_handle=1: child1_kind=fq_codel child1_handle=123:
+        BBRV3_SYS_CLASS_NET_ROOT="$mq_net_root"
+        mkdir -p "$mq_net_root/eth0/queues/tx-0" "$mq_net_root/eth0/queues/tx-1"
         rows=$(printf '%s\n' \
-            'qdisc mq 0: root' \
-            'qdisc fq_codel 0: parent :1 limit 10240p flows 1024 quantum 1514 target 5ms interval 100ms refcnt 2' \
-            'qdisc fq 0: parent :2 limit 10000p flow_limit 100p bands 3 priomap 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 weights 1 1 1' |
+            'qdisc mq 8003: root' \
+            'qdisc fq_codel 123: parent 8003:1 limit 10240p flows 1024 quantum 1514 target 5ms interval 100ms refcnt 2' \
+            'qdisc pfifo_fast 0: parent 8003:2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1' \
+            'qdisc clsact ffff: parent ffff:fff1' |
             mq_child_replay_rows_from_stream)
-        [[ "$rows" == *$':1\tfq_codel\tlimit 10240 flows 1024 quantum 1514 target 5ms interval 100ms'* ]] ||
+        [[ "$rows" == *$'8003:1\tfq_codel\t123:\tlimit 10240 flows 1024 quantum 1514 target 5ms interval 100ms'* ]] ||
             fail "mq fq_codel replay row malformed: $rows"
-        [[ "$rows" == *$':2\tfq\tlimit 10000 flow_limit 100'* && "$rows" != *priomap* && "$rows" != *weights* ]] ||
-            fail "mq fq replay row retained runtime fields: $rows"
+        [[ "$rows" == *$'8003:2\tpfifo_fast\t0:\t'* && "$rows" != *priomap* && "$rows" != *ffff:* ]] ||
+            fail "mq replay rows retained runtime or clsact fields: $rows"
+        assert_eq 2 "$(awk 'END {print NR}' <<< "$rows")" "mq complete child count"
+        mq_child_rows_validate "$rows" || fail "valid MQ child set was rejected"
+        duplicate_rows="$rows"$'\n'"$(head -n 1 <<< "$rows")"
+        if mq_child_rows_validate "$duplicate_rows"; then fail "duplicate MQ parent/handle was accepted"; fi
+        if mq_child_rows_validate ""; then fail "empty MQ child set was accepted"; fi
 
         tc() {
             case "$*" in
                 'qdisc show dev eth0')
                     printf 'qdisc mq 0: root\nqdisc %s 0: parent :1 limit 10240p\n' "$mock_child"
+                    printf '%s\n' 'qdisc pfifo_fast 0: parent :2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1'
                     ;;
-                'class show dev eth0') : ;;
+                'class show dev eth0') printf '%s\n' 'class mq :1 root' 'class mq :2 root' ;;
+                filter\ show\ dev\ eth0\ parent*) : ;;
                 *) events+=" [$*]" ;;
             esac
         }
@@ -325,12 +623,121 @@ test_mq_child_guard_and_restore() {
 
         printf '%s\n' \
             $'KIND\tmq' $'RATE\t' $'ARGS\t' \
-            'qdisc mq 0: root' \
-            'qdisc fq_codel 0: parent :1 limit 10240p flows 1024 quantum 1514 target 5ms interval 100ms' > "$snapshot"
+            'qdisc mq 8003: root' \
+            'qdisc fq_codel 123: parent 8003:1 limit 10240p flows 1024 quantum 1514 target 5ms interval 100ms' \
+            'qdisc pfifo_fast 0: parent 8003:2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1' \
+            'class mq 8003:1 root leaf 123:' \
+            'class mq 8003:2 root' > "$snapshot"
+
+        mock_child=fq_codel
+        sysctl() {
+            case "$*" in
+                '-n net.core.default_qdisc') printf '%s\n' "$mock_default_kind" ;;
+                '-q -w net.core.default_qdisc='*)
+                    mock_default_kind="${3#net.core.default_qdisc=}"
+                    events+=" [default=$mock_default_kind]"
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        tc() {
+            case "$*" in
+                'qdisc show dev eth0')
+                    if [[ "$mock_root_kind" == htb ]]; then
+                        printf '%s\n' 'qdisc htb 1: root'
+                    else
+                        printf 'qdisc mq %s root\n' "$mock_root_handle"
+                        printf '%s\n' 'qdisc pfifo_fast 0: parent 8003:2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1'
+                        if [[ "$child1_kind" == fq_codel ]]; then
+                            printf 'qdisc fq_codel %s parent 8003:1 limit 10240p flows 1024 quantum 1514 target 5ms interval 100ms\n' "$child1_handle"
+                        else
+                            printf '%s\n' 'qdisc pfifo_fast 0: parent 8003:1 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1'
+                        fi
+                    fi
+                    ;;
+                'class show dev eth0')
+                    if [[ "$mock_root_kind" == mq ]]; then
+                        if (( mock_class_valid )); then
+                            printf '%s\n' 'class mq 8003:1 root leaf 123:' 'class mq 8003:2 root'
+                        else
+                            printf '%s\n' 'class mq 8003:1 root leaf 124:' 'class mq 8003:2 root'
+                        fi
+                    fi
+                    ;;
+                'qdisc replace dev eth0 root handle 8003: mq')
+                    ((write_count+=1)); events+=" [$*]"; mock_root_kind=mq; mock_root_handle=8003:; child1_kind=pfifo_fast; child1_handle=0:
+                    ;;
+                'qdisc replace dev eth0 parent 8003:1 handle 123: fq_codel limit 10240 flows 1024 quantum 1514 target 5ms interval 100ms')
+                    ((write_count+=1)); events+=" [$*]"; child1_kind=fq_codel; child1_handle=123:
+                    ;;
+                'qdisc del dev eth0 root')
+                    ((write_count+=1)); events+=" [$*]"; mock_root_kind=mq; mock_root_handle=0:; child1_kind=fq_codel; child1_handle=0:
+                    ;;
+                *) fail "unexpected MQ restore tc invocation: $*" ;;
+            esac
+        }
         restore_mq_qdisc_snapshot eth0 "$snapshot" || fail "mq hierarchy restore failed"
-        [[ "$events" == *'[qdisc replace dev eth0 root mq]'* &&
-            "$events" == *'[qdisc replace dev eth0 parent :1 fq_codel limit 10240 flows 1024 quantum 1514 target 5ms interval 100ms]'* ]] ||
+        [[ "$events" == *'[qdisc replace dev eth0 root handle 8003: mq]'* &&
+            "$events" == *'[qdisc replace dev eth0 parent 8003:1 handle 123: fq_codel limit 10240 flows 1024 quantum 1514 target 5ms interval 100ms]'* ]] ||
             fail "mq hierarchy restore calls missing: $events"
+        assert_eq 8003: "$mock_root_handle" "MQ root handle"
+        assert_eq 123: "$child1_handle" "MQ child handle"
+
+        mock_class_valid=0
+        if restore_mq_qdisc_snapshot eth0 "$snapshot" >/dev/null 2>&1; then
+            fail "MQ restore accepted a live class/leaf mapping mismatch"
+        fi
+        mock_class_valid=1
+
+        mock_default_kind=fq; mock_root_kind=htb; mock_root_handle=1:; child1_kind=fq_codel; child1_handle=123:
+        restore_mq_qdisc_snapshot eth0 "$snapshot" || fail "MQ restore failed after temporary default_qdisc selection"
+        assert_eq fq "$mock_default_kind" "MQ temporary default_qdisc restoration"
+        [[ "$events" == *'[default=pfifo_fast]'* && "$events" == *'[default=fq]'* ]] ||
+            fail "MQ zero-handle default_qdisc transaction was not exercised: $events"
+
+        # Queue-count drift must be rejected before replacing or deleting the
+        # root.  Otherwise a 2-queue snapshot restored onto a 3/4-queue NIC can
+        # leave a partially rebuilt MQ tree before the final count check fails.
+        mkdir -p "$mq_net_root/eth0/queues/tx-2"
+        writes_before=$write_count
+        mock_root_kind=htb; mock_root_handle=1:; child1_kind=fq_codel; child1_handle=123:
+        if restore_mq_qdisc_snapshot eth0 "$snapshot" >/dev/null 2>&1; then
+            fail "non-zero MQ restore accepted TX queue-count drift"
+        fi
+        assert_eq "$writes_before" "$write_count" "non-zero MQ queue mismatch tc writes"
+
+        printf '%s\n' \
+            $'KIND\tmq' $'RATE\t' $'ARGS\t' \
+            'qdisc mq 0: root' \
+            'qdisc pfifo_fast 0: parent :1 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1' \
+            'qdisc pfifo_fast 0: parent :2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1' \
+            'class mq :1 root' \
+            'class mq :2 root' > "$zero_snapshot"
+        action_qdisc_snapshot_validate "$zero_snapshot" || fail "valid zero-handle MQ fixture was rejected"
+        sed 's/qdisc pfifo_fast 0: parent :2/qdisc fq 0: parent :2/' "$zero_snapshot" > "$zero_snapshot.mixed"
+        if action_qdisc_snapshot_validate "$zero_snapshot.mixed" >/dev/null 2>&1; then
+            fail "MQ snapshot accepted multiple zero-handle default qdisc kinds"
+        fi
+        writes_before=$write_count
+        mock_root_kind=htb; mock_root_handle=1:; child1_kind=fq_codel; child1_handle=123:
+        if restore_mq_qdisc_snapshot eth0 "$zero_snapshot" >/dev/null 2>&1; then
+            fail "zero-handle MQ restore accepted TX queue-count drift"
+        fi
+        assert_eq "$writes_before" "$write_count" "zero-handle MQ queue mismatch tc writes"
+        rmdir "$mq_net_root/eth0/queues/tx-2"
+
+        # Removing a saved child must never be accepted as a successful partial
+        # restore when the live MQ root recreates the complete queue set.  Keep
+        # both class rows so the qdisc/class count mismatch is caught by the
+        # snapshot validator before any replay is attempted.
+        grep -v 'parent 8003:2' "$snapshot" > "$snapshot.incomplete"
+        if action_qdisc_snapshot_validate "$snapshot.incomplete"; then
+            fail "incomplete MQ qdisc set with complete class rows passed snapshot validation"
+        fi
+        mock_root_kind=htb; mock_root_handle=1:; child1_kind=fq_codel; child1_handle=123:
+        if restore_mq_qdisc_snapshot eth0 "$snapshot.incomplete" >/dev/null 2>&1; then
+            fail "incomplete MQ child set was reported as restored"
+        fi
     )
 }
 
@@ -342,6 +749,28 @@ test_managed_rate_unit_parsing() {
     (
         tc() { echo 'class htb 1:10 root prio 0 rate 25Gbit ceil 25Gbit'; }
         assert_eq 25000 "$(managed_rate_mbit eth0)" "Gbit managed rate parsing"
+    )
+    (
+        tc() { echo 'class htb 1:10 root prio 0 rate 1500Kbit ceil 1500Kbit'; }
+        assert_eq 1500000 "$(managed_rate_bps eth0)" "Kbit exact managed rate parsing"
+        assert_eq 1.5 "$(managed_rate_mbit eth0)" "fractional Mbit display"
+    )
+    (
+        local class_rate=1500Kbit
+        tc() {
+            case "$*" in
+                'qdisc show dev eth0') printf 'qdisc htb 1: root default 10\nqdisc fq 10: parent 1:10\n' ;;
+                'class show dev eth0') printf 'class htb 1:10 root rate %s ceil %s\n' "$class_rate" "$class_rate" ;;
+                filter\ show\ dev\ eth0\ parent*) : ;;
+                *) return 1 ;;
+            esac
+        }
+        managed_htb eth0 || fail "fractional-Mbit closed HTB topology was not recognized"
+        if verify_shaping eth0 2 >/dev/null 2>&1; then fail "1500 Kbit was accepted as an exact 2 Mbit policy"; fi
+        class_rate=1999Kbit
+        if verify_shaping eth0 2 >/dev/null 2>&1; then fail "1999 Kbit was accepted as an exact 2 Mbit policy"; fi
+        class_rate=2000Kbit
+        verify_shaping eth0 2 || fail "exact 2000 Kbit policy was rejected"
     )
 }
 
@@ -359,6 +788,7 @@ test_tc_transaction() {
                     htb) echo 'qdisc htb 1: root refcnt 2 default 0x10'; ((MOCK_LEAF)) && echo 'qdisc fq 10: parent 1:10 limit 10000p' ;;
                 esac ;;
             'class show dev eth0') ((MOCK_CLASS)) && echo "class htb 1:10 root rate ${MOCK_RATE}Mbit ceil ${MOCK_RATE}Mbit" || true ;;
+            filter\ show\ dev\ eth0\ parent*) : ;;
             'qdisc replace dev eth0 root handle 1: htb default 10')
                 [[ "$MOCK_ROOT" != htb ]] || return 95
                 MOCK_ROOT=htb; MOCK_CLASS=0; MOCK_LEAF=0
@@ -389,9 +819,9 @@ test_tc_transaction() {
     assert_eq 1 "$MOCK_LEAF" "FQ leaf after in-place rate update"
 
     MOCK_LEAF=0
-    apply_shaping eth0 340
-    assert_eq 340 "$MOCK_RATE" "session-owned HTB class repair rate"
-    assert_eq 1 "$MOCK_LEAF" "session-owned FQ leaf repair"
+    if apply_shaping eth0 340 >/dev/null 2>&1; then fail "incomplete managed HTB topology was repaired implicitly"; fi
+    assert_eq 320 "$MOCK_RATE" "incomplete managed HTB class was left untouched"
+    assert_eq 0 "$MOCK_LEAF" "incomplete managed HTB leaf was left untouched"
 
     MOCK_ROOT=fq; MOCK_CLASS=0; MOCK_LEAF=0; MOCK_FAIL_LEAF=1
     if apply_shaping eth0 300; then fail "failed leaf reported success"; fi
@@ -399,6 +829,38 @@ test_tc_transaction() {
 
     MOCK_ROOT=cake; MOCK_FAIL_LEAF=0
     if qdisc_guard eth0; then fail "unknown qdisc accepted"; fi
+}
+
+test_failed_tc_apply_retains_unrestored_snapshot() {
+    local mode snapshot_path output
+    for mode in shaping fq; do
+        snapshot_path="$TEST_ROOT/${mode}-rollback-failure.snapshot"
+        rm -f -- "$snapshot_path"
+        output=$(
+            (
+                mktemp() { printf '%s\n' "$snapshot_path"; }
+                tc_dependencies() { :; }
+                qdisc_guard() { :; }
+                qdisc_module_hint() { :; }
+                action_qdisc_snapshot() {
+                    printf 'KIND\tfq_codel\nRATE\t\nARGS\tlimit 10240 target 5ms\nqdisc fq_codel 123: root limit 10240p target 5ms\n' > "$2"
+                }
+                restore_action_qdisc() { return 1; }
+                if [[ "$mode" == shaping ]]; then
+                    _apply_shaping_raw() { return 1; }
+                    apply_shaping eth0 100
+                else
+                    tc() { return 1; }
+                    apply_fq eth0
+                fi
+            ) 2>&1
+        ) && fail "$mode apply unexpectedly succeeded after rollback failure"
+        [[ -f "$snapshot_path" ]] || fail "$mode apply deleted the only qdisc snapshot after rollback failure"
+        grep -Fq "快照保留在 $snapshot_path" <<< "$output" ||
+            fail "$mode rollback failure did not report the retained snapshot: $output"
+        [[ "$output" != *'已恢复操作前 qdisc'* ]] || fail "$mode rollback failure falsely reported a completed restore"
+        rm -f -- "$snapshot_path"
+    done
 }
 
 test_measurement_math_and_history() {
@@ -536,6 +998,7 @@ test_baseline_captures_persistence_lifecycle() {
             case "$1 $2 $3 $4" in
                 'qdisc show dev eth0') printf 'qdisc fq 0: root\n' ;;
                 'class show dev eth0') return 0 ;;
+                'filter show dev eth0') return 0 ;;
                 *) return 1 ;;
             esac
         }
@@ -714,7 +1177,9 @@ test_systemd_lifecycle_strict_queries_and_runtime_states() {
             ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""
             query_mode=manager-enabled
             ensure_state_layout() { mkdir -p -- "$STATE_DIR" "$HISTORY_DIR"; }
-            action_qdisc_snapshot() { printf 'none\n' > "$2"; }
+            action_qdisc_snapshot() {
+                printf 'KIND\tnoqueue\nRATE\t\nARGS\t\nqdisc noqueue 0: root\n' > "$2"
+            }
             capture_runtime_sysctls() { :; }
             ip() { :; }
             action_transaction_snapshot_path() { :; }
@@ -798,9 +1263,9 @@ test_self_update_rolls_back_split_install() {
         local update_root="$TEST_ROOT/self-update" installed_path candidate valid_candidate output_path="" url="" update_output="" fail_persist=1
         mkdir -p "$update_root"
         installed_path="$update_root/bbr"; candidate="$update_root/new.sh"; valid_candidate="$update_root/new.valid.sh"; PERSIST_SCRIPT="$update_root/persist.sh"
-        sed 's/^SCRIPT_VERSION="8.0.1"$/SCRIPT_VERSION="8.0.0"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
+        sed 's/^SCRIPT_VERSION="8.0.2"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
         cp "$installed_path" "$PERSIST_SCRIPT"; chmod 0755 "$installed_path" "$PERSIST_SCRIPT"
-        sed 's/^SCRIPT_VERSION="8.0.1"$/SCRIPT_VERSION="8.0.2"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
+        sed 's/^SCRIPT_VERSION="8.0.2"$/SCRIPT_VERSION="8.0.3"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
         cp "$candidate" "$valid_candidate"
         require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
         current_script_path() { printf '%s\n' "$installed_path"; }
@@ -815,7 +1280,7 @@ test_self_update_rolls_back_split_install() {
                 esac
             done
             case "$url" in
-                */releases/latest) printf '{"tag_name":"v8.0.2"}\n' ;;
+                */releases/latest) printf '{"tag_name":"v8.0.3"}\n' ;;
                 */net-tcp-tune.sh) cp "$candidate" "$output_path" ;;
                 */SHA256SUMS)
                     printf '%s  net-tcp-tune.sh\n' "$(sha256sum "$candidate" | awk '{print $1}')" > "$output_path"
@@ -828,19 +1293,19 @@ test_self_update_rolls_back_split_install() {
             [[ "$target" != "$PERSIST_SCRIPT" || "$fail_persist" == 0 ]] || return 9
             cp "$source" "$target"; chmod 0755 "$target"
         }
-        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.2"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
+        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.3"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
         if self_update >/dev/null 2>&1; then fail "checksum-matching false-marker update was accepted"; fi
-        grep -Fq 'SCRIPT_VERSION="8.0.0"' "$installed_path" || fail "rejected false-marker update changed current command"
+        grep -Fq 'SCRIPT_VERSION="8.0.1"' "$installed_path" || fail "rejected false-marker update changed current command"
         cp "$valid_candidate" "$candidate"
         if update_output=$(self_update 2>&1); then fail "split self-update failure reported success"; fi
-        grep -Fq 'SCRIPT_VERSION="8.0.0"' "$installed_path" || fail "current command was not rolled back"
-        grep -Fq 'SCRIPT_VERSION="8.0.0"' "$PERSIST_SCRIPT" || fail "persistent copy changed after failed update"
-        grep -Fq 'SCRIPT_VERSION="8.0.0"' "$installed_path.previous" || fail "previous-version backup missing: $update_output"
+        grep -Fq 'SCRIPT_VERSION="8.0.1"' "$installed_path" || fail "current command was not rolled back"
+        grep -Fq 'SCRIPT_VERSION="8.0.1"' "$PERSIST_SCRIPT" || fail "persistent copy changed after failed update"
+        grep -Fq 'SCRIPT_VERSION="8.0.1"' "$installed_path.previous" || fail "previous-version backup missing: $update_output"
 
         fail_persist=0
         self_update >/dev/null
-        grep -Fq 'SCRIPT_VERSION="8.0.2"' "$installed_path" || fail "successful update did not replace current command"
-        grep -Fq 'SCRIPT_VERSION="8.0.2"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
+        grep -Fq 'SCRIPT_VERSION="8.0.3"' "$installed_path" || fail "successful update did not replace current command"
+        grep -Fq 'SCRIPT_VERSION="8.0.3"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
     )
 }
 
@@ -904,6 +1369,7 @@ test_uninstall_restores_before_removal() (
     : > "$BASELINE_DIR/manifest"; : > "$DNS_BACKUP_DIR/baseline/manifest"; : > "$IPV6_BACKUP_DIR/baseline/sysctl.tsv"
     require_root() { :; }; require_host_network_control() { :; }; require_systemd_runtime() { :; }
     require_commands() { :; }; acquire_lock() { :; }
+    nic_policy_layout_state() { printf 'absent\n'; }
     tcp_baseline_validate() { TCP_BASELINE_VALIDATED_PROVENANCE=native; TCP_BASELINE_VALIDATED_INTERFACE=eth0; }
     managed_htb_interfaces_strict() { :; }
     restore_baseline() { events+=" tcp"; }
@@ -912,6 +1378,164 @@ test_uninstall_restores_before_removal() (
     remove_cli_command() { events+=" cli"; }
     uninstall_managed 0
     assert_eq ' tcp dns ipv6 cli' "$events" "uninstall restore/delete order"
+)
+
+test_uninstall_purge_removes_only_empty_policy_parent() (
+    local root="$TEST_ROOT/uninstall-policy-parent" policy_parent state_dir custom_parent symlink_parent symlink_target
+    policy_parent="$root/etc/bbrv3-lite"
+    state_dir=$(mktemp -d /tmp/bbrv3-lite-test-uninstall-parent.XXXXXX)
+    STATE_DIR="$state_dir"; HISTORY_DIR="$STATE_DIR/history"; BASELINE_DIR="$STATE_DIR/baseline"
+    DNS_BACKUP_DIR="$root/dns"; IPV6_BACKUP_DIR="$root/ipv6"
+    NIC_POLICY_DIR="$policy_parent/interfaces.d"
+    STANDARD_NIC_POLICY_DIR="$NIC_POLICY_DIR"
+    HOME="$root/home"
+    mkdir -p "$BASELINE_DIR" "$NIC_POLICY_DIR" "$HOME"
+    : > "$BASELINE_DIR/manifest"
+
+    require_root() { :; }; require_host_network_control() { :; }; require_systemd_runtime() { :; }
+    require_commands() { :; }; legacy_shell_commands_preflight() { :; }; acquire_lock() { :; }
+    nic_policy_layout_state() { printf 'managed\n'; }
+    nic_policy_set_validate() { :; }
+    tcp_baseline_validate() { TCP_BASELINE_VALIDATED_PROVENANCE=native; TCP_BASELINE_VALIDATED_INTERFACE=eth0; }
+    restore_baseline() { rmdir -- "$NIC_POLICY_DIR"; }
+    managed_htb_interfaces_strict() { :; }
+    remove_cli_command() { :; }
+
+    uninstall_managed 1 || fail "purge uninstall rejected an empty conventional policy parent"
+    [[ ! -e "$policy_parent" && ! -L "$policy_parent" ]] ||
+        fail "purge uninstall left the empty policy parent behind"
+    [[ ! -e "$state_dir" && ! -L "$state_dir" ]] || fail "purge uninstall retained its state directory"
+
+    # A parent containing foreign data is not project-owned as a whole.  The
+    # helper must preserve both the directory and the unrelated entry.
+    mkdir -p "$policy_parent"
+    printf 'foreign\n' > "$policy_parent/keep.conf"
+    remove_empty_nic_policy_parent 1 || fail "foreign policy-parent content caused uninstall cleanup failure"
+    [[ -f "$policy_parent/keep.conf" ]] || fail "foreign policy-parent content was removed"
+
+    # Hidden entries and dangling links must also make the parent non-empty.
+    rm -f -- "$policy_parent/keep.conf"
+    ln -s "$policy_parent/missing-target" "$policy_parent/.foreign-link"
+    remove_empty_nic_policy_parent 1 || fail "dangling hidden policy-parent content caused cleanup failure"
+    [[ -L "$policy_parent/.foreign-link" ]] || fail "dangling hidden policy-parent link was removed"
+    rm -f -- "$policy_parent/.foreign-link"
+
+    # A valid policy at a custom location does not prove ownership of its
+    # parent directory, even when the final path components look conventional.
+    custom_parent="$root/custom/bbrv3-lite"
+    NIC_POLICY_DIR="$custom_parent/interfaces.d"
+    mkdir -p "$NIC_POLICY_DIR"
+    rmdir -- "$NIC_POLICY_DIR"
+    remove_empty_nic_policy_parent 1 || fail "custom policy-parent cleanup returned failure"
+    [[ -d "$custom_parent" ]] || fail "custom empty policy parent was deleted"
+
+    # Never follow or remove the standard parent when it is a symbolic link.
+    symlink_parent="$root/symlink/bbrv3-lite"
+    symlink_target="$root/symlink-target"
+    NIC_POLICY_DIR="$symlink_parent/interfaces.d"
+    STANDARD_NIC_POLICY_DIR="$NIC_POLICY_DIR"
+    mkdir -p "$(dirname "$symlink_parent")" "$symlink_target"
+    ln -s "$symlink_target" "$symlink_parent"
+    remove_empty_nic_policy_parent 1 || fail "symlink policy-parent cleanup returned failure"
+    [[ -L "$symlink_parent" && -d "$symlink_target" ]] || fail "policy-parent symlink or target was removed"
+)
+
+test_uninstall_cleanup_failures_do_not_claim_success() (
+    local root="$TEST_ROOT/uninstall-cleanup-failures" output output_file="$TEST_ROOT/uninstall-cleanup-failures.output" events="" state_dir
+    state_dir=$(mktemp -d /tmp/bbrv3-lite-test-uninstall-failure.XXXXXX)
+    STATE_DIR="$state_dir"; HISTORY_DIR="$STATE_DIR/history"; BASELINE_DIR="$STATE_DIR/baseline"
+    DNS_BACKUP_DIR="$root/dns"; IPV6_BACKUP_DIR="$root/ipv6"; NIC_POLICY_DIR="$root/custom/interfaces.d"
+    HOME="$root/home"
+    mkdir -p "$BASELINE_DIR" "$HOME"
+    : > "$BASELINE_DIR/manifest"
+
+    require_root() { :; }; require_host_network_control() { :; }; require_systemd_runtime() { :; }
+    require_commands() { :; }; legacy_shell_commands_preflight() { :; }; acquire_lock() { :; }
+    nic_policy_layout_state() { printf 'absent\n'; }
+    tcp_baseline_validate() { TCP_BASELINE_VALIDATED_PROVENANCE=native; TCP_BASELINE_VALIDATED_INTERFACE=eth0; }
+    restore_baseline() { events+=" restore"; }
+    managed_htb_interfaces_strict() { :; }
+    remove_cli_command() { events+=" cli"; }
+    remove_empty_nic_policy_parent() { events+=" parent"; return 1; }
+
+    if uninstall_managed 1 > "$output_file" 2>&1; then fail "parent cleanup failure reported uninstall success"; fi
+    output=$(<"$output_file")
+    assert_eq ' restore parent' "$events" "parent cleanup failure stopped before CLI/state deletion"
+    [[ -d "$STATE_DIR" ]] || fail "parent cleanup failure removed recovery state"
+    [[ "$output" != *'已完整卸载并永久删除状态目录'* ]] || fail "parent cleanup failure printed purge success"
+
+    events=""
+    remove_empty_nic_policy_parent() { :; }
+    rm() {
+        if [[ "$1" == -rf && "$2" == -- && "$3" == "$STATE_DIR" ]]; then return 1; fi
+        command rm "$@"
+    }
+    if uninstall_managed 1 > "$output_file" 2>&1; then fail "state removal failure reported uninstall success"; fi
+    output=$(<"$output_file")
+    assert_eq ' restore cli' "$events" "state removal failure order"
+    [[ -d "$STATE_DIR" ]] || fail "failed state removal lost recovery state"
+    [[ "$output" != *'已完整卸载并永久删除状态目录'* ]] || fail "failed state removal printed purge success"
+    unset -f rm
+    command rm -rf -- "$STATE_DIR"
+)
+
+test_uninstall_without_baseline_propagates_cleanup_failures() (
+    local root="$TEST_ROOT/uninstall-no-baseline-failures" mode output output_file events
+    local state_dir
+
+    for mode in disable reload config; do
+        state_dir=$(mktemp -d "/tmp/bbrv3-lite-test-uninstall-no-baseline-${mode}.XXXXXX")
+        STATE_DIR="$state_dir"; HISTORY_DIR="$STATE_DIR/history"; BASELINE_DIR="$STATE_DIR/baseline"
+        CONFIG_FILE="$root/$mode/etc/bbrv3-lite.conf"; SYSCTL_FILE="$root/$mode/etc/99-bbrv3-lite.conf"
+        SERVICE_FILE="$root/$mode/systemd/bbrv3-lite.service"
+        PERSIST_DIR="$root/$mode/persist"; PERSIST_SCRIPT="$PERSIST_DIR/net-tcp-tune.sh"
+        BBRV3_CLI_PATH="$root/$mode/bin/bbr"; HOME="$root/$mode/home"
+        DNS_BACKUP_DIR="$root/$mode/dns"; IPV6_BACKUP_DIR="$root/$mode/ipv6"
+        NIC_POLICY_DIR="$root/$mode/custom/interfaces.d"
+        output_file="$root/$mode/output"
+        mkdir -p "$(dirname "$CONFIG_FILE")" "$(dirname "$SERVICE_FILE")" "$PERSIST_DIR" \
+            "$(dirname "$BBRV3_CLI_PATH")" "$HOME"
+        printf 'config\n' > "$CONFIG_FILE"; printf 'sysctl\n' > "$SYSCTL_FILE"
+        printf 'service\n' > "$SERVICE_FILE"; printf 'persist\n' > "$PERSIST_SCRIPT"
+        printf '#!/usr/bin/env bash\nSCRIPT_NAME="bbrv3-lite"\n' > "$BBRV3_CLI_PATH"
+        chmod 0755 "$BBRV3_CLI_PATH"
+        events=""
+
+        require_root() { :; }; require_host_network_control() { :; }; require_systemd_runtime() { :; }
+        require_commands() { :; }; legacy_shell_commands_preflight() { :; }; acquire_lock() { :; }
+        nic_policy_layout_state() { printf 'absent\n'; }
+        managed_htb_interfaces_strict() { :; }
+        remove_cli_command() { events+=" cli"; }
+        systemctl() {
+            case "$1" in
+                disable) events+=" disable"; [[ "$mode" != disable ]] ;;
+                daemon-reload) events+=" reload"; [[ "$mode" != reload ]] ;;
+                is-active|is-enabled) return 0 ;;
+                *) return 0 ;;
+            esac
+        }
+        rm() {
+            if [[ "$mode" == config && "$1" == -f && "$2" == -- && "$3" == "$CONFIG_FILE" ]]; then
+                events+=" config-rm-failed"
+                return 1
+            fi
+            command rm "$@"
+        }
+
+        if uninstall_managed 1 > "$output_file" 2>&1; then
+            fail "$mode cleanup failure reported baseline-free uninstall success"
+        fi
+        output=$(<"$output_file")
+        [[ -e "$BBRV3_CLI_PATH" ]] || fail "$mode cleanup failure removed the CLI"
+        [[ -d "$STATE_DIR" ]] || fail "$mode cleanup failure removed recovery state"
+        [[ -e "$CONFIG_FILE" && -e "$SYSCTL_FILE" ]] || fail "$mode cleanup failure removed management config"
+        [[ "$events" != *' cli'* ]] || fail "$mode cleanup failure reached CLI removal: $events"
+        [[ "$output" != *'已移除管理文件'* && "$output" != *'已完整卸载'* ]] ||
+            fail "$mode cleanup failure printed uninstall success: $output"
+
+        unset -f rm systemctl
+        command rm -rf -- "$STATE_DIR"
+    done
 )
 
 test_tcp_sysctl_snapshot_whitespace_portability() (
@@ -983,6 +1607,7 @@ test_tcp_baseline_validation_is_write_free() (
 
     require_root() { :; }; require_host_network_control() { :; }; require_systemd_runtime() { :; }
     require_commands() { :; }; acquire_lock() { :; }
+    nic_policy_layout_state() { printf 'absent\n'; }
     systemctl() { events+=" systemctl:$*"; return 1; }
     sysctl() { events+=" sysctl:$*"; return 1; }
     tc() { events+=" tc:$*"; return 1; }
@@ -1062,10 +1687,11 @@ test_tcp_baseline_capture_is_atomic_and_replayable() (
     sysctl() { [[ "$1" == -n ]] || return 1; tcp_baseline_test_sysctl_value "$2"; }
     tc() {
         case "$1 $2 $3 $4:$qdisc_mode" in
-            'qdisc show dev eth0:htb') printf 'qdisc htb 1: root\nqdisc fq 10: parent 1:10\n' ;;
+            'qdisc show dev eth0:htb') printf 'qdisc htb 1: root default 0x10\nqdisc fq 10: parent 1:10\n' ;;
             'class show dev eth0:htb') printf 'class htb 1:10 root rate 100Mbit ceil 100Mbit\n' ;;
             'qdisc show dev eth0:fq') printf 'qdisc fq 8001: root refcnt 2 limit 10000p\n' ;;
             'class show dev eth0:fq') return 0 ;;
+            'filter show dev eth0:htb'|'filter show dev eth0:fq') return 0 ;;
             *) return 1 ;;
         esac
     }
@@ -1097,8 +1723,72 @@ test_tcp_baseline_capture_is_atomic_and_replayable() (
     for key in FORMAT RESTORE_SCOPE ROUTE_DUMPS; do grep -q "^${key}"$'\t' "$BASELINE_DIR/manifest" || fail "new baseline missing $key"; done
 )
 
+test_native_mq_baseline_requires_complete_qdisc_class_mapping() (
+    local root="$TEST_ROOT/tcp-baseline-mq" baseline="$TEST_ROOT/tcp-baseline-mq/baseline"
+    mkdir -p "$root"
+    write_valid_v1_tcp_baseline "$baseline" eth0
+    printf '%s\n' \
+        'qdisc mq 8003: root' \
+        'qdisc fq_codel 123: parent 8003:1 limit 2048p target 7ms' \
+        'qdisc pfifo_fast 0: parent 8003:2 bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1' > "$baseline/qdisc.txt"
+    printf '%s\n' \
+        'class mq 8003:1 root leaf 123:' \
+        'class mq 8003:2 root' > "$baseline/class.txt"
+    tcp_baseline_validate "$baseline" || fail "complete native MQ qdisc/class baseline was rejected"
+
+    sed -i 's/leaf 123:/leaf 124:/' "$baseline/class.txt"
+    if tcp_baseline_validate "$baseline" >/dev/null 2>&1; then
+        fail "MQ baseline accepted a class leaf that does not match its child qdisc handle"
+    fi
+    sed -i 's/leaf 124:/leaf 123:/' "$baseline/class.txt"
+    sed -i '/8003:2/d' "$baseline/class.txt"
+    if tcp_baseline_validate "$baseline" >/dev/null 2>&1; then
+        fail "MQ baseline accepted a missing queue class"
+    fi
+)
+
+test_native_handle_zero_baseline_allows_recoverable_default_mismatch() (
+    local baseline="$TEST_ROOT/tcp-baseline-handle-zero"
+    write_valid_v1_tcp_baseline "$baseline" eth0
+    printf '%s\n' 'qdisc fq_codel 0: root limit 10240p target 5ms' > "$baseline/qdisc.txt"
+    tcp_baseline_validate "$baseline" || fail "recoverable fq_codel 0:/default fq baseline was rejected"
+    printf '%s\n' 'qdisc fq 0: root limit 10000p flow_limit 100p' > "$baseline/qdisc.txt"
+    tcp_baseline_validate "$baseline" || fail "matching fq/default_qdisc handle-0 baseline was rejected"
+)
+
+test_tcp_restore_preflight_rejects_mq_queue_drift_before_later_checks() (
+    local root="$TEST_ROOT/tcp-restore-mq-preflight" later_checks=0
+    BASELINE_DIR="$root/baseline"
+    BBRV3_SYS_CLASS_NET_ROOT="$root/sys/class/net"
+    mkdir -p "$BASELINE_DIR" \
+        "$BBRV3_SYS_CLASS_NET_ROOT/eth0/queues/tx-0" \
+        "$BBRV3_SYS_CLASS_NET_ROOT/eth0/queues/tx-1" \
+        "$BBRV3_SYS_CLASS_NET_ROOT/eth0/queues/tx-2"
+    printf '%s\n' \
+        'qdisc mq 8003: root' \
+        'qdisc fq 8004: parent 8003:1 limit 10000p' \
+        'qdisc fq 8005: parent 8003:2 limit 10000p' > "$BASELINE_DIR/qdisc.txt"
+    tc() {
+        case "$*" in
+            'qdisc show dev eth0') printf 'qdisc fq 123: root\n' ;;
+            'class show dev eth0'|'filter show dev eth0 parent 123:') : ;;
+            *) fail "unexpected TCP MQ preflight tc invocation: $*" ;;
+        esac
+    }
+    sysctl() { ((later_checks+=1)); return 0; }
+    ip() { ((later_checks+=1)); return 0; }
+    query_unit_enabled_state() { ((later_checks+=1)); return 0; }
+    query_unit_active_state() { ((later_checks+=1)); return 0; }
+
+    if tcp_restore_runtime_preflight eth0 >/dev/null 2>&1; then
+        fail "TCP restore preflight accepted an MQ snapshot after TX queue-count drift"
+    fi
+    assert_eq 0 "$later_checks" "MQ drift reached later restore preflight checks"
+)
+
 test_valid_v1_tcp_baseline_restores() (
     local root="$TEST_ROOT/tcp-baseline-restore" events="" verb unit
+    local mock_qdisc='qdisc fq 8002: root'
     STATE_DIR="$root/state"; HISTORY_DIR="$STATE_DIR/history"; BASELINE_DIR="$STATE_DIR/baseline"
     CONFIG_FILE="$root/etc/bbrv3-lite.conf"; SYSCTL_FILE="$root/etc/99-bbrv3-lite.conf"
     LEGACY_SYSCTL_FILE="$root/etc/legacy.conf"; SERVICE_FILE="$root/systemd/bbrv3-lite.service"
@@ -1120,9 +1810,13 @@ test_valid_v1_tcp_baseline_restores() (
     }
     tc() {
         case "$1 $2 $3 $4" in
-            'qdisc show dev eth0') printf 'qdisc fq 8002: root\n' ;;
+            'qdisc show dev eth0') printf '%s\n' "$mock_qdisc" ;;
             'class show dev eth0') return 0 ;;
-            'qdisc replace dev eth0') events+=" tc:$*" ;;
+            'qdisc replace dev eth0')
+                [[ "$*" == 'qdisc replace dev eth0 root handle 8001: fq limit 10000 flow_limit 100' ]] || return 1
+                events+=" tc:$*"
+                mock_qdisc='qdisc fq 8001: root limit 10000p flow_limit 100p'
+                ;;
             *) return 0 ;;
         esac
     }
@@ -1154,7 +1848,7 @@ test_valid_v1_tcp_baseline_restores() (
     restore_baseline
     assert_eq baseline-config "$(<"$CONFIG_FILE")" "valid old baseline config restore"
     [[ ! -e "$SERVICE_FILE" && ! -e "$PERSIST_SCRIPT" ]] || fail "valid old baseline did not restore absent persistence"
-    [[ "$events" == *' sysctl:net.core.default_qdisc=fq'* && "$events" == *' tc:qdisc replace dev eth0 root fq'* ]] ||
+    [[ "$events" == *' sysctl:net.core.default_qdisc=fq'* && "$events" == *' tc:qdisc replace dev eth0 root handle 8001: fq limit 10000 flow_limit 100'* ]] ||
         fail "valid old baseline did not restore sysctl/qdisc: $events"
 )
 
@@ -1173,13 +1867,15 @@ test_uninstall_scans_all_interfaces_before_removal() (
     printf '#!/usr/bin/env bash\nSCRIPT_NAME="bbrv3-lite"\n' > "$BBRV3_CLI_PATH"; chmod 0755 "$BBRV3_CLI_PATH"
     require_root() { :; }; require_host_network_control() { :; }; require_systemd_runtime() { :; }
     require_commands() { :; }; acquire_lock() { :; }
+    nic_policy_layout_state() { printf 'absent\n'; }
     detect_interface() { fail "uninstall guessed the current default interface"; }
     tc() {
         case "$*" in
-            'qdisc show dev eth-old') printf 'qdisc htb 1: root\nqdisc fq 10: parent 1:10\n' ;;
+            'qdisc show dev eth-old') printf 'qdisc htb 1: root default 0x10\nqdisc fq 10: parent 1:10\n' ;;
             'class show dev eth-old') printf 'class htb 1:10 root rate 100Mbit ceil 100Mbit\n' ;;
             'qdisc show dev eth-new') printf 'qdisc fq 0: root\n' ;;
             'class show dev eth-new') return 0 ;;
+            filter\ show\ dev\ eth-old\ parent*|filter\ show\ dev\ eth-new\ parent*) return 0 ;;
             *) ((writes+=1)); return 1 ;;
         esac
     }
@@ -1218,10 +1914,11 @@ EOF
     detect_interface() { printf 'eth-new\n'; }
     tc() {
         case "$*" in
-            'qdisc show dev eth-old') printf 'qdisc htb 1: root\nqdisc fq 10: parent 1:10\n' ;;
+            'qdisc show dev eth-old') printf 'qdisc htb 1: root default 0x10\nqdisc fq 10: parent 1:10\n' ;;
             'class show dev eth-old') printf 'class htb 1:10 root rate 95Mbit ceil 95Mbit\n' ;;
             'qdisc show dev eth-new') printf 'qdisc fq 0: root\n' ;;
             'class show dev eth-new') return 0 ;;
+            filter\ show\ dev\ eth-old\ parent*|filter\ show\ dev\ eth-new\ parent*) return 0 ;;
             *) ((writes+=1)); return 1 ;;
         esac
     }
@@ -1247,6 +1944,108 @@ EOF
     if action_transaction_begin eth-new >/dev/null 2>&1; then fail "new transaction stacked over stale transaction"; fi
     assert_eq 0 "$writes" "stale transaction rejection side effects"
     [[ -d "$STATE_DIR/.transaction.power-loss" ]] || fail "stale transaction evidence was removed"
+)
+
+test_configured_state_runtime_apply_is_atomic() (
+    local root="$TEST_ROOT/configured-runtime-atomic" scenario state runtime_mode events="" config_loads=0
+    mkdir -p -- "$root"
+    CONFIG_FILE="$root/bbrv3-lite.conf"
+    require_root() { :; }
+    require_host_network_control() { :; }
+    require_systemd_runtime() { :; }
+    require_commands() { :; }
+    acquire_lock() { :; }
+    load_config() {
+        ((config_loads+=1))
+        reset_config
+        BBR_ENABLED=1
+        MULTI_NIC_ENABLED=0
+        TC_ENABLED=0
+        TC_INTERFACE=eth0
+        INITCWND=12
+        INITRWND=24
+    }
+    detect_interface() { printf 'eth0\n'; }
+    configured_state_target_preflight() { :; }
+    network_tuning_preflight() { :; }
+    nic_runtime_transaction_begin() {
+        NIC_RUNTIME_TRANSACTION_DIR="$root/snapshot"
+        NIC_RUNTIME_TRANSACTION_PARENT="$root"
+        mkdir -p -- "$NIC_RUNTIME_TRANSACTION_DIR"
+        events+=" begin"
+    }
+    capture_runtime_sysctls() { tcp_baseline_test_snapshot; }
+    ip() {
+        case "$*" in
+            '-4 route show default') printf 'default via 192.0.2.1 dev eth0\n' ;;
+            '-6 route show default') : ;;
+            *) return 1 ;;
+        esac
+    }
+    action_qdisc_snapshot() { printf 'snapshot\n' > "$2"; events+=" qdisc-snapshot"; }
+    nic_runtime_transaction_write_interfaces() { [[ "$1" == eth0 ]]; events+=" manifest"; }
+    nic_runtime_transaction_mark_mutated() { events+=" ready"; }
+    nic_runtime_transaction_discard() {
+        rm -rf -- "$NIC_RUNTIME_TRANSACTION_DIR"
+        NIC_RUNTIME_TRANSACTION_DIR=""
+        NIC_RUNTIME_TRANSACTION_PARENT=""
+        events+=" discard"
+    }
+    nic_runtime_transaction_rollback() {
+        state=baseline
+        NIC_RUNTIME_TRANSACTION_DIR=""
+        NIC_RUNTIME_TRANSACTION_PARENT=""
+        events+=" rollback"
+    }
+    nic_runtime_transaction_commit() {
+        NIC_RUNTIME_TRANSACTION_DIR=""
+        NIC_RUNTIME_TRANSACTION_PARENT=""
+        events+=" commit"
+    }
+    apply_sysctl_profile() {
+        runtime_mode="$1"
+        state=sysctl
+        events+=" sysctl"
+    }
+    apply_fq() {
+        state=qdisc
+        events+=" fq"
+        [[ "$scenario" != qdisc-fail ]]
+    }
+    apply_initial_windows() {
+        state=routes
+        events+=" routes"
+        [[ "$scenario" != route-fail ]]
+    }
+
+    rm -f -- "$CONFIG_FILE"
+    if apply_configured_state >/dev/null 2>&1; then
+        fail "configured-state apply accepted a missing persistent config"
+    fi
+    assert_eq 0 "$config_loads" "missing config stopped before config load"
+    assert_eq '' "$events" "missing config runtime mutations"
+    printf '# managed test config\n' > "$CONFIG_FILE"
+    chmod 0600 "$CONFIG_FILE"
+
+    scenario=qdisc-fail; state=baseline; events=""; runtime_mode=""; NIC_RUNTIME_TRANSACTION_DIR=""
+    if apply_configured_state >/dev/null 2>&1; then
+        fail "configured-state apply reported success after qdisc failure"
+    fi
+    assert_eq baseline "$state" "qdisc-failure full runtime rollback"
+    assert_eq runtime "$runtime_mode" "configured-state sysctl apply mode"
+    [[ "$events" == *' sysctl fq rollback'* ]] || fail "qdisc failure did not enter full rollback: $events"
+
+    scenario=route-fail; state=baseline; events=""; runtime_mode=""; NIC_RUNTIME_TRANSACTION_DIR=""
+    if apply_configured_state >/dev/null 2>&1; then
+        fail "configured-state apply reported success after route-window failure"
+    fi
+    assert_eq baseline "$state" "route-failure full runtime rollback"
+    [[ "$events" == *' sysctl fq routes rollback'* ]] || fail "route failure did not enter full rollback: $events"
+
+    scenario=success; state=baseline; events=""; runtime_mode=""; NIC_RUNTIME_TRANSACTION_DIR=""
+    apply_configured_state || fail "configured-state runtime transaction rejected complete success"
+    assert_eq routes "$state" "successful configured-state runtime"
+    [[ "$events" == *' sysctl fq routes commit'* ]] || fail "successful runtime transaction was not committed: $events"
 )
 
 test_tcp_mutations_require_safe_environment() (
@@ -1631,7 +2430,9 @@ test_action_transaction_capture_failure_clears_state() (
     local root="$TEST_ROOT/transaction-capture-failure"
     STATE_DIR="$root/state"; HISTORY_DIR="$STATE_DIR/history"
     ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
-    action_qdisc_snapshot() { printf 'KIND\tfq\nRATE\t\nARGS\t\n' > "$2"; }
+    action_qdisc_snapshot() {
+        printf 'KIND\tfq\nRATE\t\nARGS\t\nqdisc fq 8001: root\n' > "$2"
+    }
     capture_runtime_sysctls() { return 1; }
 
     if action_transaction_begin eth0 >/dev/null 2>&1; then fail "failed sysctl capture created a transaction"; fi
@@ -1639,6 +2440,187 @@ test_action_transaction_capture_failure_clears_state() (
     assert_eq '' "$ACTION_TRANSACTION_IFACE" "failed capture transaction interface state"
     assert_eq '' "$ACTION_TRANSACTION_INTERFACES" "failed capture transaction interface-set state"
     [[ -z "$(find "$STATE_DIR" -maxdepth 1 -name '.transaction.*' -print -quit 2>/dev/null)" ]] || fail "failed capture left a transaction directory"
+)
+
+test_action_transaction_route_snapshot_failure_is_write_free() (
+    local fail_family root events
+    for fail_family in 4 6; do
+        root="$TEST_ROOT/transaction-route-failure-$fail_family"
+        STATE_DIR="$root/state"; HISTORY_DIR="$STATE_DIR/history"
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+        events=""
+        action_qdisc_snapshot() {
+            printf 'KIND\tfq\nRATE\t\nARGS\t\nqdisc fq 8001: root\n' > "$2"
+        }
+        capture_runtime_sysctls() { tcp_baseline_test_snapshot; }
+        ip() {
+            case "$*" in
+                '-4 route show default')
+                    [[ "$fail_family" != 4 ]] || return 1
+                    printf 'default via 192.0.2.1 dev eth0\n'
+                    ;;
+                '-6 route show default')
+                    [[ "$fail_family" != 6 ]] || return 1
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        action_transaction_snapshot_path() { events+=" post-route-snapshot"; }
+        action_transaction_snapshot_tree() { events+=" post-route-tree"; }
+        action_transaction_capture_unit() { events+=" post-route-unit"; }
+
+        if action_transaction_begin eth0 >/dev/null 2>&1; then
+            fail "transaction began after IPv$fail_family default-route query failure"
+        fi
+        assert_eq '' "$ACTION_TRANSACTION_DIR" "IPv$fail_family route-failure transaction directory state"
+        assert_eq '' "$ACTION_TRANSACTION_IFACE" "IPv$fail_family route-failure transaction interface state"
+        assert_eq '' "$ACTION_TRANSACTION_INTERFACES" "IPv$fail_family route-failure interface-set state"
+        assert_eq '' "$events" "IPv$fail_family route-failure advanced into later snapshot stages"
+        [[ -z "$(find "$STATE_DIR" -maxdepth 1 -name '.transaction.*' -print -quit 2>/dev/null)" ]] ||
+            fail "IPv$fail_family route failure left a transaction directory"
+    done
+)
+
+test_apply_initial_windows_requires_complete_family_success() (
+    local scenario writes=""
+    INITCWND=12
+    INITRWND=24
+    ip() {
+        case "$*" in
+            '-4 route show default')
+                [[ "$scenario" != query-fail4 ]] || return 1
+                printf 'default via 192.0.2.1 dev eth0 proto dhcp\n'
+                ;;
+            '-6 route show default')
+                printf 'default via 2001:db8::1 dev eth0 proto ra metric 1024\n'
+                ;;
+            -4\ route\ change*)
+                writes+=" [$*]"
+                [[ "$scenario" != change-fail4 ]]
+                ;;
+            -6\ route\ change*)
+                writes+=" [$*]"
+                return 0
+                ;;
+            *) return 1 ;;
+        esac
+    }
+
+    scenario=query-fail4
+    if apply_initial_windows >/dev/null 2>&1; then
+        fail "route-window apply ignored an IPv4 query failure"
+    fi
+    assert_eq '' "$writes" "route-window query failure mutations"
+
+    scenario=change-fail4
+    writes=""
+    if apply_initial_windows >/dev/null 2>&1; then
+        fail "route-window apply reported success after one family failed"
+    fi
+    [[ "$writes" == *'[-4 route change '* && "$writes" == *'[-6 route change '* ]] ||
+        fail "route-window partial failure did not attempt every captured family: $writes"
+
+    scenario=success
+    writes=""
+    apply_initial_windows || fail "route-window apply rejected complete dual-family success"
+    [[ "$writes" == *'[-4 route change '* && "$writes" == *'[-6 route change '* ]] ||
+        fail "route-window success did not apply both captured families: $writes"
+)
+
+test_route_window_restore_rejects_route_identity_drift() (
+    local snapshot="$TEST_ROOT/route-window-identity" mock_current_route writes=""
+    mkdir -p -- "$snapshot"
+    printf 'default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 10 initrwnd 20\n' > "$snapshot/default-route-v4.txt"
+    : > "$snapshot/default-route-v6.txt"
+    mock_current_route='default via 198.51.100.1 dev eth1 proto dhcp metric 200'
+    ip() {
+        case "$*" in
+            '-4 route show default') printf '%s\n' "$mock_current_route" ;;
+            '-6 route show default') : ;;
+            -4\ route\ replace*) writes+=" [$*]" ;;
+            *) return 1 ;;
+        esac
+    }
+    if restore_default_route_windows_snapshot "$snapshot" >/dev/null 2>&1; then
+        fail "route-window rollback accepted gateway/device identity drift"
+    fi
+    assert_eq '' "$writes" "route identity drift rollback writes"
+
+    printf 'default via 192.0.2.1 dev eth0 proto dhcp metric 100\n' > "$snapshot/default-route-v4.txt"
+    if default_route_windows_snapshot_preflight "$snapshot" >/dev/null 2>&1; then
+        fail "route snapshot preflight accepted identity drift when neither route had window attributes"
+    fi
+    assert_eq '' "$writes" "window-free route identity drift writes"
+
+    : > "$snapshot/default-route-v4.txt"
+    if default_route_windows_snapshot_preflight "$snapshot" >/dev/null 2>&1; then
+        fail "route snapshot preflight accepted an empty-to-present default-route change"
+    fi
+    assert_eq '' "$writes" "empty-to-present route drift writes"
+
+    printf 'default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 10 initrwnd 20\n' > "$snapshot/default-route-v4.txt"
+    mock_current_route='default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 30 initrwnd 40'
+    restore_default_route_windows_snapshot "$snapshot" || fail "matching route identity could not restore window attributes"
+    assert_eq ' [-4 route replace default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 10 initrwnd 20]' "$writes" "matching route-window restoration"
+)
+
+test_route_window_dynamic_attrs_do_not_trigger_drift() (
+    local snapshot="$TEST_ROOT/route-window-dynamic" mock_current_route writes="" baseline_identity current_identity
+    mkdir -p -- "$snapshot"
+    : > "$snapshot/default-route-v4.txt"
+    printf 'default via 2001:db8::1 dev eth0 proto ra metric 1024 expires 1800sec pref medium initcwnd 10 initrwnd 20\n' > "$snapshot/default-route-v6.txt"
+    mock_current_route='default via 2001:db8::1 dev eth0 proto ra metric 1024 expires 1797sec pref medium initcwnd 30 initrwnd 40'
+    ip() {
+        case "$*" in
+            '-4 route show default') : ;;
+            '-6 route show default') printf '%s\n' "$mock_current_route" ;;
+            -6\ route\ replace*) writes+=" [$*]" ;;
+            *) return 1 ;;
+        esac
+    }
+
+    default_route_windows_snapshot_preflight "$snapshot" ||
+        fail "RA expiry countdown was mistaken for default-route identity drift"
+    restore_default_route_windows_snapshot "$snapshot" ||
+        fail "RA route with a live expiry could not restore window attributes"
+    assert_eq ' [-6 route replace default via 2001:db8::1 dev eth0 proto ra metric 1024 expires 1797 pref medium initcwnd 10 initrwnd 20]' "$writes" \
+        "RA restore normalizes live expiry and preserves baseline windows"
+
+    baseline_identity=$(route_identity_without_initial_windows \
+        'default via 2001:db8::1 dev eth0 proto ra metric 1024 uid 0 expires 1800sec pref medium')
+    current_identity=$(route_identity_without_initial_windows \
+        'default via 2001:db8::1 dev eth0 proto ra metric 1024 uid 1000 expires 1790sec pref medium')
+    assert_eq "$baseline_identity" "$current_identity" "dynamic route uid/expiry identity"
+    assert_eq 'default via 2001:db8::1 dev eth0 proto ra metric 1024 expires 1790 pref medium' \
+        "$(route_window_mutation_line 'default via 2001:db8::1 dev eth0 proto ra metric 1024 uid 1000 expires 1790sec initcwnd 30 initrwnd 40 pref medium')" \
+        "dynamic route fields normalized for mutation"
+
+    for mock_current_route in \
+        'default via 2001:db8::1 dev eth0 proto ra metric 2048 expires 1790sec pref medium' \
+        'default via 2001:db8::1 dev eth0 proto boot metric 1024 expires 1790sec pref medium' \
+        'default via 2001:db8::1 dev eth0 proto ra metric 1024 expires 1790sec pref high'; do
+        if default_route_windows_snapshot_preflight "$snapshot" >/dev/null 2>&1; then
+            fail "route preflight ignored metric/proto/pref identity drift: $mock_current_route"
+        fi
+    done
+
+    writes=""
+    printf 'default via 2001:db8::1 dev eth0 proto ra metric 1024 expires 1800sec pref medium\n' > "$snapshot/default-route-v6.txt"
+    for mock_current_route in \
+        'default via 2001:db8::1 dev eth0 proto ra metric 1024 expires garbage pref medium' \
+        'default via 2001:db8::1 dev eth0 proto ra metric 1024 expires 4294967296sec pref medium'; do
+        if restore_default_route_windows_snapshot "$snapshot" >/dev/null 2>&1; then
+            fail "route restore accepted an invalid live expiry: $mock_current_route"
+        fi
+    done
+    assert_eq '' "$writes" "invalid live expiry rollback writes"
+
+    printf 'default via 2001:db8::1 dev eth0 proto ra metric 1024 expires 1s pref medium\n' > "$snapshot/default-route-v6.txt"
+    mock_current_route='default via 2001:db8::1 dev eth0 proto ra metric 1024 expires 1790sec pref medium'
+    if restore_default_route_windows_snapshot "$snapshot" >/dev/null 2>&1; then
+        fail "route restore accepted an invalid snapshot expiry"
+    fi
+    assert_eq '' "$writes" "invalid snapshot expiry rollback writes"
 )
 
 test_action_transaction_rolls_back_failed_step() {
@@ -1663,7 +2645,10 @@ test_action_transaction_rolls_back_failed_step() {
     printf '%s\n' "$persist_before" > "$PERSIST_SCRIPT"
     ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_ROLLING_BACK=0; LOCK_HELD=1
     MULTI_NIC_ENABLED=0; TC_INTERFACE=auto
-    action_qdisc_snapshot() { printf 'KIND\tfq\nRATE\t\nARGS\t\n' > "$2"; }
+    action_qdisc_snapshot() {
+        printf 'KIND\tfq\nRATE\t\nARGS\t\nqdisc fq 8001: root\n' > "$2"
+    }
+    qdisc_filter_guard() { :; }
     restore_action_qdisc() { events+=" qdisc:$1"; }
     capture_runtime_sysctls() { tcp_baseline_test_snapshot; }
     sysctl() { [[ "$1" == -q && "$2" == -w ]] && events+=" sysctl:${3}"; }
@@ -1716,6 +2701,72 @@ test_action_transaction_rolls_back_failed_step() {
         fail "transaction runtime/service restore events missing: $events"
     assert_eq '' "$ACTION_TRANSACTION_DIR" "transaction snapshot cleanup"
 }
+
+test_action_transaction_rejects_late_filter_before_rollback_writes() (
+    local root="$TEST_ROOT/action-late-filter" events="$TEST_ROOT/action-late-filter.events"
+    local late_filter=0 retained_dir verb
+    STATE_DIR="$root/state"
+    BASELINE_DIR="$STATE_DIR/baseline"
+    HISTORY_DIR="$STATE_DIR/history"
+    CONFIG_FILE="$root/etc/bbrv3-lite.conf"
+    SYSCTL_FILE="$root/etc/99-bbrv3-lite.conf"
+    LEGACY_SYSCTL_FILE="$root/etc/99-bbr-ultimate.conf"
+    SERVICE_FILE="$root/systemd/bbrv3-lite.service"
+    LEGACY_SERVICE_FILE="$root/systemd/bbr-optimize-persist.service"
+    PERSIST_DIR="$root/persist"
+    PERSIST_SCRIPT="$PERSIST_DIR/net-tcp-tune.sh"
+    NIC_POLICY_DIR="$root/etc/interfaces.d"
+    ACTION_TRANSACTION_DIR=""
+    ACTION_TRANSACTION_IFACE=""
+    ACTION_TRANSACTION_INTERFACES=""
+    ACTION_TRANSACTION_READY=0
+    ACTION_TRANSACTION_MUTATED=0
+    ACTION_TRANSACTION_ROLLING_BACK=0
+    MULTI_NIC_ENABLED=0
+    TC_INTERFACE=auto
+    LOCK_HELD=1
+    : > "$events"
+
+    action_qdisc_snapshot() {
+        printf 'KIND\tfq\nRATE\t\nARGS\t\nqdisc fq 8001: root\n' > "$2"
+    }
+    qdisc_filter_guard() { (( late_filter == 0 )); }
+    capture_runtime_sysctls() { tcp_baseline_test_snapshot; }
+    ip() {
+        case "$*" in
+            '-4 route show default') printf 'default via 192.0.2.1 dev eth0\n' ;;
+            '-6 route show default') : ;;
+            *) printf 'WRITE:ip:%s\n' "$*" >> "$events" ;;
+        esac
+    }
+    systemctl() {
+        verb="$1"; shift
+        case "$verb" in
+            is-enabled) printf 'disabled\n'; return 1 ;;
+            is-active) printf 'inactive\n'; return 3 ;;
+            *) printf 'WRITE:systemctl:%s %s\n' "$verb" "$*" >> "$events" ;;
+        esac
+    }
+    action_transaction_restore_path() { printf 'WRITE:path:%s\n' "$2" >> "$events"; }
+    action_transaction_restore_tree() { printf 'WRITE:tree:%s\n' "$2" >> "$events"; }
+    restore_tcp_sysctl_snapshot_file() { printf 'WRITE:sysctl\n' >> "$events"; }
+    action_transaction_restore_routes() { printf 'WRITE:routes\n' >> "$events"; }
+    restore_action_qdisc() { printf 'WRITE:qdisc:%s\n' "$1" >> "$events"; }
+    action_transaction_restore_unit() { printf 'WRITE:unit:%s\n' "$1" >> "$events"; }
+    release_lock() { printf 'WRITE:release-lock\n' >> "$events"; LOCK_HELD=0; }
+    acquire_lock() { printf 'WRITE:acquire-lock\n' >> "$events"; LOCK_HELD=1; }
+
+    action_transaction_begin_multi eth0 || fail "could not create late-filter action transaction"
+    action_transaction_mark_mutated || fail "valid action transaction was not marked mutable"
+    retained_dir="$ACTION_TRANSACTION_DIR"
+    late_filter=1
+    if action_transaction_rollback >/dev/null 2>&1; then
+        fail "action rollback accepted a root-tree filter added after mutation began"
+    fi
+    [[ ! -s "$events" ]] || fail "late action filter allowed rollback writes: $(<"$events")"
+    [[ "$ACTION_TRANSACTION_DIR" == "$retained_dir" && -d "$retained_dir" && -f "$retained_dir/COMPLETE" ]] ||
+        fail "late action filter did not retain the transaction evidence"
+)
 
 test_auto_tune_commits_only_after_final_verify() {
     local events="" verify_fail=0 verify_path_drift=0 verify_endpoint_drift=0 candidate_rejected=0 summary_dir="$TEST_ROOT/auto-summary"
@@ -1947,9 +2998,15 @@ run_test test_hardware_aware_model
 run_test test_managed_sysctl_runtime_verifier
 run_test test_legacy_baseline_reference
 run_test test_qdisc_replay_filters_kernel_runtime_fields
+run_test test_root_qdisc_handle_restore_paths
+run_test test_cleanup_core_restores_pending_runtime_transactions_on_signal
+run_test test_cleanup_core_discards_incomplete_action_snapshot_without_writes
+run_test test_cleanup_failure_changes_successful_process_status
+run_test test_qdisc_filter_and_managed_topology_guards
 run_test test_mq_child_guard_and_restore
 run_test test_managed_rate_unit_parsing
 run_test test_tc_transaction
+run_test test_failed_tc_apply_retains_unrestored_snapshot
 run_test test_measurement_math_and_history
 run_test test_v71_measurement_metrics_and_confidence
 run_test test_peak_core_cpu_detection
@@ -1963,12 +3020,19 @@ run_test test_legacy_sysctl_retirement_requires_baseline_and_transaction
 run_test test_cli_command_removal_is_scoped
 run_test test_uninstall_purge_preflight_is_write_free
 run_test test_uninstall_restores_before_removal
+run_test test_uninstall_purge_removes_only_empty_policy_parent
+run_test test_uninstall_cleanup_failures_do_not_claim_success
+run_test test_uninstall_without_baseline_propagates_cleanup_failures
 run_test test_tcp_sysctl_snapshot_whitespace_portability
 run_test test_tcp_baseline_validation_is_write_free
 run_test test_tcp_baseline_capture_is_atomic_and_replayable
+run_test test_native_mq_baseline_requires_complete_qdisc_class_mapping
+run_test test_native_handle_zero_baseline_allows_recoverable_default_mismatch
+run_test test_tcp_restore_preflight_rejects_mq_queue_drift_before_later_checks
 run_test test_valid_v1_tcp_baseline_restores
 run_test test_uninstall_scans_all_interfaces_before_removal
 run_test test_apply_preflight_and_stale_transaction_are_write_free
+run_test test_configured_state_runtime_apply_is_atomic
 run_test test_tcp_mutations_require_safe_environment
 run_test test_submenu_stays_until_explicit_return
 run_test test_menu_exits_after_uninstall_signal
@@ -1985,11 +3049,16 @@ run_test test_dependency_install_is_minimal
 run_test test_process_substitution_source_resolution
 run_test test_self_update_rolls_back_split_install
 run_test test_action_transaction_rolls_back_failed_step
+run_test test_action_transaction_rejects_late_filter_before_rollback_writes
 run_test test_container_mutation_guard
 run_test test_install_failure_is_not_success
 run_test test_force_scan_requires_explicit_flag
 run_test test_measurement_acceptance_gate
 run_test test_action_transaction_capture_failure_clears_state
+run_test test_action_transaction_route_snapshot_failure_is_write_free
+run_test test_apply_initial_windows_requires_complete_family_success
+run_test test_route_window_restore_rejects_route_identity_drift
+run_test test_route_window_dynamic_attrs_do_not_trigger_drift
 run_test test_auto_tune_commits_only_after_final_verify
 run_test test_dns_apply_failure_restores_action_snapshot
 run_test test_ipv6_malformed_baseline_is_immutable_and_write_free

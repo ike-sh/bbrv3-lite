@@ -6,6 +6,8 @@ ACTION_TRANSACTION_DIR=""
 ACTION_TRANSACTION_IFACE=""
 ACTION_TRANSACTION_INTERFACES=""
 ACTION_TRANSACTION_ROLLING_BACK=0
+ACTION_TRANSACTION_READY=0
+ACTION_TRANSACTION_MUTATED=0
 
 current_script_path() {
     local source="${BASH_SOURCE[0]}"
@@ -171,12 +173,31 @@ restart_and_verify_persistence() {
 }
 
 remove_persistence() {
+    local rc=0
     if command_exists systemctl; then
-        systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+        if [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ]] ||
+            systemctl is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1 ||
+            systemctl is-enabled --quiet "$SERVICE_NAME" >/dev/null 2>&1; then
+            systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || {
+                log WARN "无法停止并禁用持久化服务: $SERVICE_NAME"
+                rc=1
+            }
+        fi
     fi
-    rm -f -- "$SERVICE_FILE" "$PERSIST_SCRIPT"
+    rm -f -- "$SERVICE_FILE" "$PERSIST_SCRIPT" || {
+        log WARN "无法删除持久化服务或脚本"
+        rc=1
+    }
+    if [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" || -e "$PERSIST_SCRIPT" || -L "$PERSIST_SCRIPT" ]]; then
+        log WARN "持久化服务或脚本删除后仍然存在"
+        rc=1
+    fi
     rmdir "$PERSIST_DIR" 2>/dev/null || true
-    command_exists systemctl && systemctl daemon-reload || true
+    if command_exists systemctl && ! systemctl daemon-reload; then
+        log WARN "systemd daemon-reload 失败"
+        rc=1
+    fi
+    return "$rc"
 }
 
 query_unit_enabled_state() {
@@ -236,31 +257,36 @@ capture_unit_state() {
     printf '%s\t%s\n' "$enabled" "$active" > "$file"
 }
 
-restore_unit_state() {
-    local unit="$1" file="$2" line enabled active current_enabled current_active
-    local actual_enabled actual_active rc=0 remask=0
+unit_state_snapshot_validate() {
+    local file="$1" line enabled active
     local -a state_lines=()
-    [[ -f "$file" ]] || return 0
+    [[ -f "$file" && ! -L "$file" ]] || return 1
     mapfile -t state_lines < "$file" || return 1
-    if (( ${#state_lines[@]} != 1 )); then
-        log ERR "systemd unit 状态快照格式损坏: $file"
-        return 1
-    fi
+    (( ${#state_lines[@]} == 1 )) || return 1
     line="${state_lines[0]}"
-    if [[ "$line" != *$'\t'* || "${line#*$'\t'}" == *$'\t'* ]]; then
-        log ERR "systemd unit 状态快照字段无效: $file"
-        return 1
-    fi
+    [[ "$line" == *$'\t'* && "${line#*$'\t'}" != *$'\t'* ]] || return 1
     enabled="${line%%$'\t'*}"
     active="${line#*$'\t'}"
     case "$enabled" in
         enabled|enabled-runtime|disabled|masked|masked-runtime|linked|linked-runtime|alias|static|indirect|generated|transient|not-found) ;;
-        *) log ERR "systemd unit 状态快照包含未知 unit-file 状态: ${enabled:-empty}"; return 1 ;;
+        *) return 1 ;;
     esac
-    case "$active" in
-        active|inactive) ;;
-        *) log ERR "systemd unit 状态快照包含不可恢复的 active 状态: ${active:-empty}"; return 1 ;;
-    esac
+    case "$active" in active|inactive) ;; *) return 1 ;; esac
+}
+
+restore_unit_state() {
+    local unit="$1" file="$2" line enabled active current_enabled current_active
+    local actual_enabled actual_active rc=0 remask=0
+    local -a state_lines=()
+    [[ -e "$file" || -L "$file" ]] || return 0
+    if ! unit_state_snapshot_validate "$file"; then
+        log ERR "systemd unit 状态快照格式损坏: $file"
+        return 1
+    fi
+    mapfile -t state_lines < "$file" || return 1
+    line="${state_lines[0]}"
+    enabled="${line%%$'\t'*}"
+    active="${line#*$'\t'}"
     command_exists systemctl || { log WARN "无法恢复 systemd unit 状态（systemctl 不可用）: $unit"; return 1; }
     current_enabled=$(query_unit_enabled_state "$unit") || return 1
     current_active=$(query_unit_active_state "$unit") || return 1
@@ -502,6 +528,70 @@ action_transaction_restore_routes() {
     restore_default_route_windows_snapshot "$ACTION_TRANSACTION_DIR"
 }
 
+action_transaction_path_snapshot_validate() {
+    local name="$1" type="${2:-file}" state_file payload state
+    local -a lines=()
+    state_file="$ACTION_TRANSACTION_DIR/${name}.state"
+    payload="$ACTION_TRANSACTION_DIR/files/$name"
+    [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+    mapfile -t lines < "$state_file" || return 1
+    (( ${#lines[@]} == 1 )) || return 1
+    state="${lines[0]}"
+    case "$state:$type" in
+        absent:file|absent:tree)
+            [[ ! -e "$payload" && ! -L "$payload" ]]
+            ;;
+        present:file)
+            [[ ( -f "$payload" || -L "$payload" ) && ! ( -d "$payload" && ! -L "$payload" ) ]]
+            ;;
+        present:tree)
+            [[ -d "$payload" && ! -L "$payload" ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+action_transaction_snapshot_validate() {
+    local dir="$ACTION_TRANSACTION_DIR" file iface count=0
+    local -A expected=() observed=()
+    [[ -n "$dir" && -d "$dir" && ! -L "$dir" ]] || return 1
+    [[ -f "$dir/COMPLETE" && ! -L "$dir/COMPLETE" && "$(<"$dir/COMPLETE")" == complete ]] || return 1
+    [[ -f "$dir/sysctl.tsv" && ! -L "$dir/sysctl.tsv" ]] || return 1
+    tcp_baseline_sysctl_validate "$dir/sysctl.tsv" >/dev/null || return 1
+    [[ -f "$dir/default-route-v4.txt" && ! -L "$dir/default-route-v4.txt" ]] || return 1
+    [[ -f "$dir/default-route-v6.txt" && ! -L "$dir/default-route-v6.txt" ]] || return 1
+    default_route_windows_snapshot_preflight "$dir" || return 1
+    for file in "$dir/qdiscs"/*.snapshot; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        iface="${file##*/}"; iface="${iface%.snapshot}"
+        validate_interface_name "$iface" && [[ "$iface" != auto && -z "${observed[$iface]+x}" ]] || return 1
+        action_qdisc_snapshot_validate "$file" || return 1
+        mq_snapshot_queue_preflight "$iface" "$file" || return 1
+        qdisc_filter_guard "$iface" || return 1
+        observed[$iface]=1
+        ((count+=1))
+    done
+    (( count > 0 )) || return 1
+    while IFS= read -r iface; do
+        [[ -n "$iface" ]] || continue
+        validate_interface_name "$iface" && [[ "$iface" != auto && -z "${expected[$iface]+x}" ]] || return 1
+        expected[$iface]=1
+        [[ -n "${observed[$iface]+x}" ]] || return 1
+    done <<< "$ACTION_TRANSACTION_INTERFACES"
+    (( ${#expected[@]} == ${#observed[@]} )) || return 1
+    [[ -f "$dir/qdisc.snapshot" && ! -L "$dir/qdisc.snapshot" ]] || return 1
+    action_qdisc_snapshot_validate "$dir/qdisc.snapshot" || return 1
+    action_transaction_path_snapshot_validate config || return 1
+    action_transaction_path_snapshot_validate sysctl || return 1
+    action_transaction_path_snapshot_validate legacy-sysctl || return 1
+    action_transaction_path_snapshot_validate service || return 1
+    action_transaction_path_snapshot_validate legacy-service || return 1
+    action_transaction_path_snapshot_validate persist-script || return 1
+    action_transaction_path_snapshot_validate nic-policy-dir tree || return 1
+    unit_state_snapshot_validate "$dir/service.unit" || return 1
+    unit_state_snapshot_validate "$dir/legacy-service.unit" || return 1
+}
+
 action_transaction_begin() {
     local iface="$1" dir path stale=""
     [[ -z "$ACTION_TRANSACTION_DIR" ]] || { die "已有未提交的系统配置事务"; return 1; }
@@ -516,12 +606,18 @@ action_transaction_begin() {
     ensure_state_layout || return 1
     dir=$(mktemp -d "${STATE_DIR}/.transaction.XXXXXX") || return 1
     ACTION_TRANSACTION_DIR="$dir"; ACTION_TRANSACTION_IFACE="$iface"; ACTION_TRANSACTION_INTERFACES="$iface"
-    mkdir -p "$dir/files" "$dir/qdiscs" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
-    action_qdisc_snapshot "$iface" "$dir/qdisc.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
-    cp -- "$dir/qdisc.snapshot" "$dir/qdiscs/$iface.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
-    capture_runtime_sysctls > "$dir/sysctl.tsv" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
-    ip -4 route show default > "$dir/default-route-v4.txt" 2>/dev/null || true
-    ip -6 route show default > "$dir/default-route-v6.txt" 2>/dev/null || true
+    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
+    mkdir -p "$dir/files" "$dir/qdiscs" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
+    action_qdisc_snapshot "$iface" "$dir/qdisc.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
+    cp -- "$dir/qdisc.snapshot" "$dir/qdiscs/$iface.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
+    capture_runtime_sysctls > "$dir/sysctl.tsv" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
+    if ! ip -4 route show default > "$dir/default-route-v4.txt" 2>/dev/null ||
+       ! ip -6 route show default > "$dir/default-route-v6.txt" 2>/dev/null; then
+        remove_tree_within "$dir" "$STATE_DIR" || true
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
+        die "无法完整读取 IPv4/IPv6 默认路由；未创建系统配置事务，也不会修改运行时状态"
+        return 1
+    fi
     if ! action_transaction_snapshot_path "$CONFIG_FILE" config ||
        ! action_transaction_snapshot_path "$SYSCTL_FILE" sysctl ||
        ! action_transaction_snapshot_path "$LEGACY_SYSCTL_FILE" legacy-sysctl ||
@@ -530,14 +626,14 @@ action_transaction_begin() {
        ! action_transaction_snapshot_path "$PERSIST_SCRIPT" persist-script ||
        ! action_transaction_snapshot_tree "$NIC_POLICY_DIR" nic-policy-dir; then
         remove_tree_within "$dir" "$STATE_DIR" || true
-        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
         return 1
     fi
     if ! action_transaction_capture_unit "$SERVICE_NAME" service ||
        ! action_transaction_capture_unit bbr-optimize-persist.service legacy-service ||
        ! chmod -R go-rwx "$dir"; then
         remove_tree_within "$dir" "$STATE_DIR" || true
-        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
         return 1
     fi
     log INFO "已创建本次操作回滚点: $dir"
@@ -555,22 +651,47 @@ action_transaction_add_interface() {
 action_transaction_discard_snapshot() {
     local dir="$ACTION_TRANSACTION_DIR"
     ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
     [[ -z "$dir" ]] || remove_tree_within "$dir" "$STATE_DIR"
 }
 
 action_transaction_begin_multi() {
-    local primary="$1" iface
+    local primary="$1" iface interfaces
     action_transaction_begin "$primary" || return 1
     if [[ "$(nic_policy_layout_state 2>/dev/null || true)" == managed ]]; then
         if ! nic_policy_set_validate; then action_transaction_discard_snapshot || true; return 1; fi
+        if ! interfaces=$(nic_policy_interface_list); then
+            action_transaction_discard_snapshot || true
+            die "无法完整枚举多网卡策略接口；未开始系统配置事务"
+            return 1
+        fi
         while IFS= read -r iface; do
             [[ -n "$iface" ]] || continue
             if ! action_transaction_add_interface "$iface"; then action_transaction_discard_snapshot || true; return 1; fi
-        done < <(nic_policy_interface_list)
+        done <<< "$interfaces"
     fi
     if (( ${MULTI_NIC_ENABLED:-0} == 0 )) && [[ "${TC_INTERFACE:-auto}" != auto ]]; then
         if ! action_transaction_add_interface "$TC_INTERFACE"; then action_transaction_discard_snapshot || true; return 1; fi
     fi
+    if ! chmod -R go-rwx "$ACTION_TRANSACTION_DIR" ||
+       ! printf 'complete\n' > "$ACTION_TRANSACTION_DIR/COMPLETE" ||
+       ! chmod 0600 "$ACTION_TRANSACTION_DIR/COMPLETE"; then
+        action_transaction_discard_snapshot || true
+        return 1
+    fi
+    ACTION_TRANSACTION_READY=1
+}
+
+action_transaction_mark_mutated() {
+    [[ -n "$ACTION_TRANSACTION_DIR" && "$ACTION_TRANSACTION_READY" == 1 && "$ACTION_TRANSACTION_MUTATED" == 0 ]] || {
+        die "系统配置事务尚未完成只读快照，拒绝开始写入"
+        return 1
+    }
+    action_transaction_snapshot_validate || {
+        die "系统配置事务快照不完整，或运行时 qdisc filter/队列/路由身份已漂移，拒绝开始写入"
+        return 1
+    }
+    ACTION_TRANSACTION_MUTATED=1
 }
 
 configured_state_target_preflight() {
@@ -594,6 +715,11 @@ tcp_restore_runtime_preflight() {
     }
     tc qdisc show dev "$iface" >/dev/null 2>&1 || { die "无法读取 $iface 的 qdisc；恢复尚未开始"; return 1; }
     tc class show dev "$iface" >/dev/null 2>&1 || { die "无法读取 $iface 的 class；恢复尚未开始"; return 1; }
+    qdisc_filter_guard "$iface" || return 1
+    if [[ -f "$BASELINE_DIR/qdisc.txt" ]] && ! mq_snapshot_queue_preflight "$iface" "$BASELINE_DIR/qdisc.txt"; then
+        die "$iface 的 MQ 基线与当前 TX queue 数不一致，恢复尚未开始"
+        return 1
+    fi
     while IFS= read -r key; do
         sysctl -n "$key" >/dev/null 2>&1 || { die "无法读取恢复目标 sysctl: $key"; return 1; }
     done < <(tcp_baseline_sysctl_keys)
@@ -609,6 +735,7 @@ action_transaction_commit() {
     local dir="$ACTION_TRANSACTION_DIR"
     [[ -n "$dir" ]] || return 0
     ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
     remove_tree_within "$dir" "$STATE_DIR" || log WARN "操作已提交，但无法删除临时事务快照: $dir"
 }
 
@@ -616,6 +743,20 @@ action_transaction_rollback() {
     local dir="$ACTION_TRANSACTION_DIR" iface="$ACTION_TRANSACTION_IFACE" file rc=0 had_lock="$LOCK_HELD"
     [[ -n "$dir" ]] || return 0
     (( ACTION_TRANSACTION_ROLLING_BACK == 0 )) || return 1
+    if (( ACTION_TRANSACTION_MUTATED == 0 )); then
+        log INFO "系统配置事务仍处于只读快照阶段；正在丢弃快照，不执行运行时回滚"
+        action_transaction_discard_snapshot
+        return
+    fi
+    if (( ACTION_TRANSACTION_READY != 1 )) ||
+       [[ ! -f "$dir/COMPLETE" || -L "$dir/COMPLETE" || "$(<"$dir/COMPLETE")" != complete ]]; then
+        log ERR "系统配置事务已标记写入但快照不完整；拒绝执行可能破坏系统的回滚，证据保留在 $dir"
+        return 1
+    fi
+    if ! action_transaction_snapshot_validate; then
+        log ERR "系统配置事务快照已损坏，或运行时 qdisc filter/队列/路由身份已漂移且不可完整验证；拒绝执行回滚，证据保留在 $dir"
+        return 1
+    fi
     ACTION_TRANSACTION_ROLLING_BACK=1
     systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl disable --now bbr-optimize-persist.service >/dev/null 2>&1 || true
@@ -649,6 +790,7 @@ action_transaction_rollback() {
     fi
     if (( rc == 0 )); then
         ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+        ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
         log OK "已恢复本次操作前的 qdisc、sysctl、配置和服务状态"
     else
         log ERR "自动回滚未完全成功；事务快照保留在 $dir"
@@ -660,6 +802,7 @@ action_transaction_rollback() {
 run_action_transaction_multi() {
     local iface="$1" rc rollback_rc=0; shift
     action_transaction_begin_multi "$iface" || return 1
+    action_transaction_mark_mutated || { action_transaction_discard_snapshot || true; return 1; }
     if "$@"; then
         action_transaction_commit
         return
@@ -671,9 +814,65 @@ run_action_transaction_multi() {
     return "$rc"
 }
 
+apply_configured_runtime_steps() {
+    local iface="$1"
+    # The persistent artifacts already exist when the systemd apply entry is
+    # invoked.  Reapply only runtime state here so a later qdisc/route failure
+    # cannot rewrite the sysctl drop-in outside this runtime transaction.
+    apply_sysctl_profile runtime || return 1
+    if (( TC_ENABLED == 1 )); then
+        apply_shaping "$iface" "$TC_RATE_MBIT" || return 1
+    else
+        apply_fq "$iface" || return 1
+    fi
+    apply_initial_windows
+}
+
+apply_configured_runtime_transaction() {
+    local iface="$1" snapshot_parent="${TMPDIR:-/tmp}" snapshot_dir rc=0 rollback_rc=0
+    nic_runtime_transaction_begin "$snapshot_parent" || return 1
+    snapshot_dir="$NIC_RUNTIME_TRANSACTION_DIR"
+    if ! capture_runtime_sysctls > "$snapshot_dir/sysctl.tsv"; then
+        nic_runtime_transaction_discard || true
+        die "持久化运行时应用无法完整快照 sysctl；未修改运行时状态"
+        return 1
+    fi
+    if ! ip -4 route show default > "$snapshot_dir/default-route-v4.txt" 2>/dev/null ||
+       ! ip -6 route show default > "$snapshot_dir/default-route-v6.txt" 2>/dev/null; then
+        nic_runtime_transaction_discard || true
+        die "持久化运行时应用无法完整读取 IPv4/IPv6 默认路由；未修改运行时状态"
+        return 1
+    fi
+    if ! action_qdisc_snapshot "$iface" "$snapshot_dir/$iface.snapshot" ||
+       ! nic_runtime_transaction_write_interfaces "$iface" ||
+       ! nic_runtime_transaction_mark_mutated; then
+        nic_runtime_transaction_discard || true
+        die "持久化运行时应用无法建立完整回滚点；未修改运行时状态"
+        return 1
+    fi
+    if apply_configured_runtime_steps "$iface"; then
+        nic_runtime_transaction_commit
+        return
+    else
+        rc=$?
+    fi
+    nic_runtime_transaction_rollback || rollback_rc=$?
+    if (( rollback_rc == 0 )); then
+        die "持久化运行时应用失败，已恢复本轮 qdisc、sysctl 与路由窗口快照"
+        return "$rc"
+    fi
+    die "持久化运行时应用失败且回滚不完整；快照保留在 $snapshot_dir，请人工检查"
+    return "$rollback_rc"
+}
+
 apply_configured_state() {
     require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
     require_commands ip tc sysctl systemctl modprobe || return 1; acquire_lock 30 || return 1
+    [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || {
+        die "持久化配置缺失、不是常规文件或是符号链接: $CONFIG_FILE"
+        return 1
+    }
+    check_config_permissions "$CONFIG_FILE" || return 1
     load_config || return 1
     (( BBR_ENABLED == 1 )) || return 0
     if (( MULTI_NIC_ENABLED == 1 )); then
@@ -694,13 +893,7 @@ apply_configured_state() {
     network_tuning_preflight "$iface" "$TC_ENABLED" || return 1
     # All dependency, interface, ownership and qdisc checks above are
     # deliberately read-only.  No sysctl is written until every gate passes.
-    apply_sysctl_profile || return 1
-    if (( TC_ENABLED == 1 )); then
-        apply_shaping "$iface" "$TC_RATE_MBIT" || return 1
-    else
-        apply_fq "$iface" || return 1
-    fi
-    apply_initial_windows
+    apply_configured_runtime_transaction "$iface"
 }
 
 install_base_tuning_steps() {
@@ -762,7 +955,7 @@ prepare_auto_tuning_runtime() {
 verify_runtime_tuning() {
     local iface="$1" rc=0
     verify_sysctl_profile_runtime || rc=1
-    if (( TC_ENABLED )); then verify_shaping "$iface" || rc=1
+    if (( TC_ENABLED )); then verify_shaping "$iface" "$TC_RATE_MBIT" || rc=1
     else [[ "$(root_qdisc_kind "$iface")" == fq ]] || { log ERR "root qdisc 不是 fq"; rc=1; }
     fi
     (( rc == 0 )) || { die "临时调优状态验证失败"; return 1; }
@@ -826,7 +1019,7 @@ restore_baseline() {
     tcp_restore_runtime_preflight "$iface" || return 1
     nic_restore_preflight || return 1
     if [[ "$provenance" == legacy-reference ]]; then
-        remove_persistence
+        remove_persistence || { die "无法安全移除当前持久化服务；旧版委托恢复尚未执行"; return 1; }
         nic_restore_secondary_baselines || { die "旧版委托恢复前，逐网卡 qdisc 恢复失败；策略和基线均已保留"; return 1; }
         release_lock
         log INFO "将恢复操作交给迁移时保存的旧版本工具"
@@ -836,7 +1029,7 @@ restore_baseline() {
         log OK "旧版可信基线恢复完成"
         return 0
     fi
-    remove_persistence
+    remove_persistence || rc=1
     nic_restore_secondary_baselines || rc=1
     restore_backed_path "$CONFIG_FILE" config || rc=1
     restore_backed_path "$SYSCTL_FILE" sysctl || rc=1
@@ -931,10 +1124,46 @@ remove_cli_command() {
     fi
 }
 
+remove_empty_nic_policy_parent() {
+    local owned="${1:-0}" policy="${NIC_POLICY_DIR%/}" parent entry
+    case "$owned" in 0) return 0 ;; 1) ;; *) return 1 ;; esac
+    [[ ! -e "$policy" && ! -L "$policy" ]] || {
+        die "受管策略目录在恢复后仍然存在，拒绝删除管理入口: $policy"
+        return 1
+    }
+    parent=$(dirname -- "$policy") || return 1
+
+    # Only the exact standard path is project-owned at the parent level.
+    # Custom paths may point into a directory that existed before this tool,
+    # even when their final components happen to use the same names.
+    if [[ "$policy" != "$STANDARD_NIC_POLICY_DIR" ]]; then
+        log WARN "策略目录使用自定义父路径，卸载不会删除其父目录: $parent"
+        return 0
+    fi
+    if [[ -L "$parent" ]]; then
+        log WARN "策略父目录是符号链接，卸载不会删除: $parent"
+        return 0
+    fi
+    [[ -d "$parent" ]] || return 0
+    if rmdir -- "$parent" 2>/dev/null; then
+        log INFO "已删除空策略父目录: $parent"
+        return 0
+    fi
+    for entry in "$parent"/* "$parent"/.[!.]* "$parent"/..?*; do
+        if [[ -e "$entry" || -L "$entry" ]]; then
+            log WARN "策略父目录包含非项目内容，已保留: $parent"
+            return 0
+        fi
+    done
+    die "策略父目录为空但无法删除: $parent"
+    return 1
+}
+
 uninstall_managed() {
     require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
-    require_commands ip tc sysctl systemctl readlink grep cut sed mktemp mv rm chmod chown || return 1
+    require_commands ip tc sysctl systemctl readlink grep cut sed mktemp mv rm rmdir dirname chmod chown || return 1
     local purge="${1:-0}" resolved_state restored_tcp=0 restored_dns=0 restored_ipv6=0 interfaces other
+    local policy_layout policy_parent_owned=0
 
     case "$purge" in 0|1) ;; *) die "非法卸载清理模式: $purge"; return 1 ;; esac
     if (( purge )); then
@@ -946,6 +1175,16 @@ uninstall_managed() {
     fi
     legacy_shell_commands_preflight || return 1
     acquire_lock || return 1
+
+    policy_layout=$(nic_policy_layout_state) || { die "无法识别多网卡策略目录状态"; return 1; }
+    case "$policy_layout" in
+        absent) ;;
+        managed)
+            nic_policy_set_validate || return 1
+            policy_parent_owned=1
+            ;;
+        *) die "多网卡策略目录损坏或不属于本项目；为保留恢复证据，本次不会卸载"; return 1 ;;
+    esac
 
     # Restore before deleting either the executable or the only recovery data.
     if [[ -e "$BASELINE_DIR" || -L "$BASELINE_DIR" ]]; then
@@ -965,8 +1204,18 @@ uninstall_managed() {
             die "没有可信 TCP 基线且仍有受管 HTB；已保留配置、服务和 bbr 命令"
             return 1
         fi
-        remove_persistence
-        rm -f -- "$CONFIG_FILE" "$SYSCTL_FILE"
+        remove_persistence || {
+            die "无法完整移除持久化服务；已保留 bbr 命令、配置和恢复状态"
+            return 1
+        }
+        rm -f -- "$CONFIG_FILE" "$SYSCTL_FILE" || {
+            die "无法删除管理配置；已保留 bbr 命令和恢复状态"
+            return 1
+        }
+        if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" || -e "$SYSCTL_FILE" || -L "$SYSCTL_FILE" ]]; then
+            die "管理配置删除后仍然存在；已保留 bbr 命令和恢复状态"
+            return 1
+        fi
         log WARN "没有 TCP 基线：未发现任何受管 HTB，已移除管理文件；无法精确恢复修改前的运行时 sysctl/qdisc"
     fi
     interfaces=$(managed_htb_interfaces_strict) || return 1
@@ -980,9 +1229,16 @@ uninstall_managed() {
     if [[ -f "$DNS_BACKUP_DIR/baseline/manifest" ]]; then dns_restore || return 1; restored_dns=1; fi
     if [[ -f "$IPV6_BACKUP_DIR/baseline/sysctl.tsv" ]]; then ipv6_restore || return 1; restored_ipv6=1; fi
 
+    remove_empty_nic_policy_parent "$policy_parent_owned" || return 1
     remove_cli_command || return 1
     if (( purge )); then
-        [[ ! -e "$resolved_state" ]] || rm -rf -- "$resolved_state"
+        if [[ -e "$resolved_state" || -L "$resolved_state" ]]; then
+            rm -rf -- "$resolved_state" || { die "无法永久删除状态目录: $resolved_state"; return 1; }
+        fi
+        [[ ! -e "$resolved_state" && ! -L "$resolved_state" ]] || {
+            die "状态目录删除后仍然存在: $resolved_state"
+            return 1
+        }
         log WARN "已完整卸载并永久删除状态目录"
     elif [[ -d "$STATE_DIR" ]]; then
         log OK "已完整卸载；可用基线已恢复，备份和历史保留在 $STATE_DIR"
@@ -1147,7 +1403,7 @@ verify_system_state() {
     verify_persistence_artifacts || rc=1
     systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未启用"; rc=1; }
     systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未运行"; rc=1; }
-    if (( TC_ENABLED )); then verify_shaping "$iface" || rc=1
+    if (( TC_ENABLED )); then verify_shaping "$iface" "$TC_RATE_MBIT" || rc=1
     else [[ "$(root_qdisc_kind "$iface")" == fq ]] || { log ERR "root qdisc 不是 fq"; rc=1; }
     fi
     if (( rc == 0 )); then log OK "运行时与持久化状态一致"; else die "验证发现不一致"; fi

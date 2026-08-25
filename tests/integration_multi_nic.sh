@@ -46,7 +46,24 @@ MULTI_NIC_ENABLED=1
 # sysctl and route-window rollback are covered by unit tests and must not alter
 # the Docker host while these namespace-local qdiscs are exercised.
 apply_sysctl_profile() { [[ "$1" == runtime ]]; }
-capture_runtime_sysctls() { printf 'net.core.somaxconn\t4096\n'; }
+capture_runtime_sysctls() {
+    local key value
+    while IFS= read -r key; do
+        case "$key" in
+            net.core.default_qdisc) value=fq ;;
+            net.ipv4.tcp_congestion_control) value=cubic ;;
+            net.core.rmem_max|net.core.wmem_max) value=16777216 ;;
+            net.ipv4.tcp_rmem) value='4096 131072 16777216' ;;
+            net.ipv4.tcp_wmem) value='4096 16384 16777216' ;;
+            net.ipv4.tcp_mtu_probing) value=0 ;;
+            net.ipv4.tcp_fastopen) value=1 ;;
+            net.core.somaxconn|net.ipv4.tcp_max_syn_backlog) value=4096 ;;
+            net.core.netdev_max_backlog) value=1000 ;;
+            *) return 1 ;;
+        esac
+        printf '%s\t%s\n' "$key" "$value"
+    done < <(tcp_baseline_sysctl_keys)
+}
 apply_initial_windows() { :; }
 nic_restore_runtime_snapshot() { :; }
 
@@ -76,7 +93,13 @@ fi
 
 nic_baseline_restore bbrv8a
 nic_baseline_restore bbrv8b
-! managed_htb bbrv8a
-! managed_htb bbrv8b
+if managed_htb bbrv8a; then
+    echo 'bbrv8a still has managed HTB after baseline restore' >&2
+    exit 1
+fi
+if managed_htb bbrv8b; then
+    echo 'bbrv8b still has managed HTB after baseline restore' >&2
+    exit 1
+fi
 
 printf 'multi-NIC integration test: OK (bbrv8a + bbrv8b)\n'

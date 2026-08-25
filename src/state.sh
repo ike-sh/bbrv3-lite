@@ -225,17 +225,20 @@ tcp_baseline_unit_state_validate() {
 }
 
 tcp_baseline_qdisc_validate() {
-    local file="$1" root_count kind rows unsupported
+    local file="$1" root_count kind rows unsupported handle expected_count
     tcp_baseline_regular_file "$file" || { tcp_baseline_invalid "qdisc 快照缺失或类型非法"; return 1; }
     [[ -s "$file" ]] || { tcp_baseline_invalid "qdisc 快照为空"; return 1; }
     root_count=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {count++} END {print count+0}' "$file") || return 1
     (( root_count == 1 )) || { tcp_baseline_invalid "qdisc 快照必须且只能包含一个 root"; return 1; }
     kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$file")
+    handle=$(root_qdisc_handle_from_stream < "$file")
+    qdisc_handle_valid "$handle" || { tcp_baseline_invalid "qdisc root handle 非法或缺失"; return 1; }
     case "$kind" in
         fq|fq_codel|noqueue|pfifo_fast) ;;
         mq)
             rows=$(mq_child_replay_rows_from_stream < "$file") || { tcp_baseline_invalid "mq 子队列无法解析"; return 1; }
-            [[ -n "$rows" ]] || { tcp_baseline_invalid "mq 快照缺少子队列"; return 1; }
+            expected_count=$(mq_child_candidate_count_from_stream < "$file") || { tcp_baseline_invalid "mq 子队列无法计数"; return 1; }
+            mq_child_rows_validate "$rows" "$expected_count" || { tcp_baseline_invalid "mq 子队列集合不完整、重复或格式非法"; return 1; }
             unsupported=$(awk -F'\t' '$2!="fq" && $2!="fq_codel" && $2!="pfifo_fast" && $2!="pfifo" && $2!="bfifo" && $2!="noqueue" {print $2; exit}' <<< "$rows")
             [[ -z "$unsupported" ]] || { tcp_baseline_invalid "mq 含不可安全重放的子队列: $unsupported"; return 1; }
             ;;
@@ -244,11 +247,22 @@ tcp_baseline_qdisc_validate() {
 }
 
 tcp_baseline_native_validate() {
-    local directory="$1" name route_file
+    local directory="$1" name route_file kind rows class_rows expected_count class_count handle
     tcp_baseline_sysctl_validate "$directory/sysctl.tsv" || return 1
     tcp_baseline_qdisc_validate "$directory/qdisc.txt" || return 1
     tcp_baseline_regular_file "$directory/class.txt" || { tcp_baseline_invalid "class 快照缺失或类型非法"; return 1; }
-    if grep -q '[^[:space:]]' "$directory/class.txt"; then
+    kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$directory/qdisc.txt")
+    handle=$(root_qdisc_handle_from_stream < "$directory/qdisc.txt")
+    if [[ "$kind" == mq ]]; then
+        rows=$(mq_child_replay_rows_from_stream < "$directory/qdisc.txt") || return 1
+        expected_count=$(mq_child_candidate_count_from_stream < "$directory/qdisc.txt") || return 1
+        class_rows=$(mq_class_replay_rows_from_stream < "$directory/class.txt") || return 1
+        class_count=$(mq_class_candidate_count_from_stream < "$directory/class.txt") || return 1
+        [[ "$class_count" == "$expected_count" ]] && mq_class_rows_validate "$rows" "$class_rows" "$handle" "$expected_count" || {
+            tcp_baseline_invalid "mq class 快照与 qdisc 子队列不完整或不一致"
+            return 1
+        }
+    elif grep -q '[^[:space:]]' "$directory/class.txt"; then
         tcp_baseline_invalid "class 快照包含当前恢复器不能安全重放的层级"
         return 1
     fi
@@ -360,11 +374,8 @@ backup_path() {
 
 capture_runtime_sysctls() {
     local key raw_value value
-    for key in \
-        net.core.default_qdisc net.ipv4.tcp_congestion_control \
-        net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
-        net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen net.core.somaxconn \
-        net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog; do
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
         raw_value=$(sysctl -n "$key" 2>/dev/null) || {
             log WARN "无法读取受管 sysctl，拒绝创建不完整快照: $key"
             return 1
@@ -374,7 +385,7 @@ capture_runtime_sysctls() {
             return 1
         fi
         printf '%s\t%s\n' "$key" "$value"
-    done
+    done < <(tcp_baseline_sysctl_keys)
     return 0
 }
 
@@ -387,11 +398,11 @@ capture_baseline() {
         die "已有 TCP 基线损坏或不完整；它是不可覆盖的恢复证据，已原样保留: $BASELINE_DIR"
         return 1
     fi
-    ensure_state_layout || return 1
     case "$provenance" in native|adopt-current) ;; *) die "非法基线来源: $provenance"; return 1 ;; esac
     validate_interface_name "$iface" && [[ "$iface" != auto ]] || { die "基线必须绑定具体网卡"; return 1; }
     if managed_artifacts_exist && [[ "$provenance" != adopt-current ]]; then
         if [[ -d "$LEGACY_BACKUP_DIR" && -n "$(find "$LEGACY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+            ensure_state_layout || return 1
             import_legacy_baseline "$iface"
             return
         else
@@ -399,6 +410,8 @@ capture_baseline() {
             return 1
         fi
     fi
+    qdisc_guard "$iface" || return 1
+    ensure_state_layout || return 1
     temp_dir=$(mktemp -d "${STATE_DIR}/.baseline.XXXXXX") || return 1
     if ! printf 'SCHEMA\t%s\nFORMAT\t%s\nRESTORE_SCOPE\t%s\nROUTE_DUMPS\t%s\nCOMPLETE\t1\nCREATED_AT\t%s\nCREATED_BY\t%s\nPROVENANCE\t%s\nINTERFACE\t%s\n' \
             "$TCP_BASELINE_SCHEMA" "$TCP_BASELINE_FORMAT" "$TCP_BASELINE_NATIVE_SCOPE" "$TCP_BASELINE_ROUTE_DUMPS" \

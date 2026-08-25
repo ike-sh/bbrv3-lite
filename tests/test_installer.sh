@@ -23,10 +23,10 @@ while (($#)); do
 done
 case "$url" in
     */releases/latest) exit 22 ;;
-    */tags\?per_page=100) printf '[{"name":"v8.0.1"}]\n' ;;
+    */tags\?per_page=100) printf '[{"name":"v8.0.2"}]\n' ;;
     */releases/download/*) exit 22 ;;
-    */v8.0.1/net-tcp-tune.sh) cp "$FIXTURE_ROOT/net-tcp-tune.sh" "$output" ;;
-    */v8.0.1/SHA256SUMS)
+    */v8.0.2/net-tcp-tune.sh) cp "$FIXTURE_ROOT/net-tcp-tune.sh" "$output" ;;
+    */v8.0.2/SHA256SUMS)
         hash=$(sha256sum "$FIXTURE_ROOT/net-tcp-tune.sh" | awk '{print $1}')
         printf '%s  net-tcp-tune.sh\n' "$hash" > "$output"
         ;;
@@ -38,14 +38,14 @@ chmod 0755 "$FAKE_BIN/curl"
 output=$(PATH="$FAKE_BIN:$PATH" FIXTURE_ROOT="$ROOT_DIR" bash "$ROOT_DIR/install-alias.sh" --prefix "$PREFIX" 2>&1)
 [[ -x "$PREFIX/bbr" ]] || { echo "FAIL: installer did not create bbr" >&2; exit 1; }
 grep -Fq 'falling back to immutable tag' <<< "$output" || { echo "FAIL: tag fallback was not reported" >&2; exit 1; }
-"$PREFIX/bbr" version | grep -F 'v8.0.1' >/dev/null || { echo "FAIL: installed version mismatch" >&2; exit 1; }
+"$PREFIX/bbr" version | grep -F 'v8.0.2' >/dev/null || { echo "FAIL: installed version mismatch" >&2; exit 1; }
 if [[ $(id -u) == 0 ]]; then
     chown 12345:12345 "$PREFIX/bbr"
     PATH="$FAKE_BIN:$PATH" FIXTURE_ROOT="$ROOT_DIR" bash "$ROOT_DIR/install-alias.sh" --prefix "$PREFIX" >/dev/null 2>&1
     [[ $(stat -c '%u:%g' "$PREFIX/bbr") == 12345:12345 ]] || { echo "FAIL: installer refresh changed bbr ownership" >&2; exit 1; }
 fi
 run_output=$(PATH="$FAKE_BIN:$PATH" FIXTURE_ROOT="$ROOT_DIR" bash "$ROOT_DIR/install-alias.sh" --prefix "$RUN_PREFIX" --run 2>&1)
-grep -Fq 'bbrv3-lite v8.0.1' <<< "$run_output" || { echo "FAIL: --run did not execute installed command" >&2; exit 1; }
+grep -Fq 'bbrv3-lite v8.0.2' <<< "$run_output" || { echo "FAIL: --run did not execute installed command" >&2; exit 1; }
 mkdir -p "$TEST_ROOT/home"
 cat > "$TEST_ROOT/home/.bashrc" <<'EOF'
 keep

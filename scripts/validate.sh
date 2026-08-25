@@ -12,7 +12,7 @@ for file in src/*.sh scripts/*.sh tests/*.sh install-alias.sh; do bash -n "$file
 bash -n net-tcp-tune.sh
 
 echo "==> Generated artifact markers"
-grep -Fq 'SCRIPT_VERSION="8.0.1"' net-tcp-tune.sh
+grep -Fq 'SCRIPT_VERSION="8.0.2"' net-tcp-tune.sh
 grep -Fq 'Configuration is data and is never sourced' net-tcp-tune.sh
 grep -Fq 'MEASURE_PEER_PORT=""' net-tcp-tune.sh
 grep -Fq 'LOCKED_PORT' net-tcp-tune.sh
@@ -44,7 +44,7 @@ grep -Fq 'path_profile_tuning_gate' net-tcp-tune.sh
 grep -Fq 'dns_preflight_takeover' net-tcp-tune.sh
 grep -Fq 'dns_policy_plan' net-tcp-tune.sh
 grep -Fq 'dns_policy_verify' net-tcp-tune.sh
-grep -Fq "mode='dot'" net-tcp-tune.sh
+grep -Fq 'dns_apply dot' net-tcp-tune.sh
 grep -Fq 'FORMAT\tinterface-values-v2' net-tcp-tune.sh
 grep -Fq 'ipv6_policy_plan' net-tcp-tune.sh
 grep -Fq 'ipv6_policy_verify' net-tcp-tune.sh
@@ -54,6 +54,11 @@ grep -Fq 'NIC_POLICY_FORMAT="bbrv3-lite-nic-policy"' net-tcp-tune.sh
 grep -Fq 'nic_policy_candidate_global_model' net-tcp-tune.sh
 grep -Fq 'nic_restore_runtime_snapshot' net-tcp-tune.sh
 grep -Fq 'action_transaction_discard_snapshot' net-tcp-tune.sh
+grep -Fq 'root_qdisc_snapshot_matches' net-tcp-tune.sh
+grep -Fq 'qdisc_filter_guard' net-tcp-tune.sh
+grep -Fq 'mq_snapshot_queue_preflight' net-tcp-tune.sh
+grep -Fq 'mq_class_rows_validate' net-tcp-tune.sh
+grep -Fq 'managed_htb_topology_from_stream' net-tcp-tune.sh
 grep -Fq 'all write-trigger (observed; not aggregate state)' net-tcp-tune.sh
 grep -Fq 'refusing to overwrite an unmanaged file' install-alias.sh
 if grep -Eq 'source[[:space:]]+.*bbrv3-lite\.conf' net-tcp-tune.sh; then echo "unsafe config source detected" >&2; exit 1; fi

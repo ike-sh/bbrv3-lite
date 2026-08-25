@@ -3,7 +3,7 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="8.0.1"
+SCRIPT_VERSION="8.0.2"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
@@ -32,7 +32,8 @@ LEGACY_SYSCTL_FILE="${BBRV3_LEGACY_SYSCTL_FILE:-/etc/sysctl.d/99-bbr-ultimate.co
 LOCK_FILE="${BBRV3_LOCK_FILE:-/run/lock/bbrv3-lite.lock}"
 DNS_BACKUP_DIR="${BBRV3_DNS_BACKUP_DIR:-${STATE_DIR}/dns}"
 IPV6_BACKUP_DIR="${BBRV3_IPV6_BACKUP_DIR:-${STATE_DIR}/ipv6}"
-NIC_POLICY_DIR="${BBRV3_NIC_POLICY_DIR:-/etc/bbrv3-lite/interfaces.d}"
+STANDARD_NIC_POLICY_DIR="/etc/bbrv3-lite/interfaces.d"
+NIC_POLICY_DIR="${BBRV3_NIC_POLICY_DIR:-$STANDARD_NIC_POLICY_DIR}"
 NIC_STATE_DIR="${BBRV3_NIC_STATE_DIR:-${STATE_DIR}/interfaces}"
 
 COLOR_ENABLED=0
@@ -156,34 +157,59 @@ human_bytes() {
 }
 
 cleanup_core() {
-    local rc=$?
+    local rc="${1:-$?}" cleanup_rc=0
+    if (( ${QDISC_DEFAULT_TRANSACTION_ACTIVE:-0} == 1 )) && declare -F qdisc_default_transaction_restore >/dev/null; then
+        log WARN "进程退出时 default_qdisc 临时事务仍未提交，正在恢复全局原值"
+        qdisc_default_transaction_restore || cleanup_rc=1
+    fi
+    if [[ -n "${NIC_RUNTIME_TRANSACTION_DIR:-}" ]] && declare -F nic_runtime_transaction_rollback >/dev/null; then
+        log WARN "进程退出时仍有未完成的网络运行时事务，正在恢复全部接口和全局状态"
+        nic_runtime_transaction_rollback || cleanup_rc=1
+    fi
     if [[ -n "${TC_TRIAL_IFACE:-}" && -n "${TC_TRIAL_SNAPSHOT:-}" ]] && declare -F tc_trial_transaction_rollback >/dev/null; then
         log WARN "进程退出时仍有未提交的临时 TC 操作，正在恢复操作前 qdisc"
-        tc_trial_transaction_rollback || true
+        tc_trial_transaction_rollback || cleanup_rc=1
     fi
     if [[ -n "${MEASURE_IFACE:-}" && -n "${MEASURE_SNAPSHOT:-}" ]] && declare -F measure_restore >/dev/null; then
         log WARN "进程退出时仍有测量快照，正在恢复操作前 qdisc"
-        measure_restore || true
+        measure_restore || cleanup_rc=1
     fi
     if [[ -n "${DNS_TRANSACTION_DIR:-}" ]] && declare -F dns_transaction_rollback >/dev/null; then
         log WARN "进程退出时仍有未提交 DNS 事务，正在恢复操作前状态"
-        dns_transaction_rollback || true
+        dns_transaction_rollback || cleanup_rc=1
     fi
     if [[ -n "${IPV6_TRANSACTION_DIR:-}" ]] && declare -F ipv6_transaction_rollback >/dev/null; then
         log WARN "进程退出时仍有未提交 IPv6 事务，正在恢复操作前状态"
-        ipv6_transaction_rollback || true
+        ipv6_transaction_rollback || cleanup_rc=1
     fi
     if [[ -n "${ACTION_TRANSACTION_DIR:-}" ]] && declare -F action_transaction_rollback >/dev/null; then
         log WARN "进程退出时仍有未提交事务，正在恢复操作前状态"
-        action_transaction_rollback || true
+        action_transaction_rollback || cleanup_rc=1
     fi
-    release_lock
-    return "$rc"
+    release_lock || cleanup_rc=1
+    (( rc != 0 )) && return "$rc"
+    return "$cleanup_rc"
+}
+
+cleanup_core_exit() {
+    local original_rc=$? final_rc
+    # EXIT trap return values do not replace the process status in Bash. Clear
+    # the trap and exit explicitly so a failed emergency rollback can never be
+    # reported to systemd or an operator as a successful command.
+    trap - EXIT
+    if cleanup_core "$original_rc"; then final_rc=0; else final_rc=$?; fi
+    exit "$final_rc"
 }
 
 # -----------------------------------------------------------------------------
 # Config: strict KEY=VALUE parser. Configuration is data and is never sourced.
 # -----------------------------------------------------------------------------
+
+CONFIG_KEYS=(
+    SCHEMA_VERSION BBR_ENABLED SYSCTL_PROFILE ROLE BANDWIDTH_MBIT RTT_MS
+    TC_ENABLED TC_INTERFACE TC_RATE_MBIT TC_KNEE_MBIT TC_MARGIN_PERCENT
+    INITCWND INITRWND MULTI_NIC_ENABLED
+)
 
 reset_config() {
     SCHEMA_VERSION="$STATE_SCHEMA"
@@ -201,13 +227,6 @@ reset_config() {
     INITRWND=0
     MULTI_NIC_ENABLED=0
     NIC_MODEL_INTERFACE=auto
-}
-
-config_key_known() {
-    case "$1" in
-        SCHEMA_VERSION|BBR_ENABLED|SYSCTL_PROFILE|ROLE|BANDWIDTH_MBIT|RTT_MS|TC_ENABLED|TC_INTERFACE|TC_RATE_MBIT|TC_KNEE_MBIT|TC_MARGIN_PERCENT|INITCWND|INITRWND|MULTI_NIC_ENABLED) return 0 ;;
-        *) return 1 ;;
-    esac
 }
 
 validate_interface_name() {
@@ -237,7 +256,6 @@ validate_config_value() {
 
 set_config_value() {
     local key="$1" value="$2"
-    config_key_known "$key" || return 1
     validate_config_value "$key" "$value" || return 1
     printf -v "$key" '%s' "$value"
 }
@@ -279,26 +297,17 @@ load_config() {
 }
 
 write_config_stream() {
-    printf '%s\n' \
-        "# Managed by ${SCRIPT_NAME} v${SCRIPT_VERSION}; do not source this file." \
-        "SCHEMA_VERSION=${STATE_SCHEMA}" \
-        "BBR_ENABLED=${BBR_ENABLED}" \
-        "SYSCTL_PROFILE=${SYSCTL_PROFILE}" \
-        "ROLE=${ROLE}" \
-        "BANDWIDTH_MBIT=${BANDWIDTH_MBIT}" \
-        "RTT_MS=${RTT_MS}" \
-        "TC_ENABLED=${TC_ENABLED}" \
-        "TC_INTERFACE=${TC_INTERFACE}" \
-        "TC_RATE_MBIT=${TC_RATE_MBIT}" \
-        "TC_KNEE_MBIT=${TC_KNEE_MBIT}" \
-        "TC_MARGIN_PERCENT=${TC_MARGIN_PERCENT}" \
-        "INITCWND=${INITCWND}" \
-        "INITRWND=${INITRWND}" \
-        "MULTI_NIC_ENABLED=${MULTI_NIC_ENABLED}"
+    local key value
+    printf '# Managed by %s v%s; do not source this file.\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+    for key in "${CONFIG_KEYS[@]}"; do
+        value="${!key}"
+        [[ "$key" != SCHEMA_VERSION ]] || value="$STATE_SCHEMA"
+        printf '%s=%s\n' "$key" "$value"
+    done
 }
 
 save_config() {
-    local file="${1:-$CONFIG_FILE}" temp runtime_iface runtime_rate
+    local file="${1:-$CONFIG_FILE}" temp runtime_iface runtime_rate key
     # Old configurations with TC_INTERFACE=auto remain readable. New shaping
     # commits, however, must pin the interface that was actually changed so a
     # later default-route change cannot move an old rate onto another NIC.
@@ -321,7 +330,7 @@ save_config() {
         }
         if declare -F nic_policy_set_validate >/dev/null; then nic_policy_set_validate || return 1; fi
     fi
-    for key in SCHEMA_VERSION BBR_ENABLED SYSCTL_PROFILE ROLE BANDWIDTH_MBIT RTT_MS TC_ENABLED TC_INTERFACE TC_RATE_MBIT TC_KNEE_MBIT TC_MARGIN_PERCENT INITCWND INITRWND MULTI_NIC_ENABLED; do
+    for key in "${CONFIG_KEYS[@]}"; do
         validate_config_value "$key" "${!key}" || { die "拒绝写入非法配置: $key=${!key}"; return 1; }
     done
     temp=$(mktemp) || return 1
@@ -1456,17 +1465,20 @@ tcp_baseline_unit_state_validate() {
 }
 
 tcp_baseline_qdisc_validate() {
-    local file="$1" root_count kind rows unsupported
+    local file="$1" root_count kind rows unsupported handle expected_count
     tcp_baseline_regular_file "$file" || { tcp_baseline_invalid "qdisc 快照缺失或类型非法"; return 1; }
     [[ -s "$file" ]] || { tcp_baseline_invalid "qdisc 快照为空"; return 1; }
     root_count=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {count++} END {print count+0}' "$file") || return 1
     (( root_count == 1 )) || { tcp_baseline_invalid "qdisc 快照必须且只能包含一个 root"; return 1; }
     kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$file")
+    handle=$(root_qdisc_handle_from_stream < "$file")
+    qdisc_handle_valid "$handle" || { tcp_baseline_invalid "qdisc root handle 非法或缺失"; return 1; }
     case "$kind" in
         fq|fq_codel|noqueue|pfifo_fast) ;;
         mq)
             rows=$(mq_child_replay_rows_from_stream < "$file") || { tcp_baseline_invalid "mq 子队列无法解析"; return 1; }
-            [[ -n "$rows" ]] || { tcp_baseline_invalid "mq 快照缺少子队列"; return 1; }
+            expected_count=$(mq_child_candidate_count_from_stream < "$file") || { tcp_baseline_invalid "mq 子队列无法计数"; return 1; }
+            mq_child_rows_validate "$rows" "$expected_count" || { tcp_baseline_invalid "mq 子队列集合不完整、重复或格式非法"; return 1; }
             unsupported=$(awk -F'\t' '$2!="fq" && $2!="fq_codel" && $2!="pfifo_fast" && $2!="pfifo" && $2!="bfifo" && $2!="noqueue" {print $2; exit}' <<< "$rows")
             [[ -z "$unsupported" ]] || { tcp_baseline_invalid "mq 含不可安全重放的子队列: $unsupported"; return 1; }
             ;;
@@ -1475,11 +1487,22 @@ tcp_baseline_qdisc_validate() {
 }
 
 tcp_baseline_native_validate() {
-    local directory="$1" name route_file
+    local directory="$1" name route_file kind rows class_rows expected_count class_count handle
     tcp_baseline_sysctl_validate "$directory/sysctl.tsv" || return 1
     tcp_baseline_qdisc_validate "$directory/qdisc.txt" || return 1
     tcp_baseline_regular_file "$directory/class.txt" || { tcp_baseline_invalid "class 快照缺失或类型非法"; return 1; }
-    if grep -q '[^[:space:]]' "$directory/class.txt"; then
+    kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$directory/qdisc.txt")
+    handle=$(root_qdisc_handle_from_stream < "$directory/qdisc.txt")
+    if [[ "$kind" == mq ]]; then
+        rows=$(mq_child_replay_rows_from_stream < "$directory/qdisc.txt") || return 1
+        expected_count=$(mq_child_candidate_count_from_stream < "$directory/qdisc.txt") || return 1
+        class_rows=$(mq_class_replay_rows_from_stream < "$directory/class.txt") || return 1
+        class_count=$(mq_class_candidate_count_from_stream < "$directory/class.txt") || return 1
+        [[ "$class_count" == "$expected_count" ]] && mq_class_rows_validate "$rows" "$class_rows" "$handle" "$expected_count" || {
+            tcp_baseline_invalid "mq class 快照与 qdisc 子队列不完整或不一致"
+            return 1
+        }
+    elif grep -q '[^[:space:]]' "$directory/class.txt"; then
         tcp_baseline_invalid "class 快照包含当前恢复器不能安全重放的层级"
         return 1
     fi
@@ -1591,11 +1614,8 @@ backup_path() {
 
 capture_runtime_sysctls() {
     local key raw_value value
-    for key in \
-        net.core.default_qdisc net.ipv4.tcp_congestion_control \
-        net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
-        net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen net.core.somaxconn \
-        net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog; do
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
         raw_value=$(sysctl -n "$key" 2>/dev/null) || {
             log WARN "无法读取受管 sysctl，拒绝创建不完整快照: $key"
             return 1
@@ -1605,7 +1625,7 @@ capture_runtime_sysctls() {
             return 1
         fi
         printf '%s\t%s\n' "$key" "$value"
-    done
+    done < <(tcp_baseline_sysctl_keys)
     return 0
 }
 
@@ -1618,11 +1638,11 @@ capture_baseline() {
         die "已有 TCP 基线损坏或不完整；它是不可覆盖的恢复证据，已原样保留: $BASELINE_DIR"
         return 1
     fi
-    ensure_state_layout || return 1
     case "$provenance" in native|adopt-current) ;; *) die "非法基线来源: $provenance"; return 1 ;; esac
     validate_interface_name "$iface" && [[ "$iface" != auto ]] || { die "基线必须绑定具体网卡"; return 1; }
     if managed_artifacts_exist && [[ "$provenance" != adopt-current ]]; then
         if [[ -d "$LEGACY_BACKUP_DIR" && -n "$(find "$LEGACY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+            ensure_state_layout || return 1
             import_legacy_baseline "$iface"
             return
         else
@@ -1630,6 +1650,8 @@ capture_baseline() {
             return 1
         fi
     fi
+    qdisc_guard "$iface" || return 1
+    ensure_state_layout || return 1
     temp_dir=$(mktemp -d "${STATE_DIR}/.baseline.XXXXXX") || return 1
     if ! printf 'SCHEMA\t%s\nFORMAT\t%s\nRESTORE_SCOPE\t%s\nROUTE_DUMPS\t%s\nCOMPLETE\t1\nCREATED_AT\t%s\nCREATED_BY\t%s\nPROVENANCE\t%s\nINTERFACE\t%s\n' \
             "$TCP_BASELINE_SCHEMA" "$TCP_BASELINE_FORMAT" "$TCP_BASELINE_NATIVE_SCOPE" "$TCP_BASELINE_ROUTE_DUMPS" \
@@ -1974,48 +1996,157 @@ apply_sysctl_profile() {
     fi
 }
 
+route_expiry_seconds_normalize() {
+    local value="${1:-}"
+    [[ "$value" != *sec ]] || value="${value%sec}"
+    is_uint "$value" || return 1
+    (( ${#value} <= 10 )) || return 1
+    (( 10#$value <= 4294967295 )) || return 1
+    printf '%s\n' "$value"
+}
+
+route_window_mutation_line() {
+    local line="$1" token value i
+    local -a route=() clean=()
+    [[ -n "$line" ]] || return 1
+    read -r -a route <<< "$line"
+    for ((i=0; i<${#route[@]}; i++)); do
+        token="${route[$i]}"
+        case "$token" in
+            initcwnd|initrwnd|uid)
+                (( i + 1 < ${#route[@]} )) || return 1
+                is_uint "${route[$((i + 1))]}" || return 1
+                ((i+=1))
+                ;;
+            expires)
+                (( i + 1 < ${#route[@]} )) || return 1
+                value=$(route_expiry_seconds_normalize "${route[$((i + 1))]}") || return 1
+                clean+=(expires "$value")
+                ((i+=1))
+                ;;
+            *) clean+=("$token") ;;
+        esac
+    done
+    (( ${#clean[@]} > 0 )) || return 1
+    printf '%s\n' "${clean[*]}"
+}
+
 apply_initial_windows() {
     (( INITCWND > 0 || INITRWND > 0 )) || return 0
-    local family line token i changed=0
-    local -a args=() clean=()
+    local family routes line normalized targets=0 rc=0
+    local -A route_lines=()
+    local -a clean=()
+
+    # Read both routing families before changing either one.  Treat an empty
+    # default-route set as valid, but never hide a failed route query: doing so
+    # could otherwise leave only IPv4 or IPv6 changed and report success.
     for family in -4 -6; do
-        line=$(ip "$family" route show default 2>/dev/null | sed -n '1p' || true)
+        if ! routes=$(ip "$family" route show default 2>/dev/null); then
+            die "无法读取 IPv${family#-} 默认路由；未应用 initcwnd/initrwnd"
+            return 1
+        fi
+        line=$(sed -n '1p' <<< "$routes")
+        if [[ -n "$line" ]]; then
+            normalized=$(route_window_mutation_line "$line") || {
+                die "IPv${family#-} 默认路由包含不可安全重放的动态字段"
+                return 1
+            }
+            route_lines["$family"]="$normalized"
+            ((targets+=1))
+        else
+            route_lines["$family"]=""
+        fi
+    done
+    (( targets > 0 )) || { die "没有可设置 initcwnd/initrwnd 的默认路由"; return 1; }
+
+    for family in -4 -6; do
+        line="${route_lines[$family]}"
         [[ -n "$line" ]] || continue
-        read -r -a args <<< "$line"
-        clean=()
-        for ((i=0; i<${#args[@]}; i++)); do
-            token="${args[$i]}"
-            if [[ "$token" == initcwnd || "$token" == initrwnd ]]; then ((i+=1)); continue; fi
-            clean+=("$token")
-        done
+        read -r -a clean <<< "$line"
         (( INITCWND > 0 )) && clean+=(initcwnd "$INITCWND")
         (( INITRWND > 0 )) && clean+=(initrwnd "$INITRWND")
-        if ip "$family" route change "${clean[@]}"; then ((changed+=1)); fi
+        ip "$family" route change "${clean[@]}" || rc=1
     done
-    (( changed > 0 )) || { die "没有可设置 initcwnd/initrwnd 的默认路由"; return 1; }
+    (( rc == 0 )) || { die "initcwnd/initrwnd 未能在全部可用 IP 默认路由上生效"; return 1; }
+}
+
+default_route_windows_snapshot_preflight() {
+    local directory="$1" family file baseline_routes current_routes baseline_identity current_identity
+    for family in -4 -6; do
+        file="$directory/default-route-v${family#-}.txt"
+        [[ -e "$file" || -L "$file" ]] || return 1
+        [[ -f "$file" && ! -L "$file" ]] || return 1
+        baseline_routes=$(<"$file")
+        current_routes=$(ip "$family" route show default 2>/dev/null) || return 1
+        baseline_identity=$(route_set_identity_without_initial_windows "$baseline_routes") || return 1
+        current_identity=$(route_set_identity_without_initial_windows "$current_routes") || return 1
+        [[ "$baseline_identity" == "$current_identity" ]] || return 1
+    done
 }
 
 restore_default_route_windows_snapshot() {
-    local directory="$1" family file baseline current token i rc=0
-    local -a route=() clean=()
+    local directory="$1" family file baseline current routes baseline_identity current_identity normalized rc=0
+    local -a clean=()
+    default_route_windows_snapshot_preflight "$directory" || return 1
     for family in -4 -6; do
         file="$directory/default-route-v${family#-}.txt"
         [[ -s "$file" ]] || continue
         baseline=$(head -n1 "$file")
-        current=$(ip "$family" route show default 2>/dev/null | sed -n '1p' || true)
+        routes=$(ip "$family" route show default 2>/dev/null) || { rc=1; continue; }
+        current=$(sed -n '1p' <<< "$routes")
         [[ "$baseline$current" == *initcwnd* || "$baseline$current" == *initrwnd* ]] || continue
         [[ -n "$current" ]] || { rc=1; continue; }
-        read -r -a route <<< "$current"; clean=()
-        for ((i=0; i<${#route[@]}; i++)); do
-            token="${route[$i]}"
-            if [[ "$token" == initcwnd || "$token" == initrwnd ]]; then ((i+=1)); continue; fi
-            clean+=("$token")
-        done
+        baseline_identity=$(route_identity_without_initial_windows "$baseline") || { rc=1; continue; }
+        current_identity=$(route_identity_without_initial_windows "$current") || { rc=1; continue; }
+        # Only the two managed window attributes belong to this transaction.
+        # A gateway/device/table/metric change is external route ownership
+        # drift; never graft an old window value onto that new route.
+        [[ "$baseline_identity" == "$current_identity" ]] || { rc=1; continue; }
+        normalized=$(route_window_mutation_line "$current") || { rc=1; continue; }
+        read -r -a clean <<< "$normalized"
         if [[ "$baseline" =~ (^|[[:space:]])initcwnd[[:space:]]+([0-9]+) ]]; then clean+=(initcwnd "${BASH_REMATCH[2]}"); fi
         if [[ "$baseline" =~ (^|[[:space:]])initrwnd[[:space:]]+([0-9]+) ]]; then clean+=(initrwnd "${BASH_REMATCH[2]}"); fi
         ip "$family" route replace "${clean[@]}" || rc=1
     done
     return "$rc"
+}
+
+route_identity_without_initial_windows() {
+    local line="$1" token value i
+    local -a route=() clean=()
+    [[ -n "$line" ]] || return 1
+    read -r -a route <<< "$line"
+    for ((i=0; i<${#route[@]}; i++)); do
+        token="${route[$i]}"
+        # expires is a live RA lifetime countdown and uid is query context,
+        # not forwarding identity.  They may change between snapshot and
+        # preflight without the default route itself changing ownership.
+        if [[ "$token" == initcwnd || "$token" == initrwnd ||
+              "$token" == expires || "$token" == uid ]]; then
+            (( i + 1 < ${#route[@]} )) || return 1
+            value="${route[$((i + 1))]}"
+            if [[ "$token" == expires ]]; then
+                route_expiry_seconds_normalize "$value" >/dev/null || return 1
+            else
+                is_uint "$value" || return 1
+            fi
+            ((i+=1))
+            continue
+        fi
+        clean+=("$token")
+    done
+    (( ${#clean[@]} > 0 )) || return 1
+    printf '%s\n' "${clean[*]}"
+}
+
+route_set_identity_without_initial_windows() {
+    local text="$1" line identity identities=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] || continue
+        identity=$(route_identity_without_initial_windows "$line") || return 1
+        identities+="${identities:+$'\n'}$identity"
+    done <<< "$text"
+    [[ -z "$identities" ]] || LC_ALL=C sort <<< "$identities"
 }
 
 # -----------------------------------------------------------------------------
@@ -2025,6 +2156,8 @@ restore_default_route_windows_snapshot() {
 TC_SESSION_HTB_IFACE=""
 TC_TRIAL_IFACE=""
 TC_TRIAL_SNAPSHOT=""
+QDISC_DEFAULT_TRANSACTION_ACTIVE=0
+QDISC_DEFAULT_TRANSACTION_ORIGINAL=""
 # Enough for 1 Tbit/s even at CONFIG_HZ=100. The actual value remains rate/HZ,
 # so ordinary VPS rates do not inherit a large bucket merely because the cap
 # supports modern 25/100/400G NICs.
@@ -2040,6 +2173,47 @@ qdisc_module_hint() {
     # The real replace operation below remains the authoritative capability
     # check and is always followed by structural verification.
     return 0
+}
+
+qdisc_default_kind_valid() {
+    case "${1:-}" in fq|fq_codel|pfifo_fast|pfifo|bfifo|noqueue) return 0 ;; *) return 1 ;; esac
+}
+
+qdisc_default_transaction_restore() {
+    local original actual
+    (( ${QDISC_DEFAULT_TRANSACTION_ACTIVE:-0} == 1 )) || return 0
+    original="$QDISC_DEFAULT_TRANSACTION_ORIGINAL"
+    qdisc_default_kind_valid "$original" || return 1
+    sysctl -q -w "net.core.default_qdisc=$original" >/dev/null 2>&1 || return 1
+    actual=$(sysctl -n net.core.default_qdisc 2>/dev/null) || return 1
+    [[ "$actual" == "$original" ]] || return 1
+    QDISC_DEFAULT_TRANSACTION_ACTIVE=0
+    QDISC_DEFAULT_TRANSACTION_ORIGINAL=""
+}
+
+qdisc_default_transaction_begin() {
+    local target="$1" original actual
+    qdisc_default_kind_valid "$target" || return 1
+    (( ${QDISC_DEFAULT_TRANSACTION_ACTIVE:-0} == 0 )) || return 1
+    original=$(sysctl -n net.core.default_qdisc 2>/dev/null) || return 1
+    qdisc_default_kind_valid "$original" || return 1
+    [[ "$original" != "$target" ]] || return 0
+    # Publish the original value before the host-wide write. cleanup_core can
+    # then restore it even if INT/TERM arrives in the following instructions.
+    QDISC_DEFAULT_TRANSACTION_ORIGINAL="$original"
+    QDISC_DEFAULT_TRANSACTION_ACTIVE=1
+    if ! sysctl -q -w "net.core.default_qdisc=$target" >/dev/null 2>&1; then
+        qdisc_default_transaction_restore || true
+        return 1
+    fi
+    actual=$(sysctl -n net.core.default_qdisc 2>/dev/null) || {
+        qdisc_default_transaction_restore || true
+        return 1
+    }
+    if [[ "$actual" != "$target" ]]; then
+        qdisc_default_transaction_restore || true
+        return 1
+    fi
 }
 
 network_tuning_preflight() {
@@ -2059,10 +2233,14 @@ network_tuning_preflight() {
     log INFO "硬件建议: $(hardware_scaling_note)"
 }
 
+root_qdisc_kind_from_stream() {
+    awk '$1=="qdisc" && $0 ~ / root([[:space:]]|$)/ {print $2; exit}'
+}
+
 root_qdisc_kind() {
     local text
     text=$(tc qdisc show dev "$1" 2>/dev/null) || return 1
-    awk '$1=="qdisc" && $0 ~ / root([[:space:]]|$)/ {print $2; exit}' <<< "$text"
+    root_qdisc_kind_from_stream <<< "$text"
 }
 
 qdisc_replay_args_from_stream() {
@@ -2075,7 +2253,7 @@ qdisc_replay_args_from_stream() {
                     if($i=="bands") {bands=$(i+1); i++; continue}
                     if($i=="priomap") {i+=16; continue}
                     if($i=="weights") {i+=bands; continue}
-                    token=$i; if(token ~ /^[0-9]+p$/) sub(/p$/, "", token)
+                    token=$i; if(token ~ /^[0-9]+[pb]$/) sub(/[pb]$/, "", token)
                     printf "%s%s", (out?" ":""), token; out=1
                 }
                 if($i=="root") seen=1
@@ -2088,57 +2266,447 @@ root_qdisc_replay_args() {
     tc qdisc show dev "$1" 2>/dev/null | qdisc_replay_args_from_stream
 }
 
+qdisc_handle_valid() {
+    [[ "${1:-}" =~ ^[[:xdigit:]]+:$ ]]
+}
+
+root_qdisc_handle_from_stream() {
+    awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {
+        if ($3 ~ /^[[:xdigit:]]+:$/) print $3
+        exit
+    }'
+}
+
+root_qdisc_handle() {
+    tc qdisc show dev "$1" 2>/dev/null | root_qdisc_handle_from_stream
+}
+
+replace_root_qdisc_snapshot() {
+    local iface="$1" kind="$2" handle="$3"; shift 3
+    qdisc_handle_valid "$handle" || return 1
+    tc qdisc replace dev "$iface" root handle "$handle" "$kind" "$@"
+}
+
+replace_child_qdisc_snapshot() {
+    local iface="$1" parent="$2" kind="$3" handle="$4"; shift 4
+    qdisc_handle_valid "$handle" || return 1
+    tc qdisc replace dev "$iface" parent "$parent" handle "$handle" "$kind" "$@"
+}
+
+root_qdisc_snapshot_matches() {
+    local iface="$1" kind="$2" handle="$3" args_string="$4" actual_kind actual_handle actual_args
+    actual_kind=$(root_qdisc_kind "$iface") || return 1
+    actual_handle=$(root_qdisc_handle "$iface") || return 1
+    actual_args=$(root_qdisc_replay_args "$iface") || return 1
+    [[ "$actual_kind" == "$kind" && "$actual_handle" == "$handle" && "$actual_args" == "$args_string" ]]
+}
+
+restore_classless_root_snapshot() {
+    local iface="$1" kind="$2" handle="$3" args_string="$4" default_kind rc=0 restore_default=0
+    local -a args=()
+    case "$kind" in fq|fq_codel|pfifo_fast) ;; *) return 1 ;; esac
+    qdisc_handle_valid "$handle" || return 1
+    root_qdisc_snapshot_matches "$iface" "$kind" "$handle" "$args_string" && return 0
+    if [[ "$handle" == 0: ]]; then
+        # Handle 0 is owned by the kernel's automatic default qdisc. `replace
+        # ... handle 0:` reports success but Linux assigns a generated handle,
+        # so recreate it through default_qdisc.  A per-NIC restore may need a
+        # different kind than the host-wide current default; switch only for
+        # the delete/recreate window, then restore the global value and verify
+        # both pieces of state again.
+        default_kind=$(sysctl -n net.core.default_qdisc 2>/dev/null) || return 1
+        if [[ "$default_kind" != "$kind" ]]; then
+            qdisc_default_transaction_begin "$kind" || return 1
+            restore_default=1
+        fi
+        if ! tc qdisc del dev "$iface" root >/dev/null 2>&1; then
+            rc=1
+        elif ! root_qdisc_snapshot_matches "$iface" "$kind" "$handle" "$args_string"; then
+            rc=1
+        fi
+        if (( restore_default )); then
+            qdisc_default_transaction_restore || rc=1
+        fi
+        (( rc == 0 )) || return 1
+        root_qdisc_snapshot_matches "$iface" "$kind" "$handle" "$args_string"
+        return
+    fi
+    [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
+    replace_root_qdisc_snapshot "$iface" "$kind" "$handle" "${args[@]}" >/dev/null 2>&1 || return 1
+    root_qdisc_snapshot_matches "$iface" "$kind" "$handle" "$args_string"
+}
+
 mq_child_replay_rows_from_stream() {
     awk '
-        $1=="qdisc" && $0!~/ root([[:space:]]|$)/ {
-            parent=""; start=0; bands=3
-            for(i=1;i<=NF;i++) if($i=="parent" && $(i+1) ~ /^:[[:xdigit:]]+$/) {
+        {
+            lines[NR]=$0
+            if($1=="qdisc" && $0~/ root([[:space:]]|$)/ && $3 ~ /^[[:xdigit:]]+:$/) {
+                root_handle=$3; root_major=$3; sub(/:$/, "", root_major)
+            }
+        }
+        END {
+          for(n=1;n<=NR;n++) {
+            $0=lines[n]
+            if($1!="qdisc" || $0~/ root([[:space:]]|$)/) continue
+            parent=""; handle=""; start=0; bands=3
+            if($3 ~ /^[[:xdigit:]]+:$/) handle=$3
+            for(i=1;i<=NF;i++) if($i=="parent" && $(i+1) ~ /^([[:xdigit:]]+)?:[[:xdigit:]]+$/) {
                 parent=$(i+1); start=i+2; break
             }
-            if(parent=="") next
+            if(parent=="") continue
+            parent_major=parent; sub(/:.*/, "", parent_major)
+            if(parent_major!="" && parent_major!=root_major) continue
             kind=$2; out=""
             for(i=start;i<=NF;i++) {
                 if($i=="refcnt") {i++; continue}
                 if($i=="bands") {bands=$(i+1); i++; continue}
                 if($i=="priomap") {i+=16; continue}
                 if($i=="weights") {i+=bands; continue}
-                token=$i; if(token ~ /^[0-9]+p$/) sub(/p$/, "", token)
+                token=$i; if(token ~ /^[0-9]+[pb]$/) sub(/[pb]$/, "", token)
                 out=out (out?" ":"") token
             }
-            printf "%s\t%s\t%s\n", parent, kind, out
-        }'
+            printf "%s\t%s\t%s\t%s\n", parent, kind, handle, out
+          }
+        }' | LC_ALL=C sort
 }
 
-mq_unsupported_child_qdiscs() {
-    local iface="$1"
-    tc qdisc show dev "$iface" 2>/dev/null | mq_child_replay_rows_from_stream |
-        awk -F'\t' '$2!="fq" && $2!="fq_codel" && $2!="pfifo_fast" && $2!="pfifo" && $2!="bfifo" && $2!="noqueue" {print $2 "@" $1}'
+mq_child_candidate_count_from_stream() {
+    awk '
+        $1=="qdisc" && $0!~/ root([[:space:]]|$)/ {
+            parent=""
+            for(i=1;i<=NF;i++) if($i=="parent") {parent=$(i+1); break}
+            major=parent; sub(/:.*/, "", major)
+            if(major=="ffff") next
+            count++
+        }
+        END {print count+0}
+    '
+}
+
+mq_zero_handle_default_kind_from_rows() {
+    local rows="$1"
+    awk -F'\t' '
+        $3=="0:" {kinds[$2]=1; found=1}
+        END {
+            if(!found) exit 0
+            for(kind in kinds) {count++; selected=kind}
+            if(count!=1) exit 1
+            print selected
+        }
+    ' <<< "$rows"
+}
+
+interface_tx_queue_count() {
+    local iface="$1" path count=0
+    for path in "${BBRV3_SYS_CLASS_NET_ROOT:-/sys/class/net}/$iface"/queues/tx-*; do
+        [[ -e "$path" ]] && ((count+=1))
+    done
+    printf '%s\n' "$count"
+}
+
+mq_tx_queue_count_matches() {
+    local iface="$1" expected_count="$2" actual_count
+    is_uint "$expected_count" && (( expected_count > 1 )) || return 1
+    actual_count=$(interface_tx_queue_count "$iface") || return 1
+    is_uint "$actual_count" && (( actual_count == expected_count ))
+}
+
+mq_snapshot_queue_preflight() {
+    local iface="$1" file="$2" kind expected_count
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$file")
+    [[ "$kind" == mq ]] || return 0
+    expected_count=$(mq_child_candidate_count_from_stream < "$file") || return 1
+    mq_tx_queue_count_matches "$iface" "$expected_count"
+}
+
+mq_child_rows_validate() {
+    local rows="$1" expected_count="${2:-}" actual_count
+    [[ -n "$rows" ]] || return 1
+    awk -F'\t' '
+        NF < 3 {bad=1; next}
+        $1 !~ /^([[:xdigit:]]+)?:[[:xdigit:]]+$/ {bad=1}
+        $2!="fq" && $2!="fq_codel" && $2!="pfifo_fast" && $2!="pfifo" && $2!="bfifo" && $2!="noqueue" {bad=1}
+        $3 !~ /^[[:xdigit:]]+:$/ {bad=1}
+        seen_parent[$1]++ > 0 {bad=1}
+        $3!="0:" && seen_handle[$3]++ > 0 {bad=1}
+        END {exit bad || NR==0}
+    ' <<< "$rows" || return 1
+    mq_zero_handle_default_kind_from_rows "$rows" >/dev/null || return 1
+    if [[ -n "$expected_count" ]]; then
+        is_uint "$expected_count" || return 1
+        actual_count=$(awk 'NF {count++} END {print count+0}' <<< "$rows")
+        (( actual_count == expected_count )) || return 1
+    fi
+}
+
+mq_class_replay_rows_from_stream() {
+    awk '$1=="class" {
+        leaf=""
+        for(i=1;i<=NF;i++) if($i=="leaf") {leaf=$(i+1); break}
+        printf "%s\t%s\t%s\t%s\n", $3, $2, $4, leaf
+    }'
+}
+
+mq_class_candidate_count_from_stream() {
+    awk '$1=="class" {count++} END {print count+0}'
+}
+
+mq_parent_canonical() {
+    local root_handle="$1" parent="$2" root_major="${1%:}" parent_major
+    qdisc_handle_valid "$root_handle" || return 1
+    [[ "$parent" =~ ^([[:xdigit:]]+)?:[[:xdigit:]]+$ ]] || return 1
+    parent_major="${parent%%:*}"
+    if [[ -z "$parent_major" ]]; then
+        printf '%s%s\n' "$root_major" "$parent"
+    elif [[ "$parent_major" == "$root_major" ]]; then
+        printf '%s\n' "$parent"
+    else
+        return 1
+    fi
+}
+
+mq_class_rows_validate() {
+    local qdisc_rows="$1" class_rows="$2" root_handle="$3" expected_count="$4"
+    local parent kind handle args classid class_kind relation leaf canonical actual_count
+    local -A class_leaf=() seen_class=()
+    qdisc_handle_valid "$root_handle" || return 1
+    is_uint "$expected_count" || return 1
+    actual_count=$(awk 'NF {count++} END {print count+0}' <<< "$class_rows")
+    (( actual_count == expected_count )) || return 1
+    while IFS=$'\t' read -r classid class_kind relation leaf; do
+        [[ -n "$classid" && "$class_kind" == mq && "$relation" == root ]] || return 1
+        canonical=$(mq_parent_canonical "$root_handle" "$classid") || return 1
+        [[ -z "${seen_class[$canonical]+x}" ]] || return 1
+        seen_class["$canonical"]=1
+        [[ -z "$leaf" ]] || qdisc_handle_valid "$leaf" || return 1
+        class_leaf["$canonical"]="$leaf"
+    done <<< "$class_rows"
+    while IFS=$'\t' read -r parent kind handle args; do
+        canonical=$(mq_parent_canonical "$root_handle" "$parent") || return 1
+        [[ -n "${seen_class[$canonical]+x}" ]] || return 1
+        leaf="${class_leaf[$canonical]}"
+        if [[ "$handle" == 0: ]]; then
+            [[ -z "$leaf" || "$leaf" == 0: ]] || return 1
+        else
+            [[ "$leaf" == "$handle" ]] || return 1
+        fi
+    done <<< "$qdisc_rows"
+}
+
+mq_qdisc_snapshot_matches() {
+    local iface="$1" file="$2" class_file="${3:-$2}" root_handle rows expected_count
+    local live_qdisc_text live_class_text live_rows live_class_rows live_count live_class_count
+    root_handle=$(root_qdisc_handle_from_stream < "$file")
+    qdisc_handle_valid "$root_handle" || return 1
+    rows=$(mq_child_replay_rows_from_stream < "$file") || return 1
+    expected_count=$(mq_child_candidate_count_from_stream < "$file") || return 1
+    mq_child_rows_validate "$rows" "$expected_count" || return 1
+    [[ -f "$class_file" && ! -L "$class_file" ]] || return 1
+    live_qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null) || return 1
+    [[ "$(root_qdisc_kind_from_stream <<< "$live_qdisc_text")" == mq &&
+       "$(root_qdisc_handle_from_stream <<< "$live_qdisc_text")" == "$root_handle" ]] || return 1
+    live_rows=$(mq_child_replay_rows_from_stream <<< "$live_qdisc_text") || return 1
+    live_count=$(mq_child_candidate_count_from_stream <<< "$live_qdisc_text") || return 1
+    mq_child_rows_validate "$live_rows" "$live_count" || return 1
+    [[ "$live_count" == "$expected_count" && "$live_rows" == "$rows" ]] || return 1
+    live_class_text=$(tc class show dev "$iface" 2>/dev/null) || return 1
+    live_class_rows=$(mq_class_replay_rows_from_stream <<< "$live_class_text") || return 1
+    live_class_count=$(mq_class_candidate_count_from_stream <<< "$live_class_text") || return 1
+    [[ "$live_class_count" == "$expected_count" ]] || return 1
+    mq_class_rows_validate "$live_rows" "$live_class_rows" "$root_handle" "$expected_count"
+}
+
+restore_mq_qdisc_snapshot_replay() {
+    local iface="$1" root_handle="$2" rows="$3" expected_count="$4"
+    local parent kind args_string handle live_row live_rows live_count live_qdisc_text live_class_text live_class_rows live_class_count
+    local -a args=()
+    if [[ "$root_handle" == 0: ]]; then
+        live_rows=$(tc qdisc show dev "$iface" 2>/dev/null | mq_child_replay_rows_from_stream) || return 1
+        if [[ "$(root_qdisc_kind "$iface" 2>/dev/null)" != mq ||
+              "$(root_qdisc_handle "$iface" 2>/dev/null)" != 0: || "$live_rows" != "$rows" ]]; then
+            tc qdisc del dev "$iface" root >/dev/null 2>&1 || return 1
+        fi
+        [[ "$(root_qdisc_kind "$iface" 2>/dev/null)" == mq && "$(root_qdisc_handle "$iface" 2>/dev/null)" == 0: ]] || return 1
+    else
+        replace_root_qdisc_snapshot "$iface" mq "$root_handle" >/dev/null 2>&1 || return 1
+        [[ "$(root_qdisc_kind "$iface" 2>/dev/null)" == mq && "$(root_qdisc_handle "$iface" 2>/dev/null)" == "$root_handle" ]] || return 1
+    fi
+    while IFS=$'\t' read -r parent kind handle args_string; do
+        [[ -n "$parent" && -n "$kind" ]] || continue
+        qdisc_handle_valid "$handle" || return 1
+        live_rows=$(tc qdisc show dev "$iface" 2>/dev/null | mq_child_replay_rows_from_stream) || return 1
+        live_row=$(awk -F'\t' -v parent="$parent" '$1==parent {print; exit}' <<< "$live_rows")
+        case "$kind" in
+            fq|fq_codel|pfifo_fast|pfifo|bfifo)
+                if [[ "$handle" == 0: ]]; then
+                    [[ "$live_row" == "$parent"$'\t'"$kind"$'\t'"$handle"$'\t'"$args_string" ]] || return 1
+                else
+                    args=(); [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
+                    replace_child_qdisc_snapshot "$iface" "$parent" "$kind" "$handle" "${args[@]}" >/dev/null 2>&1 || return 1
+                fi
+                ;;
+            noqueue)
+                [[ "$live_row" == "$parent"$'\t'"$kind"$'\t'"$handle"$'\t'"$args_string" ]] || return 1
+                ;;
+            *) return 2 ;;
+        esac
+        live_rows=$(tc qdisc show dev "$iface" 2>/dev/null | mq_child_replay_rows_from_stream) || return 1
+        live_row=$(awk -F'\t' -v parent="$parent" '$1==parent {print; exit}' <<< "$live_rows")
+        [[ "$live_row" == "$parent"$'\t'"$kind"$'\t'"$handle"$'\t'"$args_string" ]] || return 1
+    done <<< "$rows"
+    live_qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null) || return 1
+    [[ "$(root_qdisc_kind_from_stream <<< "$live_qdisc_text")" == mq &&
+       "$(root_qdisc_handle_from_stream <<< "$live_qdisc_text")" == "$root_handle" ]] || return 1
+    live_rows=$(mq_child_replay_rows_from_stream <<< "$live_qdisc_text") || return 1
+    live_count=$(mq_child_candidate_count_from_stream <<< "$live_qdisc_text") || return 1
+    mq_child_rows_validate "$live_rows" "$live_count" || return 1
+    [[ "$live_count" == "$expected_count" && "$live_rows" == "$rows" ]] || return 1
+    live_class_text=$(tc class show dev "$iface" 2>/dev/null) || return 1
+    live_class_rows=$(mq_class_replay_rows_from_stream <<< "$live_class_text") || return 1
+    live_class_count=$(mq_class_candidate_count_from_stream <<< "$live_class_text") || return 1
+    [[ "$live_class_count" == "$expected_count" ]] || return 1
+    mq_class_rows_validate "$live_rows" "$live_class_rows" "$root_handle" "$expected_count"
 }
 
 restore_mq_qdisc_snapshot() {
-    local iface="$1" file="$2" parent kind args_string
-    local -a args=()
-    tc qdisc replace dev "$iface" root mq >/dev/null 2>&1 || return 1
-    while IFS=$'\t' read -r parent kind args_string; do
-        [[ -n "$parent" && -n "$kind" ]] || continue
-        case "$kind" in
-            fq|fq_codel|pfifo_fast|pfifo|bfifo)
-                args=(); [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
-                tc qdisc replace dev "$iface" parent "$parent" "$kind" "${args[@]}" >/dev/null 2>&1 || return 1
-                ;;
-            noqueue) ;;
-            *) return 2 ;;
-        esac
-    done < <(mq_child_replay_rows_from_stream < "$file")
+    local iface="$1" file="$2" class_file="${3:-$2}" root_handle rows expected_count class_rows class_count zero_kind
+    local rc=0 restore_default_rc=0 default_guard=0
+    root_handle=$(root_qdisc_handle_from_stream < "$file")
+    qdisc_handle_valid "$root_handle" || return 1
+    rows=$(mq_child_replay_rows_from_stream < "$file") || return 1
+    expected_count=$(mq_child_candidate_count_from_stream < "$file") || return 1
+    mq_child_rows_validate "$rows" "$expected_count" || return 1
+    [[ -f "$class_file" && ! -L "$class_file" ]] || return 1
+    class_rows=$(mq_class_replay_rows_from_stream < "$class_file") || return 1
+    class_count=$(mq_class_candidate_count_from_stream < "$class_file") || return 1
+    [[ "$class_count" == "$expected_count" ]] || return 1
+    mq_class_rows_validate "$rows" "$class_rows" "$root_handle" "$expected_count" || return 1
+    # MQ owns exactly one child qdisc per TX queue. Queue-count drift makes the
+    # saved tree impossible to replay exactly, so reject it before root writes.
+    mq_tx_queue_count_matches "$iface" "$expected_count" || return 1
+    mq_qdisc_snapshot_matches "$iface" "$file" "$class_file" && return 0
+    zero_kind=$(mq_zero_handle_default_kind_from_rows "$rows") || return 1
+    if [[ -n "$zero_kind" ]]; then
+        qdisc_default_transaction_begin "$zero_kind" || return 1
+        default_guard=1
+    fi
+    restore_mq_qdisc_snapshot_replay "$iface" "$root_handle" "$rows" "$expected_count" || rc=$?
+    if (( default_guard )); then qdisc_default_transaction_restore || restore_default_rc=$?; fi
+    (( rc == 0 && restore_default_rc == 0 )) || return 1
+    mq_qdisc_snapshot_matches "$iface" "$file" "$class_file"
 }
 
-managed_htb() {
+qdisc_tree_selectors_from_stream() {
+    awk '
+        {
+            lines[NR]=$0
+            if($1=="qdisc" && $0~/ root([[:space:]]|$)/) {
+                roots++
+                if($3 ~ /^[[:xdigit:]]+:$/) root_handle=$3
+            }
+        }
+        END {
+            if(roots!=1 || root_handle=="") {print "!invalid-root"; exit}
+            root_major=root_handle; sub(/:$/, "", root_major)
+            print root_handle
+            for(n=1;n<=NR;n++) {
+                $0=lines[n]
+                if($1=="qdisc" && $0!~/ root([[:space:]]|$)/) {
+                    parent=""; for(i=1;i<=NF;i++) if($i=="parent") {parent=$(i+1); break}
+                    parent_major=parent; sub(/:.*/, "", parent_major)
+                    if(parent_major=="ffff") continue
+                    if(parent !~ /^([[:xdigit:]]+)?:[[:xdigit:]]+$/ || $3 !~ /^[[:xdigit:]]+:$/) {
+                        print "!invalid-qdisc"; continue
+                    }
+                    if(parent_major!="" && parent_major!=root_major) {
+                        print "!foreign-qdisc"; continue
+                    }
+                    print parent; print $3
+                } else if($1=="class") {
+                    classid=$3; class_major=classid; sub(/:.*/, "", class_major)
+                    if(class_major=="ffff") continue
+                    if(classid !~ /^([[:xdigit:]]+)?:[[:xdigit:]]+$/) {
+                        print "!invalid-class"; continue
+                    }
+                    if(class_major!="" && class_major!=root_major) {
+                        print "!foreign-class"; continue
+                    }
+                    print classid
+                }
+            }
+        }
+    '
+}
+
+qdisc_tree_filters_absent() {
+    local iface="$1" qdisc_text class_text selectors selector output
+    local -A seen=()
+    qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null) || return 2
+    class_text=$(tc class show dev "$iface" 2>/dev/null) || return 2
+    selectors=$(printf '%s\n%s\n' "$qdisc_text" "$class_text" | qdisc_tree_selectors_from_stream) || return 2
+    [[ -n "$selectors" ]] || return 2
+    while IFS= read -r selector; do
+        [[ -n "$selector" && "$selector" != !* ]] || return 2
+        seen["$selector"]=1
+    done <<< "$selectors"
+    for selector in "${!seen[@]}"; do
+        output=$(tc filter show dev "$iface" parent "$selector" 2>/dev/null) || return 2
+        [[ -z "$output" ]] || return 1
+    done
+    return 0
+}
+
+qdisc_filter_guard() {
+    local iface="$1" rc=0
+    qdisc_tree_filters_absent "$iface" || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1) die "拒绝覆盖带外部 tc filter 的 root qdisc 树（$iface）；请先自行移除 filter" ;;
+        *) die "无法完整审计 $iface 的 root qdisc filter；拒绝修改" ;;
+    esac
+}
+
+managed_htb_topology_from_stream() {
+    awk '
+        $1=="qdisc" && $0~/ root([[:space:]]|$)/ {
+            roots++
+            default_count=0; default_value=""
+            for(i=1;i<=NF;i++) if($i=="default") {
+                default_count++; default_value=tolower($(i+1))
+            }
+            if($2=="htb" && $3=="1:" && default_count==1 &&
+               (default_value=="10" || default_value=="0x10")) expected_root++
+        }
+        $1=="qdisc" && $0!~/ root([[:space:]]|$)/ {
+            parent=""; for(i=1;i<=NF;i++) if($i=="parent") {parent=$(i+1); break}
+            if(parent ~ /^1:/) {
+                qtree++; if($2=="fq" && $3=="10:" && parent=="1:10") expected_leaf++
+            }
+        }
+        $1=="class" && $3 ~ /^1:/ {
+            ctree++
+            if($2=="htb" && $3=="1:10" && ($4=="root" || ($4=="parent" && $5=="1:"))) expected++
+        }
+        END {
+            exit !(roots==1 && expected_root==1 && qtree==1 && expected_leaf==1 && ctree==1 && expected==1)
+        }
+    '
+}
+
+managed_htb_topology() {
     local iface="$1" qdisc_text class_text
     qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null) || return 1
     class_text=$(tc class show dev "$iface" 2>/dev/null) || return 1
-    grep -Eq '^qdisc htb 1: root([[:space:]]|$)' <<< "$qdisc_text" &&
-        grep -Eq '^class htb 1:10 (root|parent 1:)' <<< "$class_text" &&
-        grep -Eq '^qdisc fq 10: parent 1:10([[:space:]]|$)' <<< "$qdisc_text"
+    printf '%s\n%s\n' "$qdisc_text" "$class_text" | managed_htb_topology_from_stream
+}
+
+managed_htb() {
+    local iface="$1" values rate ceil
+    managed_htb_topology "$iface" && qdisc_tree_filters_absent "$iface" || return 1
+    values=$(managed_rate_ceil_bps "$iface") || return 1
+    IFS=$'\t' read -r rate ceil <<< "$values"
+    is_uint "$rate" && is_uint "$ceil" && (( rate > 0 && rate == ceil ))
 }
 
 managed_htb_interfaces() {
@@ -2174,9 +2742,12 @@ managed_htb_interfaces_strict() {
             die "无法读取 $iface 的 class；不能证明不存在遗留 HTB"
             return 1
         }
-        if grep -Eq '^qdisc htb 1: root([[:space:]]|$)' <<< "$qdisc_text" &&
-           grep -Eq '^class htb 1:10 (root|parent 1:)' <<< "$class_text" &&
-           grep -Eq '^qdisc fq 10: parent 1:10([[:space:]]|$)' <<< "$qdisc_text"; then
+        if grep -Eq '^qdisc htb 1: root([[:space:]]|$)|^qdisc fq 10: parent 1:10([[:space:]]|$)' <<< "$qdisc_text" ||
+           grep -Eq '^class htb 1:10 (root|parent 1:)' <<< "$class_text"; then
+            managed_htb "$iface" || {
+                die "检测到 $iface 的项目 HTB 形态已被外部 class/qdisc/filter 扩展或损坏；拒绝继续"
+                return 1
+            }
             printf '%s\n' "$iface"
         fi
     done
@@ -2297,35 +2868,92 @@ shaping_target_preflight() {
     fi
 }
 
-managed_htb_root() {
-    local text
-    text=$(tc qdisc show dev "$1" 2>/dev/null) || return 1
-    grep -Eq '^qdisc htb 1: root([[:space:]]|$)' <<< "$text"
-}
-
 managed_fq_leaf() {
     local text
     text=$(tc qdisc show dev "$1" 2>/dev/null) || return 1
     grep -Eq '^qdisc fq 10: parent 1:10([[:space:]]|$)' <<< "$text"
 }
 
-managed_rate_mbit() {
-    local iface="$1" text token
-    text=$(tc class show dev "$iface" 2>/dev/null) || return 1
-    token=$(awk '$1=="class" && $2=="htb" && $3=="1:10" {for(i=1;i<=NF;i++) if($i=="rate") {print $(i+1); exit}}' <<< "$text")
-    awk -v r="$token" 'BEGIN {
-        if (r ~ /Tbit$/) {sub(/Tbit$/, "", r); printf "%.0f\n", r*1000000}
-        else if (r ~ /Gbit$/) {sub(/Gbit$/, "", r); printf "%.0f\n", r*1000}
-        else if (r ~ /Mbit$/) {sub(/Mbit$/, "", r); printf "%.0f\n", r}
-        else if (r ~ /Kbit$/) {sub(/Kbit$/, "", r); printf "%.0f\n", r/1000}
+managed_rate_ceil_bps_from_stream() {
+    awk '
+        function to_bps(token, factor) {
+            if(token ~ /^[0-9]+([.][0-9]+)?Tbit$/) {sub(/Tbit$/, "", token); factor=1000000000000}
+            else if(token ~ /^[0-9]+([.][0-9]+)?Gbit$/) {sub(/Gbit$/, "", token); factor=1000000000}
+            else if(token ~ /^[0-9]+([.][0-9]+)?Mbit$/) {sub(/Mbit$/, "", token); factor=1000000}
+            else if(token ~ /^[0-9]+([.][0-9]+)?Kbit$/) {sub(/Kbit$/, "", token); factor=1000}
+            else if(token ~ /^[0-9]+([.][0-9]+)?bit$/) {sub(/bit$/, "", token); factor=1}
+            else return -1
+            return token*factor
+        }
+        $1=="class" && $2=="htb" && $3=="1:10" {
+            for(i=1;i<=NF;i++) {
+                if($i=="rate") rate_token=$(i+1)
+                if($i=="ceil") ceil_token=$(i+1)
+            }
+        }
+        END {
+            rate=to_bps(rate_token); ceil=to_bps(ceil_token)
+            if(rate<0 || ceil<0) exit 1
+            printf "%.0f\t%.0f\n", rate, ceil
+        }
+    '
+}
+
+rate_bps_to_mbit_text() {
+    is_uint "${1:-}" || return 1
+    awk -v b="$1" 'BEGIN {
+        value=b/1000000
+        if(value==int(value)) {printf "%.0f\n", value; exit}
+        text=sprintf("%.6f", value)
+        sub(/0+$/, "", text); sub(/[.]$/, "", text)
+        print text
     }'
+}
+
+managed_rate_ceil_mbit_from_stream() {
+    local values rate_bps ceil_bps rate_mbit ceil_mbit
+    values=$(managed_rate_ceil_bps_from_stream) || return 1
+    IFS=$'\t' read -r rate_bps ceil_bps <<< "$values"
+    rate_mbit=$(rate_bps_to_mbit_text "$rate_bps") || return 1
+    ceil_mbit=$(rate_bps_to_mbit_text "$ceil_bps") || return 1
+    printf '%s\t%s\n' "$rate_mbit" "$ceil_mbit"
+}
+
+managed_rate_mbit_from_stream() {
+    local values
+    values=$(managed_rate_ceil_mbit_from_stream) || return 1
+    printf '%s\n' "${values%%$'\t'*}"
+}
+
+managed_rate_ceil_mbit() {
+    local iface="$1" text
+    text=$(tc class show dev "$iface" 2>/dev/null) || return 1
+    managed_rate_ceil_mbit_from_stream <<< "$text"
+}
+
+managed_rate_ceil_bps() {
+    local iface="$1" text
+    text=$(tc class show dev "$iface" 2>/dev/null) || return 1
+    managed_rate_ceil_bps_from_stream <<< "$text"
+}
+
+managed_rate_bps() {
+    local values
+    values=$(managed_rate_ceil_bps "$1") || return 1
+    printf '%s\n' "${values%%$'\t'*}"
+}
+
+managed_rate_mbit() {
+    local iface="$1" text
+    text=$(tc class show dev "$iface" 2>/dev/null) || return 1
+    managed_rate_mbit_from_stream <<< "$text"
 }
 
 session_owned_htb() {
     local iface="$1" rate
     [[ -n "$TC_SESSION_HTB_IFACE" && "$TC_SESSION_HTB_IFACE" == "$iface" ]] || return 1
-    managed_htb_root "$iface" || return 1
-    rate=$(managed_rate_mbit "$iface") || return 1
+    managed_htb "$iface" || return 1
+    rate=$(managed_rate_bps "$iface") || return 1
     is_uint "$rate" && (( rate > 0 ))
 }
 
@@ -2342,13 +2970,31 @@ managed_htb_diagnostic() {
 }
 
 qdisc_guard() {
-    local iface="$1" kind detail unsupported
+    local iface="$1" kind detail unsupported qdisc_text class_text rows class_rows expected_count class_count handle
     kind=$(root_qdisc_kind "$iface") || { die "无法读取 $iface 的 root qdisc"; return 1; }
+    qdisc_filter_guard "$iface" || return 1
     if managed_htb "$iface" || session_owned_htb "$iface"; then return 0; fi
     case "$kind" in
         ""|fq|fq_codel|noqueue|pfifo_fast) return 0 ;;
         mq)
-            unsupported=$(mq_unsupported_child_qdiscs "$iface")
+            qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null) || { die "无法完整读取 $iface 的 mq"; return 1; }
+            class_text=$(tc class show dev "$iface" 2>/dev/null) || { die "无法完整读取 $iface 的 mq class"; return 1; }
+            handle=$(root_qdisc_handle_from_stream <<< "$qdisc_text")
+            qdisc_handle_valid "$handle" || { die "$iface 的 mq root handle 非法"; return 1; }
+            rows=$(mq_child_replay_rows_from_stream <<< "$qdisc_text") || return 1
+            expected_count=$(mq_child_candidate_count_from_stream <<< "$qdisc_text") || return 1
+            mq_child_rows_validate "$rows" "$expected_count" || { die "$iface 的 mq 子队列不完整、重复或格式非法"; return 1; }
+            mq_tx_queue_count_matches "$iface" "$expected_count" || {
+                die "$iface 的 mq 子队列数与当前 TX queue 数不一致"
+                return 1
+            }
+            class_rows=$(mq_class_replay_rows_from_stream <<< "$class_text") || return 1
+            class_count=$(mq_class_candidate_count_from_stream <<< "$class_text") || return 1
+            [[ "$class_count" == "$expected_count" ]] && mq_class_rows_validate "$rows" "$class_rows" "$handle" "$expected_count" || {
+                die "$iface 的 mq class 与 qdisc 子队列不一致"
+                return 1
+            }
+            unsupported=$(awk -F'\t' '$2!="fq" && $2!="fq_codel" && $2!="pfifo_fast" && $2!="pfifo" && $2!="bfifo" && $2!="noqueue" {print $2 "@" $1}' <<< "$rows")
             if [[ -n "$unsupported" ]]; then
                 die "拒绝覆盖含不可安全重放子队列的 mq（$iface；$unsupported）"
                 return 1
@@ -2369,21 +3015,25 @@ qdisc_guard() {
 
 action_qdisc_snapshot() {
     local iface="$1" file="$2" kind rate="" replay_args_string=""
+    qdisc_filter_guard "$iface" || return 1
     kind=$(root_qdisc_kind "$iface") || return 1
     if managed_htb "$iface" || session_owned_htb "$iface"; then
         kind="managed-htb"
         rate=$(managed_rate_mbit "$iface") || return 1
     fi
-    [[ "$kind" == fq || "$kind" == fq_codel ]] && replay_args_string=$(root_qdisc_replay_args "$iface")
+    case "$kind" in managed-htb|fq|fq_codel|mq|noqueue|pfifo_fast) ;; *) return 1 ;; esac
+    [[ "$kind" == fq || "$kind" == fq_codel || "$kind" == pfifo_fast ]] && replay_args_string=$(root_qdisc_replay_args "$iface")
     printf 'KIND\t%s\nRATE\t%s\nARGS\t%s\n' "$kind" "$rate" "$replay_args_string" > "$file" || return 1
-    tc qdisc show dev "$iface" >> "$file" 2>/dev/null || true
-    tc class show dev "$iface" >> "$file" 2>/dev/null || true
+    tc qdisc show dev "$iface" >> "$file" 2>/dev/null || return 1
+    tc class show dev "$iface" >> "$file" 2>/dev/null || return 1
+    action_qdisc_snapshot_validate "$file" || return 1
+    [[ "$kind" != mq ]] || mq_snapshot_queue_preflight "$iface" "$file"
 }
 
 snapshot_field() { awk -F'\t' -v key="$2" '$1==key {print $2; exit}' "$1"; }
 
 action_qdisc_snapshot_validate() {
-    local file="$1" kind rate args extra
+    local file="$1" kind rate args extra root_count root_kind handle rows expected_count raw_args class_rows class_count raw_rate
     local -a snapshot_header=()
     [[ -f "$file" && ! -L "$file" ]] || return 1
     mapfile -t snapshot_header < <(head -n 3 "$file") || return 1
@@ -2392,12 +3042,45 @@ action_qdisc_snapshot_validate() {
     [[ "${snapshot_header[1]}" == RATE$'\t'* && "${snapshot_header[1]#*$'\t'}" != *$'\t'* ]] || return 1
     [[ "${snapshot_header[2]}" == ARGS$'\t'* && "${snapshot_header[2]#*$'\t'}" != *$'\t'* ]] || return 1
     kind="${snapshot_header[0]#*$'\t'}"; rate="${snapshot_header[1]#*$'\t'}"; args="${snapshot_header[2]#*$'\t'}"
+    root_count=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {count++} END {print count+0}' "$file") || return 1
+    root_kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$file")
     case "$kind" in
         managed-htb)
             is_uint "$rate" && (( rate > 0 && rate <= 1000000 )) && [[ -z "$args" ]] || return 1
+            managed_htb_topology_from_stream < "$file" || return 1
+            raw_rate=$(managed_rate_mbit_from_stream < "$file") || return 1
+            [[ "$raw_rate" == "$rate" ]] || return 1
             ;;
-        fq|fq_codel) [[ -z "$rate" ]] || return 1 ;;
-        ""|mq|noqueue|pfifo_fast) [[ -z "$rate" && -z "$args" ]] || return 1 ;;
+        fq|fq_codel|pfifo_fast)
+            [[ -z "$rate" ]] || return 1
+            (( root_count == 1 )) && [[ "$root_kind" == "$kind" ]] || return 1
+            handle=$(root_qdisc_handle_from_stream < "$file")
+            qdisc_handle_valid "$handle" || return 1
+            raw_args=$(qdisc_replay_args_from_stream < "$file") || return 1
+            [[ "$raw_args" == "$args" ]] || return 1
+            ;;
+        mq)
+            [[ -z "$rate" && -z "$args" ]] || return 1
+            (( root_count == 1 )) && [[ "$root_kind" == mq ]] || return 1
+            handle=$(root_qdisc_handle_from_stream < "$file")
+            qdisc_handle_valid "$handle" || return 1
+            rows=$(mq_child_replay_rows_from_stream < "$file") || return 1
+            expected_count=$(mq_child_candidate_count_from_stream < "$file") || return 1
+            mq_child_rows_validate "$rows" "$expected_count" || return 1
+            class_rows=$(mq_class_replay_rows_from_stream < "$file") || return 1
+            class_count=$(mq_class_candidate_count_from_stream < "$file") || return 1
+            [[ "$class_count" == "$expected_count" ]] || return 1
+            mq_class_rows_validate "$rows" "$class_rows" "$handle" "$expected_count" || return 1
+            ;;
+        noqueue)
+            [[ -z "$rate" && -z "$args" ]] || return 1
+            (( root_count == 1 )) && [[ "$root_kind" == noqueue ]] || return 1
+            handle=$(root_qdisc_handle_from_stream < "$file")
+            qdisc_handle_valid "$handle" || return 1
+            ;;
+        "")
+            [[ -z "$rate" && -z "$args" ]] && (( root_count == 0 )) || return 1
+            ;;
         *) return 1 ;;
     esac
     extra=$(awk -F'\t' '$1=="KIND" || $1=="RATE" || $1=="ARGS" {count++} END {print count+0}' "$file") || return 1
@@ -2405,17 +3088,17 @@ action_qdisc_snapshot_validate() {
 }
 
 restore_action_qdisc() {
-    local iface="$1" file="$2" kind rate args_string
-    local -a args=()
+    local iface="$1" file="$2" kind rate args_string handle
     action_qdisc_snapshot_validate "$file" || { die "qdisc 操作快照格式非法: $file"; return 1; }
+    qdisc_filter_guard "$iface" || return 1
     kind=$(snapshot_field "$file" KIND)
     rate=$(snapshot_field "$file" RATE)
     args_string=$(snapshot_field "$file" ARGS)
-    [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
+    handle=$(root_qdisc_handle_from_stream < "$file")
     case "$kind" in
         managed-htb) _apply_shaping_raw "$iface" "$rate" ;;
-        fq|fq_codel)
-            if tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null 2>&1 || tc qdisc replace dev "$iface" root "$kind" >/dev/null; then
+        fq|fq_codel|pfifo_fast)
+            if restore_classless_root_snapshot "$iface" "$kind" "$handle" "$args_string"; then
                 if [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]]; then TC_SESSION_HTB_IFACE=""; fi
             else return 1
             fi
@@ -2424,8 +3107,13 @@ restore_action_qdisc() {
             restore_mq_qdisc_snapshot "$iface" "$file" || return 1
             if [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]]; then TC_SESSION_HTB_IFACE=""; fi
             ;;
-        ""|noqueue|pfifo_fast)
+        ""|noqueue)
             tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
+            if [[ "$kind" == noqueue ]]; then
+                root_qdisc_snapshot_matches "$iface" noqueue "$handle" "" || return 1
+            else
+                [[ -z "$(root_qdisc_kind "$iface")" ]] || return 1
+            fi
             if [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]]; then TC_SESSION_HTB_IFACE=""; fi
             ;;
         *) die "无法安全恢复 qdisc 类型: $kind" ;;
@@ -2433,15 +3121,25 @@ restore_action_qdisc() {
 }
 
 restore_qdisc_text_snapshot() {
-    local iface="$1" file="$2" kind args_string
-    local -a args=()
+    local iface="$1" file="$2" kind args_string handle class_file
     kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$file" 2>/dev/null)
+    qdisc_filter_guard "$iface" || return 1
+    handle=$(root_qdisc_handle_from_stream < "$file")
     args_string=$(qdisc_replay_args_from_stream < "$file")
-    [[ -n "$args_string" ]] && read -r -a args <<< "$args_string"
     case "$kind" in
-        fq|fq_codel) tc qdisc replace dev "$iface" root "$kind" "${args[@]}" >/dev/null 2>&1 || tc qdisc replace dev "$iface" root "$kind" ;;
-        mq) restore_mq_qdisc_snapshot "$iface" "$file" ;;
-        ""|noqueue|pfifo_fast) tc qdisc del dev "$iface" root 2>/dev/null || true ;;
+        fq|fq_codel|pfifo_fast) restore_classless_root_snapshot "$iface" "$kind" "$handle" "$args_string" ;;
+        mq)
+            class_file="$(dirname "$file")/class.txt"
+            restore_mq_qdisc_snapshot "$iface" "$file" "$class_file"
+            ;;
+        ""|noqueue)
+            tc qdisc del dev "$iface" root 2>/dev/null || true
+            if [[ "$kind" == noqueue ]]; then
+                root_qdisc_snapshot_matches "$iface" noqueue "$handle" ""
+            else
+                [[ -z "$(root_qdisc_kind "$iface")" ]]
+            fi
+            ;;
         *) return 2 ;;
     esac
 }
@@ -2480,8 +3178,25 @@ calc_htb_quantum() {
 }
 
 verify_shaping() {
-    local iface="$1"
+    local iface="$1" expected_rate="${2:-}" values actual_rate actual_ceil expected_bps display_values display_rate display_ceil
     managed_htb "$iface" || { die "HTB -> FQ 层级验证失败: $iface"; return 1; }
+    values=$(managed_rate_ceil_bps "$iface") || { die "HTB rate/ceil 无法解析: $iface"; return 1; }
+    IFS=$'\t' read -r actual_rate actual_ceil <<< "$values"
+    if [[ "$actual_rate" != "$actual_ceil" ]]; then
+        display_values=$(managed_rate_ceil_mbit "$iface" 2>/dev/null || true)
+        IFS=$'\t' read -r display_rate display_ceil <<< "$display_values"
+        die "HTB rate/ceil 不一致: $iface (${display_rate:-unknown}/${display_ceil:-unknown} Mbit)"
+        return 1
+    fi
+    if [[ -n "$expected_rate" ]]; then
+        is_uint "$expected_rate" || { die "非法期望整形速率: $expected_rate"; return 1; }
+        expected_bps=$((expected_rate * 1000000))
+    fi
+    if [[ -n "$expected_rate" && "$actual_rate" != "$expected_bps" ]]; then
+        display_rate=$(rate_bps_to_mbit_text "$actual_rate" 2>/dev/null || printf 'unknown')
+        die "HTB 速率漂移: $iface（当前 ${display_rate} Mbit，期望 ${expected_rate} Mbit）"
+        return 1
+    fi
 }
 
 _apply_shaping_raw() {
@@ -2506,33 +3221,41 @@ _apply_shaping_raw() {
     if ! managed_fq_leaf "$iface"; then
         tc qdisc replace dev "$iface" parent 1:10 handle 10: fq || return 1
     fi
-    verify_shaping "$iface" || return 1
+    verify_shaping "$iface" "$rate" || return 1
     TC_SESSION_HTB_IFACE="$iface"
 }
 
 apply_shaping() {
-    local iface="$1" rate="$2" snapshot
+    local iface="$1" rate="$2" snapshot rollback_rc=0
     tc_dependencies || return 1; qdisc_guard "$iface" || return 1
     snapshot=$(mktemp) || return 1
     action_qdisc_snapshot "$iface" "$snapshot" || { rm -f -- "$snapshot"; return 1; }
     if ! _apply_shaping_raw "$iface" "$rate"; then
         log ERR "应用 ${rate} Mbit 整形失败，正在恢复操作前 qdisc"
-        restore_action_qdisc "$iface" "$snapshot" || true
-        rm -f -- "$snapshot"
+        restore_action_qdisc "$iface" "$snapshot" || rollback_rc=$?
+        if (( rollback_rc == 0 )); then
+            rm -f -- "$snapshot"
+        else
+            log ERR "整形失败且 qdisc 回滚不完整；快照保留在 $snapshot，请人工检查"
+        fi
         return 1
     fi
     rm -f -- "$snapshot"
 }
 
 apply_fq() {
-    local iface="$1" snapshot
+    local iface="$1" snapshot rollback_rc=0
     tc_dependencies || return 1; qdisc_guard "$iface" || return 1; qdisc_module_hint fq
     snapshot=$(mktemp) || return 1
     action_qdisc_snapshot "$iface" "$snapshot" || { rm -f -- "$snapshot"; return 1; }
     if ! tc qdisc replace dev "$iface" root fq || [[ "$(root_qdisc_kind "$iface")" != fq ]]; then
-        restore_action_qdisc "$iface" "$snapshot" || true
-        rm -f -- "$snapshot"
-        die "root FQ 应用失败"
+        restore_action_qdisc "$iface" "$snapshot" || rollback_rc=$?
+        if (( rollback_rc == 0 )); then
+            rm -f -- "$snapshot"
+            die "root FQ 应用失败，已恢复操作前 qdisc"
+        else
+            die "root FQ 应用失败且 qdisc 回滚不完整；快照保留在 $snapshot，请人工检查"
+        fi
         return 1
     fi
     [[ "$TC_SESSION_HTB_IFACE" == "$iface" ]] && TC_SESSION_HTB_IFACE=""
@@ -2701,6 +3424,11 @@ NIC_POLICY_SCHEMA="1"
 NIC_POLICY_FORMAT="bbrv3-lite-nic-policy"
 NIC_BASELINE_SCHEMA="1"
 NIC_BASELINE_FORMAT="bbrv3-lite-nic-baseline"
+NIC_RUNTIME_TRANSACTION_DIR=""
+NIC_RUNTIME_TRANSACTION_PARENT=""
+NIC_RUNTIME_TRANSACTION_MUTATED=0
+NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+NIC_RUNTIME_TRANSACTION_READY=0
 
 nic_policy_reset_record() {
     NIC_POLICY_INTERFACE=""
@@ -2769,15 +3497,23 @@ nic_policy_manifest_validate() {
 }
 
 nic_policy_directory_entries_validate() {
-    local entry name
-    while IFS= read -r -d '' entry; do
+    local entry name had_nullglob=0 had_dotglob=0
+    local -a entries=()
+    [[ -d "$NIC_POLICY_DIR" && ! -L "$NIC_POLICY_DIR" && -r "$NIC_POLICY_DIR" && -x "$NIC_POLICY_DIR" ]] || return 1
+    shopt -q nullglob && had_nullglob=1
+    shopt -q dotglob && had_dotglob=1
+    shopt -s nullglob dotglob
+    entries=("$NIC_POLICY_DIR"/*)
+    (( had_nullglob )) || shopt -u nullglob
+    (( had_dotglob )) || shopt -u dotglob
+    for entry in "${entries[@]}"; do
         name="${entry##*/}"
         case "$name" in
             .manifest) [[ -f "$entry" && ! -L "$entry" ]] || { die "网卡策略清单类型非法: $entry"; return 1; } ;;
             *.conf) [[ -f "$entry" && ! -L "$entry" ]] || { die "网卡策略必须是非符号链接常规文件: $entry"; return 1; } ;;
             *) die "多网卡策略目录含未知条目: $entry"; return 1 ;;
         esac
-    done < <(find "$NIC_POLICY_DIR" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    done
 }
 
 nic_policy_layout_state() {
@@ -2812,6 +3548,18 @@ nic_policy_files() {
         [[ -f "$file" && ! -L "$file" ]] || continue
         printf '%s\n' "$file"
     done | LC_ALL=C sort
+}
+
+# Buffer the producer before exposing any path to a caller.  In particular, a
+# glob/sort/read failure must not leak a valid-looking prefix that a process
+# substitution could mistake for the complete policy set.
+nic_policy_files_checked() {
+    local files
+    if ! files=$(nic_policy_files); then
+        die "无法完整枚举多网卡策略；拒绝使用不完整策略集合"
+        return 1
+    fi
+    [[ -z "$files" ]] || printf '%s\n' "$files"
 }
 
 nic_policy_load_file() {
@@ -2869,8 +3617,8 @@ nic_policy_load_file() {
 nic_policy_path() { printf '%s/%s.conf\n' "$NIC_POLICY_DIR" "$1"; }
 nic_policy_exists() { [[ -f "$(nic_policy_path "$1")" && ! -L "$(nic_policy_path "$1")" ]]; }
 
-nic_policy_set_validate() {
-    local state file count=0
+nic_policy_set_validate_files() {
+    local files="$1" state file count=0
     state=$(nic_policy_layout_state)
     [[ "$state" == managed ]] || { die "多网卡模式需要有效策略目录，当前: $state"; return 1; }
     nic_policy_directory_entries_validate || return 1
@@ -2878,8 +3626,14 @@ nic_policy_set_validate() {
         [[ -n "$file" ]] || continue
         nic_policy_load_file "$file" || return 1
         ((count+=1))
-    done < <(nic_policy_files)
+    done <<< "$files"
     return 0
+}
+
+nic_policy_set_validate() {
+    local files
+    files=$(nic_policy_files_checked) || return 1
+    nic_policy_set_validate_files "$files"
 }
 
 nic_policy_write() {
@@ -2917,12 +3671,14 @@ nic_policy_remove() {
 }
 
 nic_policy_interface_list() {
-    local file
+    local files file interfaces=""
+    files=$(nic_policy_files_checked) || return 1
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         nic_policy_load_file "$file" >/dev/null || return 1
-        printf '%s\n' "$NIC_POLICY_INTERFACE"
-    done < <(nic_policy_files)
+        interfaces+="${interfaces:+$'\n'}$NIC_POLICY_INTERFACE"
+    done <<< "$files"
+    [[ -z "$interfaces" ]] || printf '%s\n' "$interfaces"
 }
 
 nic_policy_validate_identity() {
@@ -2975,27 +3731,47 @@ nic_aggregate_model_rows() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$profile" "$role" "$bandwidth" "$rtt" "$iface"
 }
 
-nic_policy_model_rows() {
-    local excluded="${1:-}" file
+nic_policy_model_rows_files() {
+    local excluded="$1" files="$2" file rows=""
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         nic_policy_load_file "$file" >/dev/null || return 1
         [[ -z "$excluded" || "$NIC_POLICY_INTERFACE" != "$excluded" ]] || continue
-        printf '%s\t%s\t%s\t%s\t%s\n' "$NIC_POLICY_PROFILE" "$NIC_POLICY_ROLE" "$NIC_POLICY_BANDWIDTH_MBIT" "$NIC_POLICY_RTT_MS" "$NIC_POLICY_INTERFACE"
-    done < <(nic_policy_files)
+        rows+="${rows:+$'\n'}${NIC_POLICY_PROFILE}"$'\t'"${NIC_POLICY_ROLE}"$'\t'"${NIC_POLICY_BANDWIDTH_MBIT}"$'\t'"${NIC_POLICY_RTT_MS}"$'\t'"${NIC_POLICY_INTERFACE}"
+    done <<< "$files"
+    [[ -z "$rows" ]] || printf '%s\n' "$rows"
 }
 
-nic_policy_global_model() {
-    local rows
-    nic_policy_set_validate || return 1
-    rows=$(nic_policy_model_rows) || return 1
+nic_policy_model_rows() {
+    local excluded="${1:-}" files
+    files=$(nic_policy_files_checked) || return 1
+    nic_policy_model_rows_files "$excluded" "$files"
+}
+
+nic_policy_global_model_files() {
+    local files="$1" rows
+    nic_policy_set_validate_files "$files" || return 1
+    rows=$(nic_policy_model_rows_files "" "$files") || return 1
     nic_aggregate_model_rows <<< "$rows"
 }
 
+nic_policy_global_model() {
+    local files
+    files=$(nic_policy_files_checked) || return 1
+    nic_policy_global_model_files "$files"
+}
+
 nic_policy_candidate_global_model() {
-    local target="$1" profile="$2" role="$3" bandwidth="$4" rtt="$5" rows legacy_rtt
-    case "$(nic_policy_layout_state)" in managed) nic_policy_set_validate || return 1 ;; absent) ;; *) return 1 ;; esac
-    rows=$(nic_policy_model_rows "$target") || return 1
+    local target="$1" profile="$2" role="$3" bandwidth="$4" rtt="$5" rows legacy_rtt files=""
+    case "$(nic_policy_layout_state)" in
+        managed)
+            files=$(nic_policy_files_checked) || return 1
+            nic_policy_set_validate_files "$files" || return 1
+            ;;
+        absent) ;;
+        *) return 1 ;;
+    esac
+    rows=$(nic_policy_model_rows_files "$target" "$files") || return 1
     if (( ${MULTI_NIC_ENABLED:-0} == 0 )) && [[ "${TC_INTERFACE:-auto}" != auto && "${TC_INTERFACE:-auto}" != "$target" ]]; then
         legacy_rtt="$RTT_MS"
         if [[ "$SYSCTL_PROFILE" == balanced ]] && (( BANDWIDTH_MBIT == 0 )); then legacy_rtt=0; fi
@@ -3046,9 +3822,9 @@ nic_sync_global_model() {
     IFS=$'\t' read -r SYSCTL_PROFILE ROLE BANDWIDTH_MBIT RTT_MS NIC_MODEL_INTERFACE <<< "$values"
 }
 
-nic_global_model_verify() {
-    local values expected_profile expected_role expected_bandwidth expected_rtt expected_iface
-    values=$(nic_policy_global_model) || return 1
+nic_global_model_verify_files() {
+    local files="$1" values expected_profile expected_role expected_bandwidth expected_rtt expected_iface
+    values=$(nic_policy_global_model_files "$files") || return 1
     IFS=$'\t' read -r expected_profile expected_role expected_bandwidth expected_rtt expected_iface <<< "$values"
     NIC_MODEL_INTERFACE="$expected_iface"
     [[ "$SYSCTL_PROFILE" == "$expected_profile" && "$ROLE" == "$expected_role" &&
@@ -3056,6 +3832,12 @@ nic_global_model_verify() {
         die "全局 TCP 模型与多网卡策略不一致：当前 $SYSCTL_PROFILE/$ROLE/$BANDWIDTH_MBIT/$RTT_MS，期望 $expected_profile/$expected_role/$expected_bandwidth/$expected_rtt"
         return 1
     }
+}
+
+nic_global_model_verify() {
+    local files
+    files=$(nic_policy_files_checked) || return 1
+    nic_global_model_verify_files "$files"
 }
 
 nic_reset_legacy_tc_fields() {
@@ -3134,13 +3916,6 @@ nic_baseline_capture() {
         return
     fi
     nic_require_manageable "$iface" || return 1
-    ensure_state_layout || return 1
-    if [[ -e "$NIC_STATE_DIR" || -L "$NIC_STATE_DIR" ]]; then
-        [[ -d "$NIC_STATE_DIR" && ! -L "$NIC_STATE_DIR" ]] || { die "网卡基线根目录类型不安全: $NIC_STATE_DIR"; return 1; }
-    else
-        mkdir -p -- "$NIC_STATE_DIR" || return 1
-    fi
-    chmod 0700 "$NIC_STATE_DIR" 2>/dev/null || true
     if [[ -e "$BASELINE_DIR" || -L "$BASELINE_DIR" ]] && tcp_baseline_validate "$BASELINE_DIR" >/dev/null 2>&1 &&
        [[ "$TCP_BASELINE_VALIDATED_INTERFACE" == "$iface" && "$TCP_BASELINE_VALIDATED_PROVENANCE" != legacy-reference ]]; then
         source=global
@@ -3152,6 +3927,13 @@ nic_baseline_capture() {
         die "拒绝把没有策略或旧配置归属的 HTB 采用为 $iface 原始基线"
         return 1
     fi
+    ensure_state_layout || return 1
+    if [[ -e "$NIC_STATE_DIR" || -L "$NIC_STATE_DIR" ]]; then
+        [[ -d "$NIC_STATE_DIR" && ! -L "$NIC_STATE_DIR" ]] || { die "网卡基线根目录类型不安全: $NIC_STATE_DIR"; return 1; }
+    else
+        mkdir -p -- "$NIC_STATE_DIR" || return 1
+    fi
+    chmod 0700 "$NIC_STATE_DIR" 2>/dev/null || true
     temp=$(mktemp -d "${STATE_DIR}/.nic-baseline.XXXXXX") || return 1
     mac=$(nic_current_mac "$iface")
     printf 'SCHEMA\t%s\nFORMAT\t%s\nINTERFACE\t%s\nMATCH_MAC\t%s\nSOURCE\t%s\nCREATED_AT\t%s\nCREATED_BY\t%s\n' \
@@ -3184,23 +3966,25 @@ nic_baseline_restore() {
 }
 
 nic_restore_secondary_baselines() {
-    local iface source rc=0
+    local iface source rc=0 interfaces
     [[ "$(nic_policy_layout_state)" == managed ]] || return 0
     nic_policy_set_validate || return 1
+    interfaces=$(nic_policy_interface_list) || return 1
     while IFS= read -r iface; do
         [[ -n "$iface" ]] || continue
         nic_baseline_validate "$iface" || { rc=1; continue; }
         source=$(awk -F'\t' '$1=="SOURCE" {print $2}' "$(nic_baseline_dir "$iface")/manifest")
         [[ "$source" == snapshot ]] || continue
         nic_baseline_restore "$iface" || rc=1
-    done < <(nic_policy_interface_list)
+    done <<< "$interfaces"
     return "$rc"
 }
 
 nic_restore_preflight() {
-    local state iface dir
+    local state iface dir source interfaces
     state=$(nic_policy_layout_state)
     case "$state" in absent) return 0 ;; managed) nic_policy_set_validate || return 1 ;; *) die "多网卡策略目录损坏，恢复尚未开始"; return 1 ;; esac
+    interfaces=$(nic_policy_interface_list) || return 1
     while IFS= read -r iface; do
         [[ -n "$iface" ]] || continue
         dir=$(nic_baseline_dir "$iface")
@@ -3211,7 +3995,13 @@ nic_restore_preflight() {
             die "无法读取 $iface 的 qdisc/class，恢复尚未开始"
             return 1
         }
-    done < <(nic_policy_interface_list)
+        qdisc_filter_guard "$iface" || return 1
+        source=$(awk -F'\t' '$1=="SOURCE" {print $2}' "$dir/manifest")
+        if [[ "$source" == snapshot ]] && ! mq_snapshot_queue_preflight "$iface" "$dir/qdisc.snapshot"; then
+            die "$iface 的 MQ 基线与当前 TX queue 数不一致，恢复尚未开始"
+            return 1
+        fi
+    done <<< "$interfaces"
 }
 
 nic_policy_remove_tree() {
@@ -3254,21 +4044,15 @@ nic_finalize_multi_config() {
     nic_sync_global_model || return 1
 }
 
-nic_policy_ownership_preflight() {
-    local target="${1:-}" file iface managed policies=""
-    case "$(nic_policy_layout_state)" in
-        absent) ;;
-        managed)
-            while IFS= read -r file; do
-                [[ -n "$file" ]] || continue
-                nic_policy_load_file "$file" || return 1
-                nic_policy_validate_identity || return 1
-                qdisc_guard "$NIC_POLICY_INTERFACE" || return 1
-                policies+="${policies:+$'\n'}$NIC_POLICY_INTERFACE"
-            done < <(nic_policy_files)
-            ;;
-        *) die "多网卡策略目录损坏或不属于本项目"; return 1 ;;
-    esac
+nic_policy_ownership_preflight_files() {
+    local target="$1" files="$2" file iface managed policies=""
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        nic_policy_load_file "$file" || return 1
+        nic_policy_validate_identity || return 1
+        qdisc_guard "$NIC_POLICY_INTERFACE" || return 1
+        policies+="${policies:+$'\n'}$NIC_POLICY_INTERFACE"
+    done <<< "$files"
     if (( ${MULTI_NIC_ENABLED:-0} == 0 && ${TC_ENABLED:-0} == 1 )) && [[ "${TC_INTERFACE:-auto}" != auto ]]; then
         policies+="${policies:+$'\n'}$TC_INTERFACE"
     fi
@@ -3283,6 +4067,16 @@ nic_policy_ownership_preflight() {
     [[ -z "$target" ]] || { nic_require_manageable "$target" && qdisc_guard "$target"; }
 }
 
+nic_policy_ownership_preflight() {
+    local target="${1:-}" files=""
+    case "$(nic_policy_layout_state)" in
+        absent) ;;
+        managed) files=$(nic_policy_files_checked) || return 1 ;;
+        *) die "多网卡策略目录损坏或不属于本项目"; return 1 ;;
+    esac
+    nic_policy_ownership_preflight_files "$target" "$files"
+}
+
 nic_restore_runtime_snapshot() {
     local directory="$1" rc=0
     [[ -f "$directory/sysctl.tsv" ]] || return 1
@@ -3291,11 +4085,140 @@ nic_restore_runtime_snapshot() {
     return "$rc"
 }
 
-nic_verify_runtime_policies() {
-    local only="${1:-}" file iface managed policies="" rc=0 found=0
+nic_runtime_transaction_begin() {
+    local parent="$1"
+    [[ -z "$NIC_RUNTIME_TRANSACTION_DIR" ]] || { die "已有未完成的网络运行时事务"; return 1; }
+    NIC_RUNTIME_TRANSACTION_DIR=$(mktemp -d "$parent/${SCRIPT_NAME}.multi-nic.XXXXXX") || return 1
+    NIC_RUNTIME_TRANSACTION_PARENT="$parent"
+    NIC_RUNTIME_TRANSACTION_MUTATED=0
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+    NIC_RUNTIME_TRANSACTION_READY=0
+}
+
+nic_runtime_transaction_discard() {
+    local dir="$NIC_RUNTIME_TRANSACTION_DIR" parent="$NIC_RUNTIME_TRANSACTION_PARENT"
+    [[ -n "$dir" && -n "$parent" ]] || return 0
+    remove_tree_within "$dir" "$parent" || return 1
+    NIC_RUNTIME_TRANSACTION_DIR=""
+    NIC_RUNTIME_TRANSACTION_PARENT=""
+    NIC_RUNTIME_TRANSACTION_MUTATED=0
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+    NIC_RUNTIME_TRANSACTION_READY=0
+}
+
+nic_runtime_transaction_commit() {
+    local dir="$NIC_RUNTIME_TRANSACTION_DIR" parent="$NIC_RUNTIME_TRANSACTION_PARENT"
+    NIC_RUNTIME_TRANSACTION_DIR=""
+    NIC_RUNTIME_TRANSACTION_PARENT=""
+    NIC_RUNTIME_TRANSACTION_MUTATED=0
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+    NIC_RUNTIME_TRANSACTION_READY=0
+    [[ -z "$dir" ]] || remove_tree_within "$dir" "$parent" || log WARN "网络运行时状态已提交，但无法删除事务快照: $dir"
+}
+
+nic_runtime_transaction_write_interfaces() {
+    local interfaces="$1" dir="$NIC_RUNTIME_TRANSACTION_DIR" iface temp count=0
+    local -A seen=()
+    [[ -n "$dir" && -d "$dir" && ! -L "$dir" && "$NIC_RUNTIME_TRANSACTION_MUTATED" == 0 ]] || return 1
+    [[ -n "$interfaces" ]] || { die "运行时事务接口清单为空"; return 1; }
+    [[ ! -e "$dir/interfaces.list" && ! -L "$dir/interfaces.list" ]] || return 1
+    while IFS= read -r iface; do
+        [[ -n "$iface" ]] || { die "运行时事务接口清单含空行"; return 1; }
+        validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
+        [[ -z "${seen[$iface]+x}" ]] || { die "运行时事务接口清单重复: $iface"; return 1; }
+        seen[$iface]=1
+        [[ -f "$dir/$iface.snapshot" && ! -L "$dir/$iface.snapshot" ]] || return 1
+        action_qdisc_snapshot_validate "$dir/$iface.snapshot" || return 1
+        mq_snapshot_queue_preflight "$iface" "$dir/$iface.snapshot" || return 1
+        ((count+=1))
+    done <<< "$interfaces"
+    (( count > 0 )) || return 1
+    temp=$(mktemp "$dir/.interfaces.XXXXXX") || return 1
+    if ! printf '%s\n' "$interfaces" > "$temp" || ! chmod 0600 "$temp" || ! mv -- "$temp" "$dir/interfaces.list"; then
+        rm -f -- "$temp"
+        return 1
+    fi
+}
+
+nic_runtime_transaction_snapshot_validate() {
+    local dir="$NIC_RUNTIME_TRANSACTION_DIR" file iface count=0 expected_count=0
+    local -A expected=()
+    [[ -n "$dir" && -d "$dir" && ! -L "$dir" ]] || return 1
+    [[ -f "$dir/COMPLETE" && ! -L "$dir/COMPLETE" && "$(<"$dir/COMPLETE")" == complete ]] || return 1
+    tcp_baseline_sysctl_validate "$dir/sysctl.tsv" >/dev/null || return 1
+    [[ -f "$dir/default-route-v4.txt" && ! -L "$dir/default-route-v4.txt" ]] || return 1
+    [[ -f "$dir/default-route-v6.txt" && ! -L "$dir/default-route-v6.txt" ]] || return 1
+    default_route_windows_snapshot_preflight "$dir" || return 1
+    [[ -f "$dir/interfaces.list" && ! -L "$dir/interfaces.list" ]] || return 1
+    check_config_permissions "$dir/interfaces.list" || return 1
+    while IFS= read -r iface; do
+        [[ -n "$iface" ]] || return 1
+        validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
+        [[ -z "${expected[$iface]+x}" ]] || return 1
+        expected[$iface]=1
+        [[ -f "$dir/$iface.snapshot" && ! -L "$dir/$iface.snapshot" ]] || return 1
+        ((expected_count+=1))
+    done < "$dir/interfaces.list"
+    (( expected_count > 0 )) || return 1
+    for file in "$dir"/*.snapshot; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        iface="${file##*/}"; iface="${iface%.snapshot}"
+        validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
+        [[ -n "${expected[$iface]+x}" ]] || return 1
+        action_qdisc_snapshot_validate "$file" || return 1
+        mq_snapshot_queue_preflight "$iface" "$file" || return 1
+        qdisc_filter_guard "$iface" || return 1
+        ((count+=1))
+    done
+    (( count == expected_count ))
+}
+
+nic_runtime_transaction_mark_mutated() {
+    [[ -n "$NIC_RUNTIME_TRANSACTION_DIR" && "$NIC_RUNTIME_TRANSACTION_MUTATED" == 0 ]] || return 1
+    if ! chmod -R go-rwx "$NIC_RUNTIME_TRANSACTION_DIR" ||
+       ! printf 'complete\n' > "$NIC_RUNTIME_TRANSACTION_DIR/COMPLETE" ||
+       ! chmod 0600 "$NIC_RUNTIME_TRANSACTION_DIR/COMPLETE"; then
+        return 1
+    fi
+    NIC_RUNTIME_TRANSACTION_READY=1
+    nic_runtime_transaction_snapshot_validate || { NIC_RUNTIME_TRANSACTION_READY=0; return 1; }
+    NIC_RUNTIME_TRANSACTION_MUTATED=1
+}
+
+nic_runtime_transaction_rollback() {
+    local dir="$NIC_RUNTIME_TRANSACTION_DIR" parent="$NIC_RUNTIME_TRANSACTION_PARENT" iface rc=0
+    [[ -n "$dir" && -n "$parent" ]] || return 0
+    (( NIC_RUNTIME_TRANSACTION_ROLLING_BACK == 0 )) || return 1
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=1
+    if (( NIC_RUNTIME_TRANSACTION_MUTATED )); then
+        if (( NIC_RUNTIME_TRANSACTION_READY != 1 )) || ! nic_runtime_transaction_snapshot_validate; then
+            log ERR "网络运行时事务快照已损坏，或运行时 qdisc filter/队列/路由身份已漂移且不可完整验证；拒绝执行回滚，证据保留在 $dir"
+            rc=1
+        else
+            nic_restore_runtime_snapshot "$dir" || rc=1
+            while IFS= read -r iface; do
+                restore_action_qdisc "$iface" "$dir/$iface.snapshot" || rc=1
+            done < "$dir/interfaces.list"
+        fi
+    fi
+    if (( rc == 0 )); then
+        remove_tree_within "$dir" "$parent" || rc=1
+    fi
+    if (( rc == 0 )); then
+        NIC_RUNTIME_TRANSACTION_DIR=""
+        NIC_RUNTIME_TRANSACTION_PARENT=""
+        NIC_RUNTIME_TRANSACTION_MUTATED=0
+        NIC_RUNTIME_TRANSACTION_READY=0
+    fi
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+    return "$rc"
+}
+
+nic_verify_runtime_policies_files() {
+    local only="$1" files="$2" file iface managed policies="" rc=0 found=0
     (( MULTI_NIC_ENABLED == 1 )) || { die "当前不是多网卡配置"; return 1; }
-    nic_policy_set_validate || return 1
-    nic_global_model_verify || rc=1
+    nic_policy_set_validate_files "$files" || return 1
+    nic_global_model_verify_files "$files" || rc=1
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         nic_policy_load_file "$file" || { rc=1; continue; }
@@ -3304,12 +4227,12 @@ nic_verify_runtime_policies() {
         found=1
         nic_policy_validate_identity || { rc=1; continue; }
         if [[ "$NIC_POLICY_MODE" == shape ]]; then
-            verify_shaping "$iface" || rc=1
+            verify_shaping "$iface" "$NIC_POLICY_RATE_MBIT" || rc=1
             [[ "$(managed_rate_mbit "$iface" 2>/dev/null || true)" == "$NIC_POLICY_RATE_MBIT" ]] || { log ERR "$iface 整形速率漂移"; rc=1; }
         else
             [[ "$(root_qdisc_kind "$iface")" == fq ]] || { log ERR "$iface root qdisc 不是 fq"; rc=1; }
         fi
-    done < <(nic_policy_files)
+    done <<< "$files"
     [[ -z "$only" || $found == 1 ]] || { die "没有找到网卡策略: $only"; return 1; }
     if [[ -z "$only" ]]; then
         managed=$(managed_htb_interfaces_strict) || return 1
@@ -3322,25 +4245,47 @@ nic_verify_runtime_policies() {
     log OK "多网卡运行时与策略一致${only:+: $only}"
 }
 
+nic_verify_runtime_policies() {
+    local only="${1:-}" files
+    files=$(nic_policy_files_checked) || return 1
+    nic_verify_runtime_policies_files "$only" "$files"
+}
+
 nic_apply_runtime_policies() {
-    local file iface rc=0 mutated=0 snapshot_dir="" snapshot_parent
-    nic_policy_set_validate || return 1
-    nic_global_model_verify || return 1
-    nic_policy_ownership_preflight || return 1
+    local file iface rc=0 mutated=0 snapshot_dir="" snapshot_parent rollback_rc=0 policy_files interfaces=""
+    policy_files=$(nic_policy_files_checked) || return 1
+    [[ -n "$policy_files" ]] || { die "多网卡持久化应用需要至少一个网卡策略"; return 1; }
+    nic_policy_set_validate_files "$policy_files" || return 1
+    nic_global_model_verify_files "$policy_files" || return 1
+    nic_policy_ownership_preflight_files "" "$policy_files" || return 1
     snapshot_parent="${TMPDIR:-/tmp}"
-    snapshot_dir=$(mktemp -d "$snapshot_parent/${SCRIPT_NAME}.multi-nic.XXXXXX") || return 1
+    nic_runtime_transaction_begin "$snapshot_parent" || return 1
+    snapshot_dir="$NIC_RUNTIME_TRANSACTION_DIR"
     if ! capture_runtime_sysctls > "$snapshot_dir/sysctl.tsv"; then
-        remove_tree_within "$snapshot_dir" "$snapshot_parent" || true
+        nic_runtime_transaction_discard || true
         return 1
     fi
-    ip -4 route show default > "$snapshot_dir/default-route-v4.txt" 2>/dev/null || true
-    ip -6 route show default > "$snapshot_dir/default-route-v6.txt" 2>/dev/null || true
+    if ! ip -4 route show default > "$snapshot_dir/default-route-v4.txt" 2>/dev/null ||
+       ! ip -6 route show default > "$snapshot_dir/default-route-v6.txt" 2>/dev/null; then
+        if ! nic_runtime_transaction_discard; then
+            die "多网卡持久化应用无法完整读取 IPv4/IPv6 默认路由；未修改运行时状态，但临时快照无法删除: $snapshot_dir"
+        else
+            die "多网卡持久化应用无法完整读取 IPv4/IPv6 默认路由；未修改运行时状态"
+        fi
+        return 1
+    fi
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         nic_policy_load_file "$file" || { rc=1; break; }
         action_qdisc_snapshot "$NIC_POLICY_INTERFACE" "$snapshot_dir/$NIC_POLICY_INTERFACE.snapshot" || { rc=1; break; }
-    done < <(nic_policy_files)
-    if (( rc == 0 )); then mutated=1; apply_sysctl_profile runtime || rc=1; fi
+        interfaces+="${interfaces:+$'\n'}$NIC_POLICY_INTERFACE"
+    done <<< "$policy_files"
+    if (( rc == 0 )); then nic_runtime_transaction_write_interfaces "$interfaces" || rc=1; fi
+    if (( rc == 0 )); then nic_runtime_transaction_mark_mutated || rc=1; fi
+    if (( rc == 0 )); then
+        mutated=1
+        apply_sysctl_profile runtime || rc=1
+    fi
     if (( rc == 0 )); then
         while IFS= read -r file; do
             [[ -n "$file" ]] || continue
@@ -3349,26 +4294,24 @@ nic_apply_runtime_policies() {
             if [[ "$NIC_POLICY_MODE" == shape ]]; then apply_shaping "$iface" "$NIC_POLICY_RATE_MBIT" || { rc=1; break; }
             else apply_fq "$iface" || { rc=1; break; }
             fi
-        done < <(nic_policy_files)
+        done <<< "$policy_files"
     fi
     if (( rc == 0 )); then apply_initial_windows || rc=1; fi
-    if (( rc == 0 )); then nic_verify_runtime_policies || rc=1; fi
+    if (( rc == 0 )); then nic_verify_runtime_policies_files "" "$policy_files" || rc=1; fi
     if (( rc != 0 )); then
         if (( mutated )); then
-            nic_restore_runtime_snapshot "$snapshot_dir" || true
-            for file in "$snapshot_dir"/*.snapshot; do
-                [[ -f "$file" ]] || continue
-                iface="${file##*/}"; iface="${iface%.snapshot}"
-                restore_action_qdisc "$iface" "$file" || true
-            done
+            nic_runtime_transaction_rollback || rollback_rc=$?
+        else
+            nic_runtime_transaction_discard || rollback_rc=$?
         fi
-        remove_tree_within "$snapshot_dir" "$snapshot_parent" || true
-        if (( mutated )); then die "多网卡持久化应用失败，已恢复本轮 qdisc、sysctl 与路由窗口快照"
+        if (( mutated && rollback_rc == 0 )); then die "多网卡持久化应用失败，已恢复本轮 qdisc、sysctl 与路由窗口快照"
+        elif (( mutated )); then die "多网卡持久化应用失败且回滚不完整；快照保留在 $snapshot_dir，请人工检查"
+        elif (( rollback_rc != 0 )); then die "多网卡持久化应用在只读快照阶段失败；未修改运行时状态，但临时快照无法删除: $snapshot_dir"
         else die "多网卡持久化应用在只读快照阶段失败；未修改运行时状态"
         fi
         return 1
     fi
-    remove_tree_within "$snapshot_dir" "$snapshot_parent"
+    nic_runtime_transaction_commit
 }
 
 nic_manage_steps() {
@@ -3441,10 +4384,13 @@ nic_route_role() {
 }
 
 nic_inventory() {
-    local root path iface state mac driver mtu speed rx tx qdisc policy mode rate role layout file rc=0
+    local root path iface state mac driver mtu speed rx tx qdisc policy mode rate role layout file rc=0 policy_files=""
     layout=$(nic_policy_layout_state)
     case "$layout" in
-        managed) nic_policy_set_validate || return 1 ;;
+        managed)
+            policy_files=$(nic_policy_files_checked) || return 1
+            nic_policy_set_validate_files "$policy_files" || return 1
+            ;;
         absent) ;;
         *) die "多网卡策略目录损坏或不属于本项目: $NIC_POLICY_DIR"; return 1 ;;
     esac
@@ -3475,7 +4421,7 @@ nic_inventory() {
         printf '%-15s %-18s %-17s %-8s %-8s %-7s %-9s %-12s %s\n' "$iface" missing unknown missing "$mode" "$rate" unknown unknown missing
         log ERR "受管网卡已消失: $iface"
         rc=1
-    done < <(nic_policy_files)
+    done <<< "$policy_files"
     return "$rc"
 }
 
@@ -3507,14 +4453,6 @@ nic_plan() {
         'Requested model' "$profile/$role/$bandwidth/$rtt" 'Current global model' "$current_model" \
         'Global model after apply' "$(tr '\t' '/' <<< "$candidate")" 'Action' "$action" 'Readiness' "$readiness" 'Plan mutation' 'none (read-only)'
     [[ "$state" == eligible && "$readiness" == ready ]] || return 1
-}
-
-nic_apply_command() {
-    require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
-    acquire_lock || return 1; require_commands ip tc sysctl systemctl modprobe || return 1
-    load_config || return 1
-    (( MULTI_NIC_ENABLED == 1 )) || { die "当前不是多网卡配置"; return 1; }
-    nic_apply_runtime_policies
 }
 
 nic_policy_reset_record
@@ -5073,6 +6011,8 @@ ACTION_TRANSACTION_DIR=""
 ACTION_TRANSACTION_IFACE=""
 ACTION_TRANSACTION_INTERFACES=""
 ACTION_TRANSACTION_ROLLING_BACK=0
+ACTION_TRANSACTION_READY=0
+ACTION_TRANSACTION_MUTATED=0
 
 current_script_path() {
     local source="${BASH_SOURCE[0]}"
@@ -5238,12 +6178,31 @@ restart_and_verify_persistence() {
 }
 
 remove_persistence() {
+    local rc=0
     if command_exists systemctl; then
-        systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+        if [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ]] ||
+            systemctl is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1 ||
+            systemctl is-enabled --quiet "$SERVICE_NAME" >/dev/null 2>&1; then
+            systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || {
+                log WARN "无法停止并禁用持久化服务: $SERVICE_NAME"
+                rc=1
+            }
+        fi
     fi
-    rm -f -- "$SERVICE_FILE" "$PERSIST_SCRIPT"
+    rm -f -- "$SERVICE_FILE" "$PERSIST_SCRIPT" || {
+        log WARN "无法删除持久化服务或脚本"
+        rc=1
+    }
+    if [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" || -e "$PERSIST_SCRIPT" || -L "$PERSIST_SCRIPT" ]]; then
+        log WARN "持久化服务或脚本删除后仍然存在"
+        rc=1
+    fi
     rmdir "$PERSIST_DIR" 2>/dev/null || true
-    command_exists systemctl && systemctl daemon-reload || true
+    if command_exists systemctl && ! systemctl daemon-reload; then
+        log WARN "systemd daemon-reload 失败"
+        rc=1
+    fi
+    return "$rc"
 }
 
 query_unit_enabled_state() {
@@ -5303,31 +6262,36 @@ capture_unit_state() {
     printf '%s\t%s\n' "$enabled" "$active" > "$file"
 }
 
-restore_unit_state() {
-    local unit="$1" file="$2" line enabled active current_enabled current_active
-    local actual_enabled actual_active rc=0 remask=0
+unit_state_snapshot_validate() {
+    local file="$1" line enabled active
     local -a state_lines=()
-    [[ -f "$file" ]] || return 0
+    [[ -f "$file" && ! -L "$file" ]] || return 1
     mapfile -t state_lines < "$file" || return 1
-    if (( ${#state_lines[@]} != 1 )); then
-        log ERR "systemd unit 状态快照格式损坏: $file"
-        return 1
-    fi
+    (( ${#state_lines[@]} == 1 )) || return 1
     line="${state_lines[0]}"
-    if [[ "$line" != *$'\t'* || "${line#*$'\t'}" == *$'\t'* ]]; then
-        log ERR "systemd unit 状态快照字段无效: $file"
-        return 1
-    fi
+    [[ "$line" == *$'\t'* && "${line#*$'\t'}" != *$'\t'* ]] || return 1
     enabled="${line%%$'\t'*}"
     active="${line#*$'\t'}"
     case "$enabled" in
         enabled|enabled-runtime|disabled|masked|masked-runtime|linked|linked-runtime|alias|static|indirect|generated|transient|not-found) ;;
-        *) log ERR "systemd unit 状态快照包含未知 unit-file 状态: ${enabled:-empty}"; return 1 ;;
+        *) return 1 ;;
     esac
-    case "$active" in
-        active|inactive) ;;
-        *) log ERR "systemd unit 状态快照包含不可恢复的 active 状态: ${active:-empty}"; return 1 ;;
-    esac
+    case "$active" in active|inactive) ;; *) return 1 ;; esac
+}
+
+restore_unit_state() {
+    local unit="$1" file="$2" line enabled active current_enabled current_active
+    local actual_enabled actual_active rc=0 remask=0
+    local -a state_lines=()
+    [[ -e "$file" || -L "$file" ]] || return 0
+    if ! unit_state_snapshot_validate "$file"; then
+        log ERR "systemd unit 状态快照格式损坏: $file"
+        return 1
+    fi
+    mapfile -t state_lines < "$file" || return 1
+    line="${state_lines[0]}"
+    enabled="${line%%$'\t'*}"
+    active="${line#*$'\t'}"
     command_exists systemctl || { log WARN "无法恢复 systemd unit 状态（systemctl 不可用）: $unit"; return 1; }
     current_enabled=$(query_unit_enabled_state "$unit") || return 1
     current_active=$(query_unit_active_state "$unit") || return 1
@@ -5569,6 +6533,70 @@ action_transaction_restore_routes() {
     restore_default_route_windows_snapshot "$ACTION_TRANSACTION_DIR"
 }
 
+action_transaction_path_snapshot_validate() {
+    local name="$1" type="${2:-file}" state_file payload state
+    local -a lines=()
+    state_file="$ACTION_TRANSACTION_DIR/${name}.state"
+    payload="$ACTION_TRANSACTION_DIR/files/$name"
+    [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+    mapfile -t lines < "$state_file" || return 1
+    (( ${#lines[@]} == 1 )) || return 1
+    state="${lines[0]}"
+    case "$state:$type" in
+        absent:file|absent:tree)
+            [[ ! -e "$payload" && ! -L "$payload" ]]
+            ;;
+        present:file)
+            [[ ( -f "$payload" || -L "$payload" ) && ! ( -d "$payload" && ! -L "$payload" ) ]]
+            ;;
+        present:tree)
+            [[ -d "$payload" && ! -L "$payload" ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+action_transaction_snapshot_validate() {
+    local dir="$ACTION_TRANSACTION_DIR" file iface count=0
+    local -A expected=() observed=()
+    [[ -n "$dir" && -d "$dir" && ! -L "$dir" ]] || return 1
+    [[ -f "$dir/COMPLETE" && ! -L "$dir/COMPLETE" && "$(<"$dir/COMPLETE")" == complete ]] || return 1
+    [[ -f "$dir/sysctl.tsv" && ! -L "$dir/sysctl.tsv" ]] || return 1
+    tcp_baseline_sysctl_validate "$dir/sysctl.tsv" >/dev/null || return 1
+    [[ -f "$dir/default-route-v4.txt" && ! -L "$dir/default-route-v4.txt" ]] || return 1
+    [[ -f "$dir/default-route-v6.txt" && ! -L "$dir/default-route-v6.txt" ]] || return 1
+    default_route_windows_snapshot_preflight "$dir" || return 1
+    for file in "$dir/qdiscs"/*.snapshot; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        iface="${file##*/}"; iface="${iface%.snapshot}"
+        validate_interface_name "$iface" && [[ "$iface" != auto && -z "${observed[$iface]+x}" ]] || return 1
+        action_qdisc_snapshot_validate "$file" || return 1
+        mq_snapshot_queue_preflight "$iface" "$file" || return 1
+        qdisc_filter_guard "$iface" || return 1
+        observed[$iface]=1
+        ((count+=1))
+    done
+    (( count > 0 )) || return 1
+    while IFS= read -r iface; do
+        [[ -n "$iface" ]] || continue
+        validate_interface_name "$iface" && [[ "$iface" != auto && -z "${expected[$iface]+x}" ]] || return 1
+        expected[$iface]=1
+        [[ -n "${observed[$iface]+x}" ]] || return 1
+    done <<< "$ACTION_TRANSACTION_INTERFACES"
+    (( ${#expected[@]} == ${#observed[@]} )) || return 1
+    [[ -f "$dir/qdisc.snapshot" && ! -L "$dir/qdisc.snapshot" ]] || return 1
+    action_qdisc_snapshot_validate "$dir/qdisc.snapshot" || return 1
+    action_transaction_path_snapshot_validate config || return 1
+    action_transaction_path_snapshot_validate sysctl || return 1
+    action_transaction_path_snapshot_validate legacy-sysctl || return 1
+    action_transaction_path_snapshot_validate service || return 1
+    action_transaction_path_snapshot_validate legacy-service || return 1
+    action_transaction_path_snapshot_validate persist-script || return 1
+    action_transaction_path_snapshot_validate nic-policy-dir tree || return 1
+    unit_state_snapshot_validate "$dir/service.unit" || return 1
+    unit_state_snapshot_validate "$dir/legacy-service.unit" || return 1
+}
+
 action_transaction_begin() {
     local iface="$1" dir path stale=""
     [[ -z "$ACTION_TRANSACTION_DIR" ]] || { die "已有未提交的系统配置事务"; return 1; }
@@ -5583,12 +6611,18 @@ action_transaction_begin() {
     ensure_state_layout || return 1
     dir=$(mktemp -d "${STATE_DIR}/.transaction.XXXXXX") || return 1
     ACTION_TRANSACTION_DIR="$dir"; ACTION_TRANSACTION_IFACE="$iface"; ACTION_TRANSACTION_INTERFACES="$iface"
-    mkdir -p "$dir/files" "$dir/qdiscs" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
-    action_qdisc_snapshot "$iface" "$dir/qdisc.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
-    cp -- "$dir/qdisc.snapshot" "$dir/qdiscs/$iface.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
-    capture_runtime_sysctls > "$dir/sysctl.tsv" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; return 1; }
-    ip -4 route show default > "$dir/default-route-v4.txt" 2>/dev/null || true
-    ip -6 route show default > "$dir/default-route-v6.txt" 2>/dev/null || true
+    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
+    mkdir -p "$dir/files" "$dir/qdiscs" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
+    action_qdisc_snapshot "$iface" "$dir/qdisc.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
+    cp -- "$dir/qdisc.snapshot" "$dir/qdiscs/$iface.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
+    capture_runtime_sysctls > "$dir/sysctl.tsv" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
+    if ! ip -4 route show default > "$dir/default-route-v4.txt" 2>/dev/null ||
+       ! ip -6 route show default > "$dir/default-route-v6.txt" 2>/dev/null; then
+        remove_tree_within "$dir" "$STATE_DIR" || true
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
+        die "无法完整读取 IPv4/IPv6 默认路由；未创建系统配置事务，也不会修改运行时状态"
+        return 1
+    fi
     if ! action_transaction_snapshot_path "$CONFIG_FILE" config ||
        ! action_transaction_snapshot_path "$SYSCTL_FILE" sysctl ||
        ! action_transaction_snapshot_path "$LEGACY_SYSCTL_FILE" legacy-sysctl ||
@@ -5597,14 +6631,14 @@ action_transaction_begin() {
        ! action_transaction_snapshot_path "$PERSIST_SCRIPT" persist-script ||
        ! action_transaction_snapshot_tree "$NIC_POLICY_DIR" nic-policy-dir; then
         remove_tree_within "$dir" "$STATE_DIR" || true
-        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
         return 1
     fi
     if ! action_transaction_capture_unit "$SERVICE_NAME" service ||
        ! action_transaction_capture_unit bbr-optimize-persist.service legacy-service ||
        ! chmod -R go-rwx "$dir"; then
         remove_tree_within "$dir" "$STATE_DIR" || true
-        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
         return 1
     fi
     log INFO "已创建本次操作回滚点: $dir"
@@ -5622,22 +6656,47 @@ action_transaction_add_interface() {
 action_transaction_discard_snapshot() {
     local dir="$ACTION_TRANSACTION_DIR"
     ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
     [[ -z "$dir" ]] || remove_tree_within "$dir" "$STATE_DIR"
 }
 
 action_transaction_begin_multi() {
-    local primary="$1" iface
+    local primary="$1" iface interfaces
     action_transaction_begin "$primary" || return 1
     if [[ "$(nic_policy_layout_state 2>/dev/null || true)" == managed ]]; then
         if ! nic_policy_set_validate; then action_transaction_discard_snapshot || true; return 1; fi
+        if ! interfaces=$(nic_policy_interface_list); then
+            action_transaction_discard_snapshot || true
+            die "无法完整枚举多网卡策略接口；未开始系统配置事务"
+            return 1
+        fi
         while IFS= read -r iface; do
             [[ -n "$iface" ]] || continue
             if ! action_transaction_add_interface "$iface"; then action_transaction_discard_snapshot || true; return 1; fi
-        done < <(nic_policy_interface_list)
+        done <<< "$interfaces"
     fi
     if (( ${MULTI_NIC_ENABLED:-0} == 0 )) && [[ "${TC_INTERFACE:-auto}" != auto ]]; then
         if ! action_transaction_add_interface "$TC_INTERFACE"; then action_transaction_discard_snapshot || true; return 1; fi
     fi
+    if ! chmod -R go-rwx "$ACTION_TRANSACTION_DIR" ||
+       ! printf 'complete\n' > "$ACTION_TRANSACTION_DIR/COMPLETE" ||
+       ! chmod 0600 "$ACTION_TRANSACTION_DIR/COMPLETE"; then
+        action_transaction_discard_snapshot || true
+        return 1
+    fi
+    ACTION_TRANSACTION_READY=1
+}
+
+action_transaction_mark_mutated() {
+    [[ -n "$ACTION_TRANSACTION_DIR" && "$ACTION_TRANSACTION_READY" == 1 && "$ACTION_TRANSACTION_MUTATED" == 0 ]] || {
+        die "系统配置事务尚未完成只读快照，拒绝开始写入"
+        return 1
+    }
+    action_transaction_snapshot_validate || {
+        die "系统配置事务快照不完整，或运行时 qdisc filter/队列/路由身份已漂移，拒绝开始写入"
+        return 1
+    }
+    ACTION_TRANSACTION_MUTATED=1
 }
 
 configured_state_target_preflight() {
@@ -5661,6 +6720,11 @@ tcp_restore_runtime_preflight() {
     }
     tc qdisc show dev "$iface" >/dev/null 2>&1 || { die "无法读取 $iface 的 qdisc；恢复尚未开始"; return 1; }
     tc class show dev "$iface" >/dev/null 2>&1 || { die "无法读取 $iface 的 class；恢复尚未开始"; return 1; }
+    qdisc_filter_guard "$iface" || return 1
+    if [[ -f "$BASELINE_DIR/qdisc.txt" ]] && ! mq_snapshot_queue_preflight "$iface" "$BASELINE_DIR/qdisc.txt"; then
+        die "$iface 的 MQ 基线与当前 TX queue 数不一致，恢复尚未开始"
+        return 1
+    fi
     while IFS= read -r key; do
         sysctl -n "$key" >/dev/null 2>&1 || { die "无法读取恢复目标 sysctl: $key"; return 1; }
     done < <(tcp_baseline_sysctl_keys)
@@ -5676,6 +6740,7 @@ action_transaction_commit() {
     local dir="$ACTION_TRANSACTION_DIR"
     [[ -n "$dir" ]] || return 0
     ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
     remove_tree_within "$dir" "$STATE_DIR" || log WARN "操作已提交，但无法删除临时事务快照: $dir"
 }
 
@@ -5683,6 +6748,20 @@ action_transaction_rollback() {
     local dir="$ACTION_TRANSACTION_DIR" iface="$ACTION_TRANSACTION_IFACE" file rc=0 had_lock="$LOCK_HELD"
     [[ -n "$dir" ]] || return 0
     (( ACTION_TRANSACTION_ROLLING_BACK == 0 )) || return 1
+    if (( ACTION_TRANSACTION_MUTATED == 0 )); then
+        log INFO "系统配置事务仍处于只读快照阶段；正在丢弃快照，不执行运行时回滚"
+        action_transaction_discard_snapshot
+        return
+    fi
+    if (( ACTION_TRANSACTION_READY != 1 )) ||
+       [[ ! -f "$dir/COMPLETE" || -L "$dir/COMPLETE" || "$(<"$dir/COMPLETE")" != complete ]]; then
+        log ERR "系统配置事务已标记写入但快照不完整；拒绝执行可能破坏系统的回滚，证据保留在 $dir"
+        return 1
+    fi
+    if ! action_transaction_snapshot_validate; then
+        log ERR "系统配置事务快照已损坏，或运行时 qdisc filter/队列/路由身份已漂移且不可完整验证；拒绝执行回滚，证据保留在 $dir"
+        return 1
+    fi
     ACTION_TRANSACTION_ROLLING_BACK=1
     systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl disable --now bbr-optimize-persist.service >/dev/null 2>&1 || true
@@ -5716,6 +6795,7 @@ action_transaction_rollback() {
     fi
     if (( rc == 0 )); then
         ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
+        ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
         log OK "已恢复本次操作前的 qdisc、sysctl、配置和服务状态"
     else
         log ERR "自动回滚未完全成功；事务快照保留在 $dir"
@@ -5727,6 +6807,7 @@ action_transaction_rollback() {
 run_action_transaction_multi() {
     local iface="$1" rc rollback_rc=0; shift
     action_transaction_begin_multi "$iface" || return 1
+    action_transaction_mark_mutated || { action_transaction_discard_snapshot || true; return 1; }
     if "$@"; then
         action_transaction_commit
         return
@@ -5738,9 +6819,65 @@ run_action_transaction_multi() {
     return "$rc"
 }
 
+apply_configured_runtime_steps() {
+    local iface="$1"
+    # The persistent artifacts already exist when the systemd apply entry is
+    # invoked.  Reapply only runtime state here so a later qdisc/route failure
+    # cannot rewrite the sysctl drop-in outside this runtime transaction.
+    apply_sysctl_profile runtime || return 1
+    if (( TC_ENABLED == 1 )); then
+        apply_shaping "$iface" "$TC_RATE_MBIT" || return 1
+    else
+        apply_fq "$iface" || return 1
+    fi
+    apply_initial_windows
+}
+
+apply_configured_runtime_transaction() {
+    local iface="$1" snapshot_parent="${TMPDIR:-/tmp}" snapshot_dir rc=0 rollback_rc=0
+    nic_runtime_transaction_begin "$snapshot_parent" || return 1
+    snapshot_dir="$NIC_RUNTIME_TRANSACTION_DIR"
+    if ! capture_runtime_sysctls > "$snapshot_dir/sysctl.tsv"; then
+        nic_runtime_transaction_discard || true
+        die "持久化运行时应用无法完整快照 sysctl；未修改运行时状态"
+        return 1
+    fi
+    if ! ip -4 route show default > "$snapshot_dir/default-route-v4.txt" 2>/dev/null ||
+       ! ip -6 route show default > "$snapshot_dir/default-route-v6.txt" 2>/dev/null; then
+        nic_runtime_transaction_discard || true
+        die "持久化运行时应用无法完整读取 IPv4/IPv6 默认路由；未修改运行时状态"
+        return 1
+    fi
+    if ! action_qdisc_snapshot "$iface" "$snapshot_dir/$iface.snapshot" ||
+       ! nic_runtime_transaction_write_interfaces "$iface" ||
+       ! nic_runtime_transaction_mark_mutated; then
+        nic_runtime_transaction_discard || true
+        die "持久化运行时应用无法建立完整回滚点；未修改运行时状态"
+        return 1
+    fi
+    if apply_configured_runtime_steps "$iface"; then
+        nic_runtime_transaction_commit
+        return
+    else
+        rc=$?
+    fi
+    nic_runtime_transaction_rollback || rollback_rc=$?
+    if (( rollback_rc == 0 )); then
+        die "持久化运行时应用失败，已恢复本轮 qdisc、sysctl 与路由窗口快照"
+        return "$rc"
+    fi
+    die "持久化运行时应用失败且回滚不完整；快照保留在 $snapshot_dir，请人工检查"
+    return "$rollback_rc"
+}
+
 apply_configured_state() {
     require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
     require_commands ip tc sysctl systemctl modprobe || return 1; acquire_lock 30 || return 1
+    [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || {
+        die "持久化配置缺失、不是常规文件或是符号链接: $CONFIG_FILE"
+        return 1
+    }
+    check_config_permissions "$CONFIG_FILE" || return 1
     load_config || return 1
     (( BBR_ENABLED == 1 )) || return 0
     if (( MULTI_NIC_ENABLED == 1 )); then
@@ -5761,13 +6898,7 @@ apply_configured_state() {
     network_tuning_preflight "$iface" "$TC_ENABLED" || return 1
     # All dependency, interface, ownership and qdisc checks above are
     # deliberately read-only.  No sysctl is written until every gate passes.
-    apply_sysctl_profile || return 1
-    if (( TC_ENABLED == 1 )); then
-        apply_shaping "$iface" "$TC_RATE_MBIT" || return 1
-    else
-        apply_fq "$iface" || return 1
-    fi
-    apply_initial_windows
+    apply_configured_runtime_transaction "$iface"
 }
 
 install_base_tuning_steps() {
@@ -5829,7 +6960,7 @@ prepare_auto_tuning_runtime() {
 verify_runtime_tuning() {
     local iface="$1" rc=0
     verify_sysctl_profile_runtime || rc=1
-    if (( TC_ENABLED )); then verify_shaping "$iface" || rc=1
+    if (( TC_ENABLED )); then verify_shaping "$iface" "$TC_RATE_MBIT" || rc=1
     else [[ "$(root_qdisc_kind "$iface")" == fq ]] || { log ERR "root qdisc 不是 fq"; rc=1; }
     fi
     (( rc == 0 )) || { die "临时调优状态验证失败"; return 1; }
@@ -5893,7 +7024,7 @@ restore_baseline() {
     tcp_restore_runtime_preflight "$iface" || return 1
     nic_restore_preflight || return 1
     if [[ "$provenance" == legacy-reference ]]; then
-        remove_persistence
+        remove_persistence || { die "无法安全移除当前持久化服务；旧版委托恢复尚未执行"; return 1; }
         nic_restore_secondary_baselines || { die "旧版委托恢复前，逐网卡 qdisc 恢复失败；策略和基线均已保留"; return 1; }
         release_lock
         log INFO "将恢复操作交给迁移时保存的旧版本工具"
@@ -5903,7 +7034,7 @@ restore_baseline() {
         log OK "旧版可信基线恢复完成"
         return 0
     fi
-    remove_persistence
+    remove_persistence || rc=1
     nic_restore_secondary_baselines || rc=1
     restore_backed_path "$CONFIG_FILE" config || rc=1
     restore_backed_path "$SYSCTL_FILE" sysctl || rc=1
@@ -5998,10 +7129,46 @@ remove_cli_command() {
     fi
 }
 
+remove_empty_nic_policy_parent() {
+    local owned="${1:-0}" policy="${NIC_POLICY_DIR%/}" parent entry
+    case "$owned" in 0) return 0 ;; 1) ;; *) return 1 ;; esac
+    [[ ! -e "$policy" && ! -L "$policy" ]] || {
+        die "受管策略目录在恢复后仍然存在，拒绝删除管理入口: $policy"
+        return 1
+    }
+    parent=$(dirname -- "$policy") || return 1
+
+    # Only the exact standard path is project-owned at the parent level.
+    # Custom paths may point into a directory that existed before this tool,
+    # even when their final components happen to use the same names.
+    if [[ "$policy" != "$STANDARD_NIC_POLICY_DIR" ]]; then
+        log WARN "策略目录使用自定义父路径，卸载不会删除其父目录: $parent"
+        return 0
+    fi
+    if [[ -L "$parent" ]]; then
+        log WARN "策略父目录是符号链接，卸载不会删除: $parent"
+        return 0
+    fi
+    [[ -d "$parent" ]] || return 0
+    if rmdir -- "$parent" 2>/dev/null; then
+        log INFO "已删除空策略父目录: $parent"
+        return 0
+    fi
+    for entry in "$parent"/* "$parent"/.[!.]* "$parent"/..?*; do
+        if [[ -e "$entry" || -L "$entry" ]]; then
+            log WARN "策略父目录包含非项目内容，已保留: $parent"
+            return 0
+        fi
+    done
+    die "策略父目录为空但无法删除: $parent"
+    return 1
+}
+
 uninstall_managed() {
     require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
-    require_commands ip tc sysctl systemctl readlink grep cut sed mktemp mv rm chmod chown || return 1
+    require_commands ip tc sysctl systemctl readlink grep cut sed mktemp mv rm rmdir dirname chmod chown || return 1
     local purge="${1:-0}" resolved_state restored_tcp=0 restored_dns=0 restored_ipv6=0 interfaces other
+    local policy_layout policy_parent_owned=0
 
     case "$purge" in 0|1) ;; *) die "非法卸载清理模式: $purge"; return 1 ;; esac
     if (( purge )); then
@@ -6013,6 +7180,16 @@ uninstall_managed() {
     fi
     legacy_shell_commands_preflight || return 1
     acquire_lock || return 1
+
+    policy_layout=$(nic_policy_layout_state) || { die "无法识别多网卡策略目录状态"; return 1; }
+    case "$policy_layout" in
+        absent) ;;
+        managed)
+            nic_policy_set_validate || return 1
+            policy_parent_owned=1
+            ;;
+        *) die "多网卡策略目录损坏或不属于本项目；为保留恢复证据，本次不会卸载"; return 1 ;;
+    esac
 
     # Restore before deleting either the executable or the only recovery data.
     if [[ -e "$BASELINE_DIR" || -L "$BASELINE_DIR" ]]; then
@@ -6032,8 +7209,18 @@ uninstall_managed() {
             die "没有可信 TCP 基线且仍有受管 HTB；已保留配置、服务和 bbr 命令"
             return 1
         fi
-        remove_persistence
-        rm -f -- "$CONFIG_FILE" "$SYSCTL_FILE"
+        remove_persistence || {
+            die "无法完整移除持久化服务；已保留 bbr 命令、配置和恢复状态"
+            return 1
+        }
+        rm -f -- "$CONFIG_FILE" "$SYSCTL_FILE" || {
+            die "无法删除管理配置；已保留 bbr 命令和恢复状态"
+            return 1
+        }
+        if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" || -e "$SYSCTL_FILE" || -L "$SYSCTL_FILE" ]]; then
+            die "管理配置删除后仍然存在；已保留 bbr 命令和恢复状态"
+            return 1
+        fi
         log WARN "没有 TCP 基线：未发现任何受管 HTB，已移除管理文件；无法精确恢复修改前的运行时 sysctl/qdisc"
     fi
     interfaces=$(managed_htb_interfaces_strict) || return 1
@@ -6047,9 +7234,16 @@ uninstall_managed() {
     if [[ -f "$DNS_BACKUP_DIR/baseline/manifest" ]]; then dns_restore || return 1; restored_dns=1; fi
     if [[ -f "$IPV6_BACKUP_DIR/baseline/sysctl.tsv" ]]; then ipv6_restore || return 1; restored_ipv6=1; fi
 
+    remove_empty_nic_policy_parent "$policy_parent_owned" || return 1
     remove_cli_command || return 1
     if (( purge )); then
-        [[ ! -e "$resolved_state" ]] || rm -rf -- "$resolved_state"
+        if [[ -e "$resolved_state" || -L "$resolved_state" ]]; then
+            rm -rf -- "$resolved_state" || { die "无法永久删除状态目录: $resolved_state"; return 1; }
+        fi
+        [[ ! -e "$resolved_state" && ! -L "$resolved_state" ]] || {
+            die "状态目录删除后仍然存在: $resolved_state"
+            return 1
+        }
         log WARN "已完整卸载并永久删除状态目录"
     elif [[ -d "$STATE_DIR" ]]; then
         log OK "已完整卸载；可用基线已恢复，备份和历史保留在 $STATE_DIR"
@@ -6214,7 +7408,7 @@ verify_system_state() {
     verify_persistence_artifacts || rc=1
     systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未启用"; rc=1; }
     systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未运行"; rc=1; }
-    if (( TC_ENABLED )); then verify_shaping "$iface" || rc=1
+    if (( TC_ENABLED )); then verify_shaping "$iface" "$TC_RATE_MBIT" || rc=1
     else [[ "$(root_qdisc_kind "$iface")" == fq ]] || { log ERR "root qdisc 不是 fq"; rc=1; }
     fi
     if (( rc == 0 )); then log OK "运行时与持久化状态一致"; else die "验证发现不一致"; fi
@@ -7224,17 +8418,13 @@ EOF
 dns_apply() {
     require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
     acquire_lock || return 1; require_commands systemctl resolvectl timeout || return 1
-    local mode="${1:-auto}" rc rollback_rc=0
-    [[ "$mode" == auto || "$mode" == dot || "$mode" == plain ]] || { die "DNS mode 只支持 auto/dot/plain"; return 1; }
+    local mode="${1:-}" rc rollback_rc=0
+    [[ "$mode" == dot || "$mode" == plain ]] || { die "内部 DNS mode 只支持 dot/plain"; return 1; }
     dns_refuse_pending_transaction || return 1
     systemctl cat systemd-resolved >/dev/null 2>&1 || { die "系统未提供 systemd-resolved"; return 1; }
     dns_preflight_takeover || return 1
     dns_require_legacy_baseline_lifecycle_safety || return 1
     dns_capture_baseline || return 1
-    if [[ "$mode" == auto ]]; then
-        mode='dot'
-        log INFO "自动模式将尝试经认证的 DoT；验证失败会完整回滚，不会降级为普通公共 DNS"
-    fi
     dns_transaction_begin || return 1
     if dns_apply_steps "$mode"; then
         dns_transaction_commit
@@ -9249,6 +10439,7 @@ Usage:
                     [--bandwidth MBIT --rtt MS]
   ${0##*/} nic unmanage --interface DEV
   ${0##*/} nic verify [--interface DEV]
+  ${0##*/} nic apply
   ${0##*/} measure deps
   ${0##*/} measure path --peer HOST [--interface DEV] [--samples 7] [--no-pmtu]
   ${0##*/} measure probe --peer HOST [--port 5201] [--duration 10] [--parallel 4]
@@ -9431,7 +10622,7 @@ cmd_nic() {
             load_config || return 1
             nic_verify_runtime_policies "$iface"
             ;;
-        apply) require_no_arguments "nic apply" "$@" || return 1; nic_apply_command ;;
+        apply) require_no_arguments "nic apply" "$@" || return 1; apply_configured_state ;;
         *) die "nic 子命令应为 list/status/plan/manage/unmanage/verify/apply" ;;
     esac
 }
@@ -9928,6 +11119,7 @@ auto_tune_wizard() {
     qdisc_guard "$iface" || return 1
     BANDWIDTH_MBIT="$nominal"; network_tuning_preflight "$iface" 1 || return 1
     action_transaction_begin_multi "$iface" || return 1
+    action_transaction_mark_mutated || { action_transaction_discard_snapshot || true; return 1; }
     if auto_tune_execute "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" "$peer_rtt"; then
         action_transaction_commit
         return
@@ -9947,7 +11139,7 @@ menu_run() {
     # the menu's errexit state. Transactions also live in that shell, so it
     # must own an EXIT trap; the parent trap cannot see child-only variables
     # after Ctrl-C, SIGTERM or another abrupt exit.
-    ( set -Eeuo pipefail; trap cleanup_core EXIT; "$@" )
+    ( set -Eeuo pipefail; trap cleanup_core_exit EXIT; "$@" )
     rc=$?
     set -e
     (( rc != 90 )) || return 90
@@ -10141,7 +11333,7 @@ interactive_menu() {
 }
 
 main() {
-    trap cleanup_core EXIT
+    trap cleanup_core_exit EXIT
     local command="${1:-}"; [[ -n "$command" ]] && shift || true
     if [[ -z "$command" ]]; then
         if [[ -t 0 ]]; then interactive_menu; else show_help; fi

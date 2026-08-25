@@ -41,7 +41,7 @@ jobs:
           grep -Fxq "SCRIPT_VERSION=\"$version\"" src/00-header.sh
           SKIP_RELEASE_CHECKSUM=1 bash scripts/validate.sh
           bash scripts/release.sh
-          git diff --exit-code -- net-tcp-tune.sh
+          git diff --exit-code -- net-tcp-tune.sh SHA256SUMS
           sha256sum -c SHA256SUMS
 
       - name: Publish GitHub Release

@@ -267,46 +267,155 @@ apply_sysctl_profile() {
     fi
 }
 
+route_expiry_seconds_normalize() {
+    local value="${1:-}"
+    [[ "$value" != *sec ]] || value="${value%sec}"
+    is_uint "$value" || return 1
+    (( ${#value} <= 10 )) || return 1
+    (( 10#$value <= 4294967295 )) || return 1
+    printf '%s\n' "$value"
+}
+
+route_window_mutation_line() {
+    local line="$1" token value i
+    local -a route=() clean=()
+    [[ -n "$line" ]] || return 1
+    read -r -a route <<< "$line"
+    for ((i=0; i<${#route[@]}; i++)); do
+        token="${route[$i]}"
+        case "$token" in
+            initcwnd|initrwnd|uid)
+                (( i + 1 < ${#route[@]} )) || return 1
+                is_uint "${route[$((i + 1))]}" || return 1
+                ((i+=1))
+                ;;
+            expires)
+                (( i + 1 < ${#route[@]} )) || return 1
+                value=$(route_expiry_seconds_normalize "${route[$((i + 1))]}") || return 1
+                clean+=(expires "$value")
+                ((i+=1))
+                ;;
+            *) clean+=("$token") ;;
+        esac
+    done
+    (( ${#clean[@]} > 0 )) || return 1
+    printf '%s\n' "${clean[*]}"
+}
+
 apply_initial_windows() {
     (( INITCWND > 0 || INITRWND > 0 )) || return 0
-    local family line token i changed=0
-    local -a args=() clean=()
+    local family routes line normalized targets=0 rc=0
+    local -A route_lines=()
+    local -a clean=()
+
+    # Read both routing families before changing either one.  Treat an empty
+    # default-route set as valid, but never hide a failed route query: doing so
+    # could otherwise leave only IPv4 or IPv6 changed and report success.
     for family in -4 -6; do
-        line=$(ip "$family" route show default 2>/dev/null | sed -n '1p' || true)
+        if ! routes=$(ip "$family" route show default 2>/dev/null); then
+            die "无法读取 IPv${family#-} 默认路由；未应用 initcwnd/initrwnd"
+            return 1
+        fi
+        line=$(sed -n '1p' <<< "$routes")
+        if [[ -n "$line" ]]; then
+            normalized=$(route_window_mutation_line "$line") || {
+                die "IPv${family#-} 默认路由包含不可安全重放的动态字段"
+                return 1
+            }
+            route_lines["$family"]="$normalized"
+            ((targets+=1))
+        else
+            route_lines["$family"]=""
+        fi
+    done
+    (( targets > 0 )) || { die "没有可设置 initcwnd/initrwnd 的默认路由"; return 1; }
+
+    for family in -4 -6; do
+        line="${route_lines[$family]}"
         [[ -n "$line" ]] || continue
-        read -r -a args <<< "$line"
-        clean=()
-        for ((i=0; i<${#args[@]}; i++)); do
-            token="${args[$i]}"
-            if [[ "$token" == initcwnd || "$token" == initrwnd ]]; then ((i+=1)); continue; fi
-            clean+=("$token")
-        done
+        read -r -a clean <<< "$line"
         (( INITCWND > 0 )) && clean+=(initcwnd "$INITCWND")
         (( INITRWND > 0 )) && clean+=(initrwnd "$INITRWND")
-        if ip "$family" route change "${clean[@]}"; then ((changed+=1)); fi
+        ip "$family" route change "${clean[@]}" || rc=1
     done
-    (( changed > 0 )) || { die "没有可设置 initcwnd/initrwnd 的默认路由"; return 1; }
+    (( rc == 0 )) || { die "initcwnd/initrwnd 未能在全部可用 IP 默认路由上生效"; return 1; }
+}
+
+default_route_windows_snapshot_preflight() {
+    local directory="$1" family file baseline_routes current_routes baseline_identity current_identity
+    for family in -4 -6; do
+        file="$directory/default-route-v${family#-}.txt"
+        [[ -e "$file" || -L "$file" ]] || return 1
+        [[ -f "$file" && ! -L "$file" ]] || return 1
+        baseline_routes=$(<"$file")
+        current_routes=$(ip "$family" route show default 2>/dev/null) || return 1
+        baseline_identity=$(route_set_identity_without_initial_windows "$baseline_routes") || return 1
+        current_identity=$(route_set_identity_without_initial_windows "$current_routes") || return 1
+        [[ "$baseline_identity" == "$current_identity" ]] || return 1
+    done
 }
 
 restore_default_route_windows_snapshot() {
-    local directory="$1" family file baseline current token i rc=0
-    local -a route=() clean=()
+    local directory="$1" family file baseline current routes baseline_identity current_identity normalized rc=0
+    local -a clean=()
+    default_route_windows_snapshot_preflight "$directory" || return 1
     for family in -4 -6; do
         file="$directory/default-route-v${family#-}.txt"
         [[ -s "$file" ]] || continue
         baseline=$(head -n1 "$file")
-        current=$(ip "$family" route show default 2>/dev/null | sed -n '1p' || true)
+        routes=$(ip "$family" route show default 2>/dev/null) || { rc=1; continue; }
+        current=$(sed -n '1p' <<< "$routes")
         [[ "$baseline$current" == *initcwnd* || "$baseline$current" == *initrwnd* ]] || continue
         [[ -n "$current" ]] || { rc=1; continue; }
-        read -r -a route <<< "$current"; clean=()
-        for ((i=0; i<${#route[@]}; i++)); do
-            token="${route[$i]}"
-            if [[ "$token" == initcwnd || "$token" == initrwnd ]]; then ((i+=1)); continue; fi
-            clean+=("$token")
-        done
+        baseline_identity=$(route_identity_without_initial_windows "$baseline") || { rc=1; continue; }
+        current_identity=$(route_identity_without_initial_windows "$current") || { rc=1; continue; }
+        # Only the two managed window attributes belong to this transaction.
+        # A gateway/device/table/metric change is external route ownership
+        # drift; never graft an old window value onto that new route.
+        [[ "$baseline_identity" == "$current_identity" ]] || { rc=1; continue; }
+        normalized=$(route_window_mutation_line "$current") || { rc=1; continue; }
+        read -r -a clean <<< "$normalized"
         if [[ "$baseline" =~ (^|[[:space:]])initcwnd[[:space:]]+([0-9]+) ]]; then clean+=(initcwnd "${BASH_REMATCH[2]}"); fi
         if [[ "$baseline" =~ (^|[[:space:]])initrwnd[[:space:]]+([0-9]+) ]]; then clean+=(initrwnd "${BASH_REMATCH[2]}"); fi
         ip "$family" route replace "${clean[@]}" || rc=1
     done
     return "$rc"
+}
+
+route_identity_without_initial_windows() {
+    local line="$1" token value i
+    local -a route=() clean=()
+    [[ -n "$line" ]] || return 1
+    read -r -a route <<< "$line"
+    for ((i=0; i<${#route[@]}; i++)); do
+        token="${route[$i]}"
+        # expires is a live RA lifetime countdown and uid is query context,
+        # not forwarding identity.  They may change between snapshot and
+        # preflight without the default route itself changing ownership.
+        if [[ "$token" == initcwnd || "$token" == initrwnd ||
+              "$token" == expires || "$token" == uid ]]; then
+            (( i + 1 < ${#route[@]} )) || return 1
+            value="${route[$((i + 1))]}"
+            if [[ "$token" == expires ]]; then
+                route_expiry_seconds_normalize "$value" >/dev/null || return 1
+            else
+                is_uint "$value" || return 1
+            fi
+            ((i+=1))
+            continue
+        fi
+        clean+=("$token")
+    done
+    (( ${#clean[@]} > 0 )) || return 1
+    printf '%s\n' "${clean[*]}"
+}
+
+route_set_identity_without_initial_windows() {
+    local text="$1" line identity identities=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] || continue
+        identity=$(route_identity_without_initial_windows "$line") || return 1
+        identities+="${identities:+$'\n'}$identity"
+    done <<< "$text"
+    [[ -z "$identities" ]] || LC_ALL=C sort <<< "$identities"
 }

@@ -415,19 +415,19 @@ EOF
     if dns_apply plain >/dev/null 2>&1; then fail 'status output without Global section was accepted'; fi
 }
 
-test_auto_dot_failure_rolls_back_without_plain_fallback() {
+test_dot_failure_rolls_back_without_plain_fallback() {
     reset_case
     ln -s "$DNS_STUB_RESOLV" "$DNS_RESOLV_CONF"
     UNIT_ENABLED=disabled
     UNIT_ACTIVE=active
     QUERY_FAIL=1
-    if dns_apply auto >/dev/null 2>&1; then fail 'failed DoT auto mode reported success'; fi
+    if dns_apply dot >/dev/null 2>&1; then fail 'failed strict DoT mode reported success'; fi
     assert_contains "$DNS_BACKUP_DIR/baseline/service.unit" $'disabled\tactive\tloaded'
     assert_eq disabled "$UNIT_ENABLED" 'rollback did not restore disabled unit state'
     assert_eq active "$UNIT_ACTIVE" 'rollback did not restore active unit state'
     [[ ! -e "$DNS_DROPIN" ]] || fail 'failed DoT left its drop-in installed'
-    [[ "$APPLIED_CONTENT" == *'DNSOverTLS=yes'* ]] || fail 'auto mode did not try strict DoT'
-    [[ "$APPLIED_CONTENT" != *'DNSOverTLS=no'* ]] || fail 'auto mode silently fell back to plain DNS'
+    [[ "$APPLIED_CONTENT" == *'DNSOverTLS=yes'* ]] || fail 'strict DoT mode was not attempted'
+    [[ "$APPLIED_CONTENT" != *'DNSOverTLS=no'* ]] || fail 'strict DoT silently fell back to plain DNS'
     assert_eq '' "$DNS_TRANSACTION_DIR" 'failed DoT left a transaction behind'
 }
 
@@ -599,7 +599,7 @@ test_legacy_baseline_blocks_lifecycle_changes
 test_corrupt_baseline_is_never_overwritten
 test_inactive_resolver_without_domain_inspection_fails_closed
 test_unknown_and_unowned_global_domains_fail_closed
-test_auto_dot_failure_rolls_back_without_plain_fallback
+test_dot_failure_rolls_back_without_plain_fallback
 test_legacy_uninspectable_routing_cannot_commit
 test_dot_verification_uses_only_global_and_encrypted_evidence
 test_dot_success_commits_complete_dual_stack_policy

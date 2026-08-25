@@ -17,7 +17,8 @@ LEGACY_SYSCTL_FILE="${BBRV3_LEGACY_SYSCTL_FILE:-/etc/sysctl.d/99-bbr-ultimate.co
 LOCK_FILE="${BBRV3_LOCK_FILE:-/run/lock/bbrv3-lite.lock}"
 DNS_BACKUP_DIR="${BBRV3_DNS_BACKUP_DIR:-${STATE_DIR}/dns}"
 IPV6_BACKUP_DIR="${BBRV3_IPV6_BACKUP_DIR:-${STATE_DIR}/ipv6}"
-NIC_POLICY_DIR="${BBRV3_NIC_POLICY_DIR:-/etc/bbrv3-lite/interfaces.d}"
+STANDARD_NIC_POLICY_DIR="/etc/bbrv3-lite/interfaces.d"
+NIC_POLICY_DIR="${BBRV3_NIC_POLICY_DIR:-$STANDARD_NIC_POLICY_DIR}"
 NIC_STATE_DIR="${BBRV3_NIC_STATE_DIR:-${STATE_DIR}/interfaces}"
 
 COLOR_ENABLED=0
@@ -141,27 +142,46 @@ human_bytes() {
 }
 
 cleanup_core() {
-    local rc=$?
+    local rc="${1:-$?}" cleanup_rc=0
+    if (( ${QDISC_DEFAULT_TRANSACTION_ACTIVE:-0} == 1 )) && declare -F qdisc_default_transaction_restore >/dev/null; then
+        log WARN "进程退出时 default_qdisc 临时事务仍未提交，正在恢复全局原值"
+        qdisc_default_transaction_restore || cleanup_rc=1
+    fi
+    if [[ -n "${NIC_RUNTIME_TRANSACTION_DIR:-}" ]] && declare -F nic_runtime_transaction_rollback >/dev/null; then
+        log WARN "进程退出时仍有未完成的网络运行时事务，正在恢复全部接口和全局状态"
+        nic_runtime_transaction_rollback || cleanup_rc=1
+    fi
     if [[ -n "${TC_TRIAL_IFACE:-}" && -n "${TC_TRIAL_SNAPSHOT:-}" ]] && declare -F tc_trial_transaction_rollback >/dev/null; then
         log WARN "进程退出时仍有未提交的临时 TC 操作，正在恢复操作前 qdisc"
-        tc_trial_transaction_rollback || true
+        tc_trial_transaction_rollback || cleanup_rc=1
     fi
     if [[ -n "${MEASURE_IFACE:-}" && -n "${MEASURE_SNAPSHOT:-}" ]] && declare -F measure_restore >/dev/null; then
         log WARN "进程退出时仍有测量快照，正在恢复操作前 qdisc"
-        measure_restore || true
+        measure_restore || cleanup_rc=1
     fi
     if [[ -n "${DNS_TRANSACTION_DIR:-}" ]] && declare -F dns_transaction_rollback >/dev/null; then
         log WARN "进程退出时仍有未提交 DNS 事务，正在恢复操作前状态"
-        dns_transaction_rollback || true
+        dns_transaction_rollback || cleanup_rc=1
     fi
     if [[ -n "${IPV6_TRANSACTION_DIR:-}" ]] && declare -F ipv6_transaction_rollback >/dev/null; then
         log WARN "进程退出时仍有未提交 IPv6 事务，正在恢复操作前状态"
-        ipv6_transaction_rollback || true
+        ipv6_transaction_rollback || cleanup_rc=1
     fi
     if [[ -n "${ACTION_TRANSACTION_DIR:-}" ]] && declare -F action_transaction_rollback >/dev/null; then
         log WARN "进程退出时仍有未提交事务，正在恢复操作前状态"
-        action_transaction_rollback || true
+        action_transaction_rollback || cleanup_rc=1
     fi
-    release_lock
-    return "$rc"
+    release_lock || cleanup_rc=1
+    (( rc != 0 )) && return "$rc"
+    return "$cleanup_rc"
+}
+
+cleanup_core_exit() {
+    local original_rc=$? final_rc
+    # EXIT trap return values do not replace the process status in Bash. Clear
+    # the trap and exit explicitly so a failed emergency rollback can never be
+    # reported to systemd or an operator as a successful command.
+    trap - EXIT
+    if cleanup_core "$original_rc"; then final_rc=0; else final_rc=$?; fi
+    exit "$final_rc"
 }

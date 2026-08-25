@@ -24,6 +24,7 @@ Usage:
                     [--bandwidth MBIT --rtt MS]
   ${0##*/} nic unmanage --interface DEV
   ${0##*/} nic verify [--interface DEV]
+  ${0##*/} nic apply
   ${0##*/} measure deps
   ${0##*/} measure path --peer HOST [--interface DEV] [--samples 7] [--no-pmtu]
   ${0##*/} measure probe --peer HOST [--port 5201] [--duration 10] [--parallel 4]
@@ -206,7 +207,7 @@ cmd_nic() {
             load_config || return 1
             nic_verify_runtime_policies "$iface"
             ;;
-        apply) require_no_arguments "nic apply" "$@" || return 1; nic_apply_command ;;
+        apply) require_no_arguments "nic apply" "$@" || return 1; apply_configured_state ;;
         *) die "nic 子命令应为 list/status/plan/manage/unmanage/verify/apply" ;;
     esac
 }
@@ -703,6 +704,7 @@ auto_tune_wizard() {
     qdisc_guard "$iface" || return 1
     BANDWIDTH_MBIT="$nominal"; network_tuning_preflight "$iface" 1 || return 1
     action_transaction_begin_multi "$iface" || return 1
+    action_transaction_mark_mutated || { action_transaction_discard_snapshot || true; return 1; }
     if auto_tune_execute "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" "$peer_rtt"; then
         action_transaction_commit
         return
@@ -722,7 +724,7 @@ menu_run() {
     # the menu's errexit state. Transactions also live in that shell, so it
     # must own an EXIT trap; the parent trap cannot see child-only variables
     # after Ctrl-C, SIGTERM or another abrupt exit.
-    ( set -Eeuo pipefail; trap cleanup_core EXIT; "$@" )
+    ( set -Eeuo pipefail; trap cleanup_core_exit EXIT; "$@" )
     rc=$?
     set -e
     (( rc != 90 )) || return 90
@@ -916,7 +918,7 @@ interactive_menu() {
 }
 
 main() {
-    trap cleanup_core EXIT
+    trap cleanup_core_exit EXIT
     local command="${1:-}"; [[ -n "$command" ]] && shift || true
     if [[ -z "$command" ]]; then
         if [[ -t 0 ]]; then interactive_menu; else show_help; fi

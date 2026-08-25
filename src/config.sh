@@ -2,6 +2,12 @@
 # Config: strict KEY=VALUE parser. Configuration is data and is never sourced.
 # -----------------------------------------------------------------------------
 
+CONFIG_KEYS=(
+    SCHEMA_VERSION BBR_ENABLED SYSCTL_PROFILE ROLE BANDWIDTH_MBIT RTT_MS
+    TC_ENABLED TC_INTERFACE TC_RATE_MBIT TC_KNEE_MBIT TC_MARGIN_PERCENT
+    INITCWND INITRWND MULTI_NIC_ENABLED
+)
+
 reset_config() {
     SCHEMA_VERSION="$STATE_SCHEMA"
     BBR_ENABLED=1
@@ -18,13 +24,6 @@ reset_config() {
     INITRWND=0
     MULTI_NIC_ENABLED=0
     NIC_MODEL_INTERFACE=auto
-}
-
-config_key_known() {
-    case "$1" in
-        SCHEMA_VERSION|BBR_ENABLED|SYSCTL_PROFILE|ROLE|BANDWIDTH_MBIT|RTT_MS|TC_ENABLED|TC_INTERFACE|TC_RATE_MBIT|TC_KNEE_MBIT|TC_MARGIN_PERCENT|INITCWND|INITRWND|MULTI_NIC_ENABLED) return 0 ;;
-        *) return 1 ;;
-    esac
 }
 
 validate_interface_name() {
@@ -54,7 +53,6 @@ validate_config_value() {
 
 set_config_value() {
     local key="$1" value="$2"
-    config_key_known "$key" || return 1
     validate_config_value "$key" "$value" || return 1
     printf -v "$key" '%s' "$value"
 }
@@ -96,26 +94,17 @@ load_config() {
 }
 
 write_config_stream() {
-    printf '%s\n' \
-        "# Managed by ${SCRIPT_NAME} v${SCRIPT_VERSION}; do not source this file." \
-        "SCHEMA_VERSION=${STATE_SCHEMA}" \
-        "BBR_ENABLED=${BBR_ENABLED}" \
-        "SYSCTL_PROFILE=${SYSCTL_PROFILE}" \
-        "ROLE=${ROLE}" \
-        "BANDWIDTH_MBIT=${BANDWIDTH_MBIT}" \
-        "RTT_MS=${RTT_MS}" \
-        "TC_ENABLED=${TC_ENABLED}" \
-        "TC_INTERFACE=${TC_INTERFACE}" \
-        "TC_RATE_MBIT=${TC_RATE_MBIT}" \
-        "TC_KNEE_MBIT=${TC_KNEE_MBIT}" \
-        "TC_MARGIN_PERCENT=${TC_MARGIN_PERCENT}" \
-        "INITCWND=${INITCWND}" \
-        "INITRWND=${INITRWND}" \
-        "MULTI_NIC_ENABLED=${MULTI_NIC_ENABLED}"
+    local key value
+    printf '# Managed by %s v%s; do not source this file.\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+    for key in "${CONFIG_KEYS[@]}"; do
+        value="${!key}"
+        [[ "$key" != SCHEMA_VERSION ]] || value="$STATE_SCHEMA"
+        printf '%s=%s\n' "$key" "$value"
+    done
 }
 
 save_config() {
-    local file="${1:-$CONFIG_FILE}" temp runtime_iface runtime_rate
+    local file="${1:-$CONFIG_FILE}" temp runtime_iface runtime_rate key
     # Old configurations with TC_INTERFACE=auto remain readable. New shaping
     # commits, however, must pin the interface that was actually changed so a
     # later default-route change cannot move an old rate onto another NIC.
@@ -138,7 +127,7 @@ save_config() {
         }
         if declare -F nic_policy_set_validate >/dev/null; then nic_policy_set_validate || return 1; fi
     fi
-    for key in SCHEMA_VERSION BBR_ENABLED SYSCTL_PROFILE ROLE BANDWIDTH_MBIT RTT_MS TC_ENABLED TC_INTERFACE TC_RATE_MBIT TC_KNEE_MBIT TC_MARGIN_PERCENT INITCWND INITRWND MULTI_NIC_ENABLED; do
+    for key in "${CONFIG_KEYS[@]}"; do
         validate_config_value "$key" "${!key}" || { die "拒绝写入非法配置: $key=${!key}"; return 1; }
     done
     temp=$(mktemp) || return 1

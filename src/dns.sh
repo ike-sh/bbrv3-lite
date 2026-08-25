@@ -859,17 +859,13 @@ EOF
 dns_apply() {
     require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
     acquire_lock || return 1; require_commands systemctl resolvectl timeout || return 1
-    local mode="${1:-auto}" rc rollback_rc=0
-    [[ "$mode" == auto || "$mode" == dot || "$mode" == plain ]] || { die "DNS mode 只支持 auto/dot/plain"; return 1; }
+    local mode="${1:-}" rc rollback_rc=0
+    [[ "$mode" == dot || "$mode" == plain ]] || { die "内部 DNS mode 只支持 dot/plain"; return 1; }
     dns_refuse_pending_transaction || return 1
     systemctl cat systemd-resolved >/dev/null 2>&1 || { die "系统未提供 systemd-resolved"; return 1; }
     dns_preflight_takeover || return 1
     dns_require_legacy_baseline_lifecycle_safety || return 1
     dns_capture_baseline || return 1
-    if [[ "$mode" == auto ]]; then
-        mode='dot'
-        log INFO "自动模式将尝试经认证的 DoT；验证失败会完整回滚，不会降级为普通公共 DNS"
-    fi
     dns_transaction_begin || return 1
     if dns_apply_steps "$mode"; then
         dns_transaction_commit

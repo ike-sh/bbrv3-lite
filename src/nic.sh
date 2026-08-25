@@ -6,6 +6,11 @@ NIC_POLICY_SCHEMA="1"
 NIC_POLICY_FORMAT="bbrv3-lite-nic-policy"
 NIC_BASELINE_SCHEMA="1"
 NIC_BASELINE_FORMAT="bbrv3-lite-nic-baseline"
+NIC_RUNTIME_TRANSACTION_DIR=""
+NIC_RUNTIME_TRANSACTION_PARENT=""
+NIC_RUNTIME_TRANSACTION_MUTATED=0
+NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+NIC_RUNTIME_TRANSACTION_READY=0
 
 nic_policy_reset_record() {
     NIC_POLICY_INTERFACE=""
@@ -74,15 +79,23 @@ nic_policy_manifest_validate() {
 }
 
 nic_policy_directory_entries_validate() {
-    local entry name
-    while IFS= read -r -d '' entry; do
+    local entry name had_nullglob=0 had_dotglob=0
+    local -a entries=()
+    [[ -d "$NIC_POLICY_DIR" && ! -L "$NIC_POLICY_DIR" && -r "$NIC_POLICY_DIR" && -x "$NIC_POLICY_DIR" ]] || return 1
+    shopt -q nullglob && had_nullglob=1
+    shopt -q dotglob && had_dotglob=1
+    shopt -s nullglob dotglob
+    entries=("$NIC_POLICY_DIR"/*)
+    (( had_nullglob )) || shopt -u nullglob
+    (( had_dotglob )) || shopt -u dotglob
+    for entry in "${entries[@]}"; do
         name="${entry##*/}"
         case "$name" in
             .manifest) [[ -f "$entry" && ! -L "$entry" ]] || { die "网卡策略清单类型非法: $entry"; return 1; } ;;
             *.conf) [[ -f "$entry" && ! -L "$entry" ]] || { die "网卡策略必须是非符号链接常规文件: $entry"; return 1; } ;;
             *) die "多网卡策略目录含未知条目: $entry"; return 1 ;;
         esac
-    done < <(find "$NIC_POLICY_DIR" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    done
 }
 
 nic_policy_layout_state() {
@@ -117,6 +130,18 @@ nic_policy_files() {
         [[ -f "$file" && ! -L "$file" ]] || continue
         printf '%s\n' "$file"
     done | LC_ALL=C sort
+}
+
+# Buffer the producer before exposing any path to a caller.  In particular, a
+# glob/sort/read failure must not leak a valid-looking prefix that a process
+# substitution could mistake for the complete policy set.
+nic_policy_files_checked() {
+    local files
+    if ! files=$(nic_policy_files); then
+        die "无法完整枚举多网卡策略；拒绝使用不完整策略集合"
+        return 1
+    fi
+    [[ -z "$files" ]] || printf '%s\n' "$files"
 }
 
 nic_policy_load_file() {
@@ -174,8 +199,8 @@ nic_policy_load_file() {
 nic_policy_path() { printf '%s/%s.conf\n' "$NIC_POLICY_DIR" "$1"; }
 nic_policy_exists() { [[ -f "$(nic_policy_path "$1")" && ! -L "$(nic_policy_path "$1")" ]]; }
 
-nic_policy_set_validate() {
-    local state file count=0
+nic_policy_set_validate_files() {
+    local files="$1" state file count=0
     state=$(nic_policy_layout_state)
     [[ "$state" == managed ]] || { die "多网卡模式需要有效策略目录，当前: $state"; return 1; }
     nic_policy_directory_entries_validate || return 1
@@ -183,8 +208,14 @@ nic_policy_set_validate() {
         [[ -n "$file" ]] || continue
         nic_policy_load_file "$file" || return 1
         ((count+=1))
-    done < <(nic_policy_files)
+    done <<< "$files"
     return 0
+}
+
+nic_policy_set_validate() {
+    local files
+    files=$(nic_policy_files_checked) || return 1
+    nic_policy_set_validate_files "$files"
 }
 
 nic_policy_write() {
@@ -222,12 +253,14 @@ nic_policy_remove() {
 }
 
 nic_policy_interface_list() {
-    local file
+    local files file interfaces=""
+    files=$(nic_policy_files_checked) || return 1
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         nic_policy_load_file "$file" >/dev/null || return 1
-        printf '%s\n' "$NIC_POLICY_INTERFACE"
-    done < <(nic_policy_files)
+        interfaces+="${interfaces:+$'\n'}$NIC_POLICY_INTERFACE"
+    done <<< "$files"
+    [[ -z "$interfaces" ]] || printf '%s\n' "$interfaces"
 }
 
 nic_policy_validate_identity() {
@@ -280,27 +313,47 @@ nic_aggregate_model_rows() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$profile" "$role" "$bandwidth" "$rtt" "$iface"
 }
 
-nic_policy_model_rows() {
-    local excluded="${1:-}" file
+nic_policy_model_rows_files() {
+    local excluded="$1" files="$2" file rows=""
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         nic_policy_load_file "$file" >/dev/null || return 1
         [[ -z "$excluded" || "$NIC_POLICY_INTERFACE" != "$excluded" ]] || continue
-        printf '%s\t%s\t%s\t%s\t%s\n' "$NIC_POLICY_PROFILE" "$NIC_POLICY_ROLE" "$NIC_POLICY_BANDWIDTH_MBIT" "$NIC_POLICY_RTT_MS" "$NIC_POLICY_INTERFACE"
-    done < <(nic_policy_files)
+        rows+="${rows:+$'\n'}${NIC_POLICY_PROFILE}"$'\t'"${NIC_POLICY_ROLE}"$'\t'"${NIC_POLICY_BANDWIDTH_MBIT}"$'\t'"${NIC_POLICY_RTT_MS}"$'\t'"${NIC_POLICY_INTERFACE}"
+    done <<< "$files"
+    [[ -z "$rows" ]] || printf '%s\n' "$rows"
 }
 
-nic_policy_global_model() {
-    local rows
-    nic_policy_set_validate || return 1
-    rows=$(nic_policy_model_rows) || return 1
+nic_policy_model_rows() {
+    local excluded="${1:-}" files
+    files=$(nic_policy_files_checked) || return 1
+    nic_policy_model_rows_files "$excluded" "$files"
+}
+
+nic_policy_global_model_files() {
+    local files="$1" rows
+    nic_policy_set_validate_files "$files" || return 1
+    rows=$(nic_policy_model_rows_files "" "$files") || return 1
     nic_aggregate_model_rows <<< "$rows"
 }
 
+nic_policy_global_model() {
+    local files
+    files=$(nic_policy_files_checked) || return 1
+    nic_policy_global_model_files "$files"
+}
+
 nic_policy_candidate_global_model() {
-    local target="$1" profile="$2" role="$3" bandwidth="$4" rtt="$5" rows legacy_rtt
-    case "$(nic_policy_layout_state)" in managed) nic_policy_set_validate || return 1 ;; absent) ;; *) return 1 ;; esac
-    rows=$(nic_policy_model_rows "$target") || return 1
+    local target="$1" profile="$2" role="$3" bandwidth="$4" rtt="$5" rows legacy_rtt files=""
+    case "$(nic_policy_layout_state)" in
+        managed)
+            files=$(nic_policy_files_checked) || return 1
+            nic_policy_set_validate_files "$files" || return 1
+            ;;
+        absent) ;;
+        *) return 1 ;;
+    esac
+    rows=$(nic_policy_model_rows_files "$target" "$files") || return 1
     if (( ${MULTI_NIC_ENABLED:-0} == 0 )) && [[ "${TC_INTERFACE:-auto}" != auto && "${TC_INTERFACE:-auto}" != "$target" ]]; then
         legacy_rtt="$RTT_MS"
         if [[ "$SYSCTL_PROFILE" == balanced ]] && (( BANDWIDTH_MBIT == 0 )); then legacy_rtt=0; fi
@@ -351,9 +404,9 @@ nic_sync_global_model() {
     IFS=$'\t' read -r SYSCTL_PROFILE ROLE BANDWIDTH_MBIT RTT_MS NIC_MODEL_INTERFACE <<< "$values"
 }
 
-nic_global_model_verify() {
-    local values expected_profile expected_role expected_bandwidth expected_rtt expected_iface
-    values=$(nic_policy_global_model) || return 1
+nic_global_model_verify_files() {
+    local files="$1" values expected_profile expected_role expected_bandwidth expected_rtt expected_iface
+    values=$(nic_policy_global_model_files "$files") || return 1
     IFS=$'\t' read -r expected_profile expected_role expected_bandwidth expected_rtt expected_iface <<< "$values"
     NIC_MODEL_INTERFACE="$expected_iface"
     [[ "$SYSCTL_PROFILE" == "$expected_profile" && "$ROLE" == "$expected_role" &&
@@ -361,6 +414,12 @@ nic_global_model_verify() {
         die "全局 TCP 模型与多网卡策略不一致：当前 $SYSCTL_PROFILE/$ROLE/$BANDWIDTH_MBIT/$RTT_MS，期望 $expected_profile/$expected_role/$expected_bandwidth/$expected_rtt"
         return 1
     }
+}
+
+nic_global_model_verify() {
+    local files
+    files=$(nic_policy_files_checked) || return 1
+    nic_global_model_verify_files "$files"
 }
 
 nic_reset_legacy_tc_fields() {
@@ -439,13 +498,6 @@ nic_baseline_capture() {
         return
     fi
     nic_require_manageable "$iface" || return 1
-    ensure_state_layout || return 1
-    if [[ -e "$NIC_STATE_DIR" || -L "$NIC_STATE_DIR" ]]; then
-        [[ -d "$NIC_STATE_DIR" && ! -L "$NIC_STATE_DIR" ]] || { die "网卡基线根目录类型不安全: $NIC_STATE_DIR"; return 1; }
-    else
-        mkdir -p -- "$NIC_STATE_DIR" || return 1
-    fi
-    chmod 0700 "$NIC_STATE_DIR" 2>/dev/null || true
     if [[ -e "$BASELINE_DIR" || -L "$BASELINE_DIR" ]] && tcp_baseline_validate "$BASELINE_DIR" >/dev/null 2>&1 &&
        [[ "$TCP_BASELINE_VALIDATED_INTERFACE" == "$iface" && "$TCP_BASELINE_VALIDATED_PROVENANCE" != legacy-reference ]]; then
         source=global
@@ -457,6 +509,13 @@ nic_baseline_capture() {
         die "拒绝把没有策略或旧配置归属的 HTB 采用为 $iface 原始基线"
         return 1
     fi
+    ensure_state_layout || return 1
+    if [[ -e "$NIC_STATE_DIR" || -L "$NIC_STATE_DIR" ]]; then
+        [[ -d "$NIC_STATE_DIR" && ! -L "$NIC_STATE_DIR" ]] || { die "网卡基线根目录类型不安全: $NIC_STATE_DIR"; return 1; }
+    else
+        mkdir -p -- "$NIC_STATE_DIR" || return 1
+    fi
+    chmod 0700 "$NIC_STATE_DIR" 2>/dev/null || true
     temp=$(mktemp -d "${STATE_DIR}/.nic-baseline.XXXXXX") || return 1
     mac=$(nic_current_mac "$iface")
     printf 'SCHEMA\t%s\nFORMAT\t%s\nINTERFACE\t%s\nMATCH_MAC\t%s\nSOURCE\t%s\nCREATED_AT\t%s\nCREATED_BY\t%s\n' \
@@ -489,23 +548,25 @@ nic_baseline_restore() {
 }
 
 nic_restore_secondary_baselines() {
-    local iface source rc=0
+    local iface source rc=0 interfaces
     [[ "$(nic_policy_layout_state)" == managed ]] || return 0
     nic_policy_set_validate || return 1
+    interfaces=$(nic_policy_interface_list) || return 1
     while IFS= read -r iface; do
         [[ -n "$iface" ]] || continue
         nic_baseline_validate "$iface" || { rc=1; continue; }
         source=$(awk -F'\t' '$1=="SOURCE" {print $2}' "$(nic_baseline_dir "$iface")/manifest")
         [[ "$source" == snapshot ]] || continue
         nic_baseline_restore "$iface" || rc=1
-    done < <(nic_policy_interface_list)
+    done <<< "$interfaces"
     return "$rc"
 }
 
 nic_restore_preflight() {
-    local state iface dir
+    local state iface dir source interfaces
     state=$(nic_policy_layout_state)
     case "$state" in absent) return 0 ;; managed) nic_policy_set_validate || return 1 ;; *) die "多网卡策略目录损坏，恢复尚未开始"; return 1 ;; esac
+    interfaces=$(nic_policy_interface_list) || return 1
     while IFS= read -r iface; do
         [[ -n "$iface" ]] || continue
         dir=$(nic_baseline_dir "$iface")
@@ -516,7 +577,13 @@ nic_restore_preflight() {
             die "无法读取 $iface 的 qdisc/class，恢复尚未开始"
             return 1
         }
-    done < <(nic_policy_interface_list)
+        qdisc_filter_guard "$iface" || return 1
+        source=$(awk -F'\t' '$1=="SOURCE" {print $2}' "$dir/manifest")
+        if [[ "$source" == snapshot ]] && ! mq_snapshot_queue_preflight "$iface" "$dir/qdisc.snapshot"; then
+            die "$iface 的 MQ 基线与当前 TX queue 数不一致，恢复尚未开始"
+            return 1
+        fi
+    done <<< "$interfaces"
 }
 
 nic_policy_remove_tree() {
@@ -559,21 +626,15 @@ nic_finalize_multi_config() {
     nic_sync_global_model || return 1
 }
 
-nic_policy_ownership_preflight() {
-    local target="${1:-}" file iface managed policies=""
-    case "$(nic_policy_layout_state)" in
-        absent) ;;
-        managed)
-            while IFS= read -r file; do
-                [[ -n "$file" ]] || continue
-                nic_policy_load_file "$file" || return 1
-                nic_policy_validate_identity || return 1
-                qdisc_guard "$NIC_POLICY_INTERFACE" || return 1
-                policies+="${policies:+$'\n'}$NIC_POLICY_INTERFACE"
-            done < <(nic_policy_files)
-            ;;
-        *) die "多网卡策略目录损坏或不属于本项目"; return 1 ;;
-    esac
+nic_policy_ownership_preflight_files() {
+    local target="$1" files="$2" file iface managed policies=""
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        nic_policy_load_file "$file" || return 1
+        nic_policy_validate_identity || return 1
+        qdisc_guard "$NIC_POLICY_INTERFACE" || return 1
+        policies+="${policies:+$'\n'}$NIC_POLICY_INTERFACE"
+    done <<< "$files"
     if (( ${MULTI_NIC_ENABLED:-0} == 0 && ${TC_ENABLED:-0} == 1 )) && [[ "${TC_INTERFACE:-auto}" != auto ]]; then
         policies+="${policies:+$'\n'}$TC_INTERFACE"
     fi
@@ -588,6 +649,16 @@ nic_policy_ownership_preflight() {
     [[ -z "$target" ]] || { nic_require_manageable "$target" && qdisc_guard "$target"; }
 }
 
+nic_policy_ownership_preflight() {
+    local target="${1:-}" files=""
+    case "$(nic_policy_layout_state)" in
+        absent) ;;
+        managed) files=$(nic_policy_files_checked) || return 1 ;;
+        *) die "多网卡策略目录损坏或不属于本项目"; return 1 ;;
+    esac
+    nic_policy_ownership_preflight_files "$target" "$files"
+}
+
 nic_restore_runtime_snapshot() {
     local directory="$1" rc=0
     [[ -f "$directory/sysctl.tsv" ]] || return 1
@@ -596,11 +667,140 @@ nic_restore_runtime_snapshot() {
     return "$rc"
 }
 
-nic_verify_runtime_policies() {
-    local only="${1:-}" file iface managed policies="" rc=0 found=0
+nic_runtime_transaction_begin() {
+    local parent="$1"
+    [[ -z "$NIC_RUNTIME_TRANSACTION_DIR" ]] || { die "已有未完成的网络运行时事务"; return 1; }
+    NIC_RUNTIME_TRANSACTION_DIR=$(mktemp -d "$parent/${SCRIPT_NAME}.multi-nic.XXXXXX") || return 1
+    NIC_RUNTIME_TRANSACTION_PARENT="$parent"
+    NIC_RUNTIME_TRANSACTION_MUTATED=0
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+    NIC_RUNTIME_TRANSACTION_READY=0
+}
+
+nic_runtime_transaction_discard() {
+    local dir="$NIC_RUNTIME_TRANSACTION_DIR" parent="$NIC_RUNTIME_TRANSACTION_PARENT"
+    [[ -n "$dir" && -n "$parent" ]] || return 0
+    remove_tree_within "$dir" "$parent" || return 1
+    NIC_RUNTIME_TRANSACTION_DIR=""
+    NIC_RUNTIME_TRANSACTION_PARENT=""
+    NIC_RUNTIME_TRANSACTION_MUTATED=0
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+    NIC_RUNTIME_TRANSACTION_READY=0
+}
+
+nic_runtime_transaction_commit() {
+    local dir="$NIC_RUNTIME_TRANSACTION_DIR" parent="$NIC_RUNTIME_TRANSACTION_PARENT"
+    NIC_RUNTIME_TRANSACTION_DIR=""
+    NIC_RUNTIME_TRANSACTION_PARENT=""
+    NIC_RUNTIME_TRANSACTION_MUTATED=0
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+    NIC_RUNTIME_TRANSACTION_READY=0
+    [[ -z "$dir" ]] || remove_tree_within "$dir" "$parent" || log WARN "网络运行时状态已提交，但无法删除事务快照: $dir"
+}
+
+nic_runtime_transaction_write_interfaces() {
+    local interfaces="$1" dir="$NIC_RUNTIME_TRANSACTION_DIR" iface temp count=0
+    local -A seen=()
+    [[ -n "$dir" && -d "$dir" && ! -L "$dir" && "$NIC_RUNTIME_TRANSACTION_MUTATED" == 0 ]] || return 1
+    [[ -n "$interfaces" ]] || { die "运行时事务接口清单为空"; return 1; }
+    [[ ! -e "$dir/interfaces.list" && ! -L "$dir/interfaces.list" ]] || return 1
+    while IFS= read -r iface; do
+        [[ -n "$iface" ]] || { die "运行时事务接口清单含空行"; return 1; }
+        validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
+        [[ -z "${seen[$iface]+x}" ]] || { die "运行时事务接口清单重复: $iface"; return 1; }
+        seen[$iface]=1
+        [[ -f "$dir/$iface.snapshot" && ! -L "$dir/$iface.snapshot" ]] || return 1
+        action_qdisc_snapshot_validate "$dir/$iface.snapshot" || return 1
+        mq_snapshot_queue_preflight "$iface" "$dir/$iface.snapshot" || return 1
+        ((count+=1))
+    done <<< "$interfaces"
+    (( count > 0 )) || return 1
+    temp=$(mktemp "$dir/.interfaces.XXXXXX") || return 1
+    if ! printf '%s\n' "$interfaces" > "$temp" || ! chmod 0600 "$temp" || ! mv -- "$temp" "$dir/interfaces.list"; then
+        rm -f -- "$temp"
+        return 1
+    fi
+}
+
+nic_runtime_transaction_snapshot_validate() {
+    local dir="$NIC_RUNTIME_TRANSACTION_DIR" file iface count=0 expected_count=0
+    local -A expected=()
+    [[ -n "$dir" && -d "$dir" && ! -L "$dir" ]] || return 1
+    [[ -f "$dir/COMPLETE" && ! -L "$dir/COMPLETE" && "$(<"$dir/COMPLETE")" == complete ]] || return 1
+    tcp_baseline_sysctl_validate "$dir/sysctl.tsv" >/dev/null || return 1
+    [[ -f "$dir/default-route-v4.txt" && ! -L "$dir/default-route-v4.txt" ]] || return 1
+    [[ -f "$dir/default-route-v6.txt" && ! -L "$dir/default-route-v6.txt" ]] || return 1
+    default_route_windows_snapshot_preflight "$dir" || return 1
+    [[ -f "$dir/interfaces.list" && ! -L "$dir/interfaces.list" ]] || return 1
+    check_config_permissions "$dir/interfaces.list" || return 1
+    while IFS= read -r iface; do
+        [[ -n "$iface" ]] || return 1
+        validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
+        [[ -z "${expected[$iface]+x}" ]] || return 1
+        expected[$iface]=1
+        [[ -f "$dir/$iface.snapshot" && ! -L "$dir/$iface.snapshot" ]] || return 1
+        ((expected_count+=1))
+    done < "$dir/interfaces.list"
+    (( expected_count > 0 )) || return 1
+    for file in "$dir"/*.snapshot; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        iface="${file##*/}"; iface="${iface%.snapshot}"
+        validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
+        [[ -n "${expected[$iface]+x}" ]] || return 1
+        action_qdisc_snapshot_validate "$file" || return 1
+        mq_snapshot_queue_preflight "$iface" "$file" || return 1
+        qdisc_filter_guard "$iface" || return 1
+        ((count+=1))
+    done
+    (( count == expected_count ))
+}
+
+nic_runtime_transaction_mark_mutated() {
+    [[ -n "$NIC_RUNTIME_TRANSACTION_DIR" && "$NIC_RUNTIME_TRANSACTION_MUTATED" == 0 ]] || return 1
+    if ! chmod -R go-rwx "$NIC_RUNTIME_TRANSACTION_DIR" ||
+       ! printf 'complete\n' > "$NIC_RUNTIME_TRANSACTION_DIR/COMPLETE" ||
+       ! chmod 0600 "$NIC_RUNTIME_TRANSACTION_DIR/COMPLETE"; then
+        return 1
+    fi
+    NIC_RUNTIME_TRANSACTION_READY=1
+    nic_runtime_transaction_snapshot_validate || { NIC_RUNTIME_TRANSACTION_READY=0; return 1; }
+    NIC_RUNTIME_TRANSACTION_MUTATED=1
+}
+
+nic_runtime_transaction_rollback() {
+    local dir="$NIC_RUNTIME_TRANSACTION_DIR" parent="$NIC_RUNTIME_TRANSACTION_PARENT" iface rc=0
+    [[ -n "$dir" && -n "$parent" ]] || return 0
+    (( NIC_RUNTIME_TRANSACTION_ROLLING_BACK == 0 )) || return 1
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=1
+    if (( NIC_RUNTIME_TRANSACTION_MUTATED )); then
+        if (( NIC_RUNTIME_TRANSACTION_READY != 1 )) || ! nic_runtime_transaction_snapshot_validate; then
+            log ERR "网络运行时事务快照已损坏，或运行时 qdisc filter/队列/路由身份已漂移且不可完整验证；拒绝执行回滚，证据保留在 $dir"
+            rc=1
+        else
+            nic_restore_runtime_snapshot "$dir" || rc=1
+            while IFS= read -r iface; do
+                restore_action_qdisc "$iface" "$dir/$iface.snapshot" || rc=1
+            done < "$dir/interfaces.list"
+        fi
+    fi
+    if (( rc == 0 )); then
+        remove_tree_within "$dir" "$parent" || rc=1
+    fi
+    if (( rc == 0 )); then
+        NIC_RUNTIME_TRANSACTION_DIR=""
+        NIC_RUNTIME_TRANSACTION_PARENT=""
+        NIC_RUNTIME_TRANSACTION_MUTATED=0
+        NIC_RUNTIME_TRANSACTION_READY=0
+    fi
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+    return "$rc"
+}
+
+nic_verify_runtime_policies_files() {
+    local only="$1" files="$2" file iface managed policies="" rc=0 found=0
     (( MULTI_NIC_ENABLED == 1 )) || { die "当前不是多网卡配置"; return 1; }
-    nic_policy_set_validate || return 1
-    nic_global_model_verify || rc=1
+    nic_policy_set_validate_files "$files" || return 1
+    nic_global_model_verify_files "$files" || rc=1
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         nic_policy_load_file "$file" || { rc=1; continue; }
@@ -609,12 +809,12 @@ nic_verify_runtime_policies() {
         found=1
         nic_policy_validate_identity || { rc=1; continue; }
         if [[ "$NIC_POLICY_MODE" == shape ]]; then
-            verify_shaping "$iface" || rc=1
+            verify_shaping "$iface" "$NIC_POLICY_RATE_MBIT" || rc=1
             [[ "$(managed_rate_mbit "$iface" 2>/dev/null || true)" == "$NIC_POLICY_RATE_MBIT" ]] || { log ERR "$iface 整形速率漂移"; rc=1; }
         else
             [[ "$(root_qdisc_kind "$iface")" == fq ]] || { log ERR "$iface root qdisc 不是 fq"; rc=1; }
         fi
-    done < <(nic_policy_files)
+    done <<< "$files"
     [[ -z "$only" || $found == 1 ]] || { die "没有找到网卡策略: $only"; return 1; }
     if [[ -z "$only" ]]; then
         managed=$(managed_htb_interfaces_strict) || return 1
@@ -627,25 +827,47 @@ nic_verify_runtime_policies() {
     log OK "多网卡运行时与策略一致${only:+: $only}"
 }
 
+nic_verify_runtime_policies() {
+    local only="${1:-}" files
+    files=$(nic_policy_files_checked) || return 1
+    nic_verify_runtime_policies_files "$only" "$files"
+}
+
 nic_apply_runtime_policies() {
-    local file iface rc=0 mutated=0 snapshot_dir="" snapshot_parent
-    nic_policy_set_validate || return 1
-    nic_global_model_verify || return 1
-    nic_policy_ownership_preflight || return 1
+    local file iface rc=0 mutated=0 snapshot_dir="" snapshot_parent rollback_rc=0 policy_files interfaces=""
+    policy_files=$(nic_policy_files_checked) || return 1
+    [[ -n "$policy_files" ]] || { die "多网卡持久化应用需要至少一个网卡策略"; return 1; }
+    nic_policy_set_validate_files "$policy_files" || return 1
+    nic_global_model_verify_files "$policy_files" || return 1
+    nic_policy_ownership_preflight_files "" "$policy_files" || return 1
     snapshot_parent="${TMPDIR:-/tmp}"
-    snapshot_dir=$(mktemp -d "$snapshot_parent/${SCRIPT_NAME}.multi-nic.XXXXXX") || return 1
+    nic_runtime_transaction_begin "$snapshot_parent" || return 1
+    snapshot_dir="$NIC_RUNTIME_TRANSACTION_DIR"
     if ! capture_runtime_sysctls > "$snapshot_dir/sysctl.tsv"; then
-        remove_tree_within "$snapshot_dir" "$snapshot_parent" || true
+        nic_runtime_transaction_discard || true
         return 1
     fi
-    ip -4 route show default > "$snapshot_dir/default-route-v4.txt" 2>/dev/null || true
-    ip -6 route show default > "$snapshot_dir/default-route-v6.txt" 2>/dev/null || true
+    if ! ip -4 route show default > "$snapshot_dir/default-route-v4.txt" 2>/dev/null ||
+       ! ip -6 route show default > "$snapshot_dir/default-route-v6.txt" 2>/dev/null; then
+        if ! nic_runtime_transaction_discard; then
+            die "多网卡持久化应用无法完整读取 IPv4/IPv6 默认路由；未修改运行时状态，但临时快照无法删除: $snapshot_dir"
+        else
+            die "多网卡持久化应用无法完整读取 IPv4/IPv6 默认路由；未修改运行时状态"
+        fi
+        return 1
+    fi
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         nic_policy_load_file "$file" || { rc=1; break; }
         action_qdisc_snapshot "$NIC_POLICY_INTERFACE" "$snapshot_dir/$NIC_POLICY_INTERFACE.snapshot" || { rc=1; break; }
-    done < <(nic_policy_files)
-    if (( rc == 0 )); then mutated=1; apply_sysctl_profile runtime || rc=1; fi
+        interfaces+="${interfaces:+$'\n'}$NIC_POLICY_INTERFACE"
+    done <<< "$policy_files"
+    if (( rc == 0 )); then nic_runtime_transaction_write_interfaces "$interfaces" || rc=1; fi
+    if (( rc == 0 )); then nic_runtime_transaction_mark_mutated || rc=1; fi
+    if (( rc == 0 )); then
+        mutated=1
+        apply_sysctl_profile runtime || rc=1
+    fi
     if (( rc == 0 )); then
         while IFS= read -r file; do
             [[ -n "$file" ]] || continue
@@ -654,26 +876,24 @@ nic_apply_runtime_policies() {
             if [[ "$NIC_POLICY_MODE" == shape ]]; then apply_shaping "$iface" "$NIC_POLICY_RATE_MBIT" || { rc=1; break; }
             else apply_fq "$iface" || { rc=1; break; }
             fi
-        done < <(nic_policy_files)
+        done <<< "$policy_files"
     fi
     if (( rc == 0 )); then apply_initial_windows || rc=1; fi
-    if (( rc == 0 )); then nic_verify_runtime_policies || rc=1; fi
+    if (( rc == 0 )); then nic_verify_runtime_policies_files "" "$policy_files" || rc=1; fi
     if (( rc != 0 )); then
         if (( mutated )); then
-            nic_restore_runtime_snapshot "$snapshot_dir" || true
-            for file in "$snapshot_dir"/*.snapshot; do
-                [[ -f "$file" ]] || continue
-                iface="${file##*/}"; iface="${iface%.snapshot}"
-                restore_action_qdisc "$iface" "$file" || true
-            done
+            nic_runtime_transaction_rollback || rollback_rc=$?
+        else
+            nic_runtime_transaction_discard || rollback_rc=$?
         fi
-        remove_tree_within "$snapshot_dir" "$snapshot_parent" || true
-        if (( mutated )); then die "多网卡持久化应用失败，已恢复本轮 qdisc、sysctl 与路由窗口快照"
+        if (( mutated && rollback_rc == 0 )); then die "多网卡持久化应用失败，已恢复本轮 qdisc、sysctl 与路由窗口快照"
+        elif (( mutated )); then die "多网卡持久化应用失败且回滚不完整；快照保留在 $snapshot_dir，请人工检查"
+        elif (( rollback_rc != 0 )); then die "多网卡持久化应用在只读快照阶段失败；未修改运行时状态，但临时快照无法删除: $snapshot_dir"
         else die "多网卡持久化应用在只读快照阶段失败；未修改运行时状态"
         fi
         return 1
     fi
-    remove_tree_within "$snapshot_dir" "$snapshot_parent"
+    nic_runtime_transaction_commit
 }
 
 nic_manage_steps() {
@@ -746,10 +966,13 @@ nic_route_role() {
 }
 
 nic_inventory() {
-    local root path iface state mac driver mtu speed rx tx qdisc policy mode rate role layout file rc=0
+    local root path iface state mac driver mtu speed rx tx qdisc policy mode rate role layout file rc=0 policy_files=""
     layout=$(nic_policy_layout_state)
     case "$layout" in
-        managed) nic_policy_set_validate || return 1 ;;
+        managed)
+            policy_files=$(nic_policy_files_checked) || return 1
+            nic_policy_set_validate_files "$policy_files" || return 1
+            ;;
         absent) ;;
         *) die "多网卡策略目录损坏或不属于本项目: $NIC_POLICY_DIR"; return 1 ;;
     esac
@@ -780,7 +1003,7 @@ nic_inventory() {
         printf '%-15s %-18s %-17s %-8s %-8s %-7s %-9s %-12s %s\n' "$iface" missing unknown missing "$mode" "$rate" unknown unknown missing
         log ERR "受管网卡已消失: $iface"
         rc=1
-    done < <(nic_policy_files)
+    done <<< "$policy_files"
     return "$rc"
 }
 
@@ -812,14 +1035,6 @@ nic_plan() {
         'Requested model' "$profile/$role/$bandwidth/$rtt" 'Current global model' "$current_model" \
         'Global model after apply' "$(tr '\t' '/' <<< "$candidate")" 'Action' "$action" 'Readiness' "$readiness" 'Plan mutation' 'none (read-only)'
     [[ "$state" == eligible && "$readiness" == ready ]] || return 1
-}
-
-nic_apply_command() {
-    require_root || return 1; require_host_network_control || return 1; require_systemd_runtime || return 1
-    acquire_lock || return 1; require_commands ip tc sysctl systemctl modprobe || return 1
-    load_config || return 1
-    (( MULTI_NIC_ENABLED == 1 )) || { die "当前不是多网卡配置"; return 1; }
-    nic_apply_runtime_policies
 }
 
 nic_policy_reset_record

@@ -81,7 +81,9 @@ test_immutable_baseline_rejects_reused_interface_identity() (
     NIC_STATE_DIR="$STATE_DIR/interfaces"
     qdisc_guard() { :; }
     managed_htb() { return 1; }
-    action_qdisc_snapshot() { printf 'KIND\tnoqueue\nRATE\t\nARGS\t\n' > "$2"; }
+    action_qdisc_snapshot() {
+        printf 'KIND\tnoqueue\nRATE\t\nARGS\t\nqdisc noqueue 0: root\n' > "$2"
+    }
     nic_baseline_capture eth3
     cp -- "$(nic_baseline_dir eth3)/qdisc.snapshot" "$(nic_baseline_dir eth3)/qdisc.snapshot.good"
     printf 'KIND\tcake\nRATE\t\nARGS\t\n' > "$(nic_baseline_dir eth3)/qdisc.snapshot"
@@ -203,6 +205,115 @@ test_ownership_gate() {
     )
 }
 
+test_restore_preflight_rejects_external_filter_before_writes() (
+    local root="$TEST_ROOT/restore-filter-preflight" events="$TEST_ROOT/restore-filter-preflight.events"
+    BASELINE_DIR="$root/baseline"
+    : > "$events"
+    mkdir -p "$BASELINE_DIR"
+
+    require_root() { :; }
+    require_host_network_control() { :; }
+    require_systemd_runtime() { :; }
+    require_commands() { :; }
+    acquire_lock() { :; }
+    tcp_baseline_validate() {
+        TCP_BASELINE_VALIDATED_PROVENANCE=native
+        TCP_BASELINE_VALIDATED_INTERFACE=eth0
+        TCP_BASELINE_VALIDATED_GENERATION=v2
+    }
+    tcp_restore_runtime_preflight() { :; }
+    nic_policy_layout_state() { printf 'managed\n'; }
+    nic_policy_set_validate() { :; }
+    nic_policy_interface_list() { printf 'eth0\neth1\n'; }
+    nic_baseline_validate() { :; }
+    nic_interface_exists() { :; }
+    nic_baseline_identity_validate() { :; }
+    tc() {
+        case "$*" in
+            'qdisc show dev eth0'|'qdisc show dev eth1') printf 'qdisc fq 123: root\n' ;;
+            'class show dev eth0'|'class show dev eth1') : ;;
+            'filter show dev eth0 parent 123:') : ;;
+            'filter show dev eth1 parent 123:') printf 'filter protocol ip pref 10 u32 chain 0\n' ;;
+            *) fail "unexpected restore-preflight tc invocation: $*" ;;
+        esac
+    }
+
+    remove_persistence() { printf 'WRITE:remove-persistence\n' >> "$events"; }
+    nic_restore_secondary_baselines() { printf 'WRITE:restore-secondary\n' >> "$events"; }
+    restore_backed_path() { printf 'WRITE:restore-path\n' >> "$events"; }
+    restore_runtime_sysctls() { printf 'WRITE:restore-sysctl\n' >> "$events"; }
+    restore_baseline_route_windows() { printf 'WRITE:restore-routes\n' >> "$events"; }
+    restore_baseline_qdisc() { printf 'WRITE:restore-qdisc\n' >> "$events"; }
+    nic_policy_remove_tree() { printf 'WRITE:remove-policy\n' >> "$events"; }
+    systemctl() { printf 'WRITE:systemctl\n' >> "$events"; }
+    restore_unit_state() { printf 'WRITE:restore-unit\n' >> "$events"; }
+
+    expect_failure restore_baseline
+    [[ ! -s "$events" ]] || fail "external-filter preflight allowed restore writes: $(<"$events")"
+)
+
+test_restore_preflight_rejects_mq_queue_drift_before_writes() (
+    local root="$TEST_ROOT/restore-mq-preflight" events="$TEST_ROOT/restore-mq-preflight.events"
+    BASELINE_DIR="$root/baseline"
+    NIC_STATE_DIR="$root/interfaces"
+    BBRV3_SYS_CLASS_NET_ROOT="$root/sys/class/net"
+    : > "$events"
+    mkdir -p "$BASELINE_DIR" "$NIC_STATE_DIR/eth0" "$NIC_STATE_DIR/eth1"
+    mkdir -p "$BBRV3_SYS_CLASS_NET_ROOT/eth1/queues/tx-0" \
+        "$BBRV3_SYS_CLASS_NET_ROOT/eth1/queues/tx-1" \
+        "$BBRV3_SYS_CLASS_NET_ROOT/eth1/queues/tx-2"
+    printf 'SOURCE\tglobal\n' > "$NIC_STATE_DIR/eth0/manifest"
+    printf 'SOURCE\tsnapshot\n' > "$NIC_STATE_DIR/eth1/manifest"
+    printf '%s\n' \
+        $'KIND\tmq' \
+        $'RATE\t' \
+        $'ARGS\t' \
+        'qdisc mq 8003: root' \
+        'qdisc fq 8004: parent 8003:1 limit 10000p' \
+        'qdisc fq 8005: parent 8003:2 limit 10000p' \
+        'class mq :1 root leaf 8004:' \
+        'class mq :2 root leaf 8005:' > "$NIC_STATE_DIR/eth1/qdisc.snapshot"
+
+    require_root() { :; }
+    require_host_network_control() { :; }
+    require_systemd_runtime() { :; }
+    require_commands() { :; }
+    acquire_lock() { :; }
+    tcp_baseline_validate() {
+        TCP_BASELINE_VALIDATED_PROVENANCE=native
+        TCP_BASELINE_VALIDATED_INTERFACE=eth0
+        TCP_BASELINE_VALIDATED_GENERATION=v2
+    }
+    tcp_restore_runtime_preflight() { :; }
+    nic_policy_layout_state() { printf 'managed\n'; }
+    nic_policy_set_validate() { :; }
+    nic_policy_interface_list() { printf 'eth0\neth1\n'; }
+    nic_baseline_validate() { :; }
+    nic_interface_exists() { :; }
+    nic_baseline_identity_validate() { :; }
+    tc() {
+        case "$*" in
+            'qdisc show dev eth0'|'qdisc show dev eth1') printf 'qdisc fq 123: root\n' ;;
+            'class show dev eth0'|'class show dev eth1') : ;;
+            'filter show dev eth0 parent 123:'|'filter show dev eth1 parent 123:') : ;;
+            *) fail "unexpected MQ restore-preflight tc invocation: $*" ;;
+        esac
+    }
+
+    remove_persistence() { printf 'WRITE:remove-persistence\n' >> "$events"; }
+    nic_restore_secondary_baselines() { printf 'WRITE:restore-secondary\n' >> "$events"; }
+    restore_backed_path() { printf 'WRITE:restore-path\n' >> "$events"; }
+    restore_runtime_sysctls() { printf 'WRITE:restore-sysctl\n' >> "$events"; }
+    restore_baseline_route_windows() { printf 'WRITE:restore-routes\n' >> "$events"; }
+    restore_baseline_qdisc() { printf 'WRITE:restore-qdisc\n' >> "$events"; }
+    nic_policy_remove_tree() { printf 'WRITE:remove-policy\n' >> "$events"; }
+    systemctl() { printf 'WRITE:systemctl\n' >> "$events"; }
+    restore_unit_state() { printf 'WRITE:restore-unit\n' >> "$events"; }
+
+    expect_failure restore_baseline
+    [[ ! -s "$events" ]] || fail "MQ queue-drift preflight allowed restore writes: $(<"$events")"
+)
+
 test_apply_failure_rolls_back_every_interface_and_global_runtime() (
     local events="$TEST_ROOT/apply-events"
     : > "$events"
@@ -211,11 +322,15 @@ test_apply_failure_rolls_back_every_interface_and_global_runtime() (
     event() { printf '%s\n' "$*" >> "$events"; }
     managed_htb_interfaces_strict() { :; }
     qdisc_guard() { :; }
+    qdisc_filter_guard() { :; }
     capture_runtime_sysctls() {
         local key
         while IFS= read -r key; do printf '%s\t%s\n' "$key" "$(nic_test_sysctl_value "$key")"; done < <(tcp_baseline_sysctl_keys)
     }
-    action_qdisc_snapshot() { event "snapshot:$1"; printf 'KIND\tnoqueue\nRATE\t\nARGS\t\n' > "$2"; }
+    action_qdisc_snapshot() {
+        event "snapshot:$1"
+        printf 'KIND\tnoqueue\nRATE\t\nARGS\t\nqdisc noqueue 0: root\n' > "$2"
+    }
     apply_sysctl_profile() { [[ "$1" == runtime ]] || return 1; event apply-sysctl; }
     apply_fq() { event "apply-fq:$1"; }
     apply_shaping() { event "apply-shape:$1:$2"; [[ "$1" != eth2 ]]; }
@@ -235,6 +350,113 @@ test_apply_failure_rolls_back_every_interface_and_global_runtime() (
     if grep -Fxq apply-routes "$events"; then fail "route mutation continued after qdisc failure"; fi
 )
 
+test_apply_rollback_failure_preserves_snapshot() (
+    local events="$TEST_ROOT/apply-rollback-failure.events" output_file="$TEST_ROOT/apply-rollback-failure.output" output snapshot_dir rollback_fail=1
+    : > "$events"
+    NIC_RUNTIME_TRANSACTION_DIR=""
+    NIC_RUNTIME_TRANSACTION_PARENT=""
+    NIC_RUNTIME_TRANSACTION_MUTATED=0
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+    nic_sync_global_model
+    MULTI_NIC_ENABLED=1
+    managed_htb_interfaces_strict() { :; }
+    qdisc_guard() { :; }
+    qdisc_filter_guard() { :; }
+    capture_runtime_sysctls() {
+        local key
+        while IFS= read -r key; do printf '%s\t%s\n' "$key" "$(nic_test_sysctl_value "$key")"; done < <(tcp_baseline_sysctl_keys)
+    }
+    action_qdisc_snapshot() {
+        printf 'KIND\tnoqueue\nRATE\t\nARGS\t\nqdisc noqueue 0: root\n' > "$2"
+    }
+    apply_sysctl_profile() { [[ "$1" == runtime ]]; }
+    apply_fq() { :; }
+    apply_shaping() { [[ "$1" != eth2 ]]; }
+    apply_initial_windows() { :; }
+    nic_restore_runtime_snapshot() { printf 'restore-runtime\n' >> "$events"; }
+    restore_action_qdisc() {
+        printf 'restore-qdisc:%s\n' "$1" >> "$events"
+        [[ "$rollback_fail" == 0 || "$1" != eth0 ]]
+    }
+    ip() { return 0; }
+
+    if nic_apply_runtime_policies > "$output_file" 2>&1; then
+        fail "multi-NIC apply reported success after an injected mutation failure"
+    fi
+    output=$(<"$output_file")
+    grep -Fq '回滚不完整' <<< "$output" || fail "rollback failure was reported as fully restored: $output"
+    [[ "$output" != *'已恢复本轮'* ]] || fail "rollback failure used a false restored message: $output"
+    snapshot_dir="$NIC_RUNTIME_TRANSACTION_DIR"
+    [[ -n "$snapshot_dir" && -d "$snapshot_dir" && -f "$snapshot_dir/sysctl.tsv" ]] ||
+        fail "rollback failure destroyed its runtime snapshot"
+    for iface in eth0 eth1 eth2; do
+        [[ -f "$snapshot_dir/$iface.snapshot" ]] || fail "rollback failure lost $iface qdisc snapshot"
+    done
+    [[ -f "$snapshot_dir/interfaces.list" ]] || fail "rollback failure lost the stable interface manifest"
+    assert_eq $'eth0\neth1\neth2' "$(<"$snapshot_dir/interfaces.list")" "runtime interface manifest"
+
+    rollback_fail=0
+    nic_runtime_transaction_rollback || fail "retained multi-NIC snapshot could not be retried"
+    [[ -z "$NIC_RUNTIME_TRANSACTION_DIR" && ! -e "$snapshot_dir" ]] ||
+        fail "successful rollback retry did not clear the retained transaction"
+)
+
+test_runtime_transaction_rejects_late_filter_before_global_writes() (
+    local root="$TEST_ROOT/runtime-late-filter" events="$TEST_ROOT/runtime-late-filter.events"
+    local late_filter=0 snapshot_dir iface interfaces=$'eth0\neth1'
+    mkdir -p "$root"
+    : > "$events"
+    NIC_RUNTIME_TRANSACTION_DIR=""
+    NIC_RUNTIME_TRANSACTION_PARENT=""
+    NIC_RUNTIME_TRANSACTION_MUTATED=0
+    NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+    NIC_RUNTIME_TRANSACTION_READY=0
+
+    capture_runtime_sysctls() {
+        local key
+        while IFS= read -r key; do
+            printf '%s\t%s\n' "$key" "$(nic_test_sysctl_value "$key")"
+        done < <(tcp_baseline_sysctl_keys)
+    }
+    ip() {
+        case "$*" in
+            '-4 route show default') printf 'default via 192.0.2.1 dev eth0\n' ;;
+            '-6 route show default') : ;;
+            *) return 1 ;;
+        esac
+    }
+    qdisc_filter_guard() {
+        [[ "$1" != eth1 || "$late_filter" == 0 ]]
+    }
+    nic_restore_runtime_snapshot() { printf 'WRITE:runtime\n' >> "$events"; }
+    restore_action_qdisc() { printf 'WRITE:qdisc:%s\n' "$1" >> "$events"; }
+
+    nic_runtime_transaction_begin "$root" || fail "could not create late-filter NIC transaction"
+    snapshot_dir="$NIC_RUNTIME_TRANSACTION_DIR"
+    capture_runtime_sysctls > "$snapshot_dir/sysctl.tsv"
+    ip -4 route show default > "$snapshot_dir/default-route-v4.txt"
+    ip -6 route show default > "$snapshot_dir/default-route-v6.txt"
+    for iface in eth0 eth1; do
+        printf 'KIND\tnoqueue\nRATE\t\nARGS\t\nqdisc noqueue 0: root\n' > "$snapshot_dir/$iface.snapshot"
+    done
+    nic_runtime_transaction_write_interfaces "$interfaces" || fail "could not write NIC transaction interface manifest"
+    nic_runtime_transaction_mark_mutated || fail "valid NIC transaction was not marked mutable"
+
+    late_filter=1
+    if nic_runtime_transaction_rollback >/dev/null 2>&1; then
+        fail "NIC rollback accepted a root-tree filter added after mutation began"
+    fi
+    [[ ! -s "$events" ]] || fail "late NIC filter allowed rollback writes: $(<"$events")"
+    [[ "$NIC_RUNTIME_TRANSACTION_DIR" == "$snapshot_dir" && -d "$snapshot_dir" && -f "$snapshot_dir/COMPLETE" ]] ||
+        fail "late NIC filter did not retain the runtime transaction evidence"
+
+    late_filter=0
+    nic_runtime_transaction_rollback || fail "NIC rollback could not be retried after the external filter was removed"
+    assert_eq $'WRITE:runtime\nWRITE:qdisc:eth0\nWRITE:qdisc:eth1' "$(<"$events")" "retry rollback order"
+    [[ -z "$NIC_RUNTIME_TRANSACTION_DIR" && ! -e "$snapshot_dir" ]] ||
+        fail "successful late-filter rollback retry did not clear the transaction"
+)
+
 test_snapshot_failure_is_write_free() (
     local events="$TEST_ROOT/snapshot-events"
     : > "$events"
@@ -246,13 +468,91 @@ test_snapshot_failure_is_write_free() (
         local key
         while IFS= read -r key; do printf '%s\t%s\n' "$key" "$(nic_test_sysctl_value "$key")"; done < <(tcp_baseline_sysctl_keys)
     }
-    action_qdisc_snapshot() { printf 'snapshot:%s\n' "$1" >> "$events"; [[ "$1" != eth1 ]]; }
+    action_qdisc_snapshot() {
+        printf 'snapshot:%s\n' "$1" >> "$events"
+        [[ "$1" != eth1 ]] || return 1
+        printf 'KIND\tnoqueue\nRATE\t\nARGS\t\nqdisc noqueue 0: root\n' > "$2"
+    }
     apply_sysctl_profile() { printf 'WRITE:sysctl\n' >> "$events"; }
     restore_action_qdisc() { printf 'WRITE:qdisc\n' >> "$events"; }
     nic_restore_runtime_snapshot() { printf 'WRITE:runtime\n' >> "$events"; }
     ip() { return 0; }
     expect_failure nic_apply_runtime_policies
     if grep -Fq 'WRITE:' "$events"; then fail "snapshot-stage failure performed runtime writes"; fi
+)
+
+test_policy_enumerator_failure_is_write_free() (
+    local events="$TEST_ROOT/policy-enumerator-failure.events" valid_policy
+    : > "$events"
+    valid_policy=$(nic_policy_path eth0)
+    MULTI_NIC_ENABLED=1
+    NIC_RUNTIME_TRANSACTION_DIR=""
+    NIC_RUNTIME_TRANSACTION_PARENT=""
+    NIC_RUNTIME_TRANSACTION_MUTATED=0
+    NIC_RUNTIME_TRANSACTION_READY=0
+
+    # The valid prefix must remain hidden when the producer ultimately fails.
+    nic_policy_files() {
+        printf '%s\n' "$valid_policy"
+        return 9
+    }
+    expect_failure nic_policy_set_validate
+
+    nic_runtime_transaction_begin() { printf 'WRITE:transaction-begin\n' >> "$events"; }
+    capture_runtime_sysctls() { printf 'WRITE:sysctl-snapshot\n' >> "$events"; }
+    action_qdisc_snapshot() { printf 'WRITE:qdisc-snapshot:%s\n' "$1" >> "$events"; }
+    apply_sysctl_profile() { printf 'WRITE:sysctl\n' >> "$events"; }
+    apply_fq() { printf 'WRITE:fq:%s\n' "$1" >> "$events"; }
+    apply_shaping() { printf 'WRITE:shape:%s\n' "$1" >> "$events"; }
+    apply_initial_windows() { printf 'WRITE:route-window\n' >> "$events"; }
+
+    expect_failure nic_apply_runtime_policies
+    [[ ! -s "$events" ]] || fail "partial policy enumeration reached transaction/runtime writes: $(<"$events")"
+    [[ -z "$NIC_RUNTIME_TRANSACTION_DIR" ]] || fail "partial policy enumeration created a runtime transaction"
+)
+
+test_route_snapshot_failure_is_write_free() (
+    local fail_family events snapshot_parent snapshot_dir
+    for fail_family in 4 6; do
+        events="$TEST_ROOT/route-snapshot-failure-$fail_family.events"
+        : > "$events"
+        NIC_RUNTIME_TRANSACTION_DIR=""
+        NIC_RUNTIME_TRANSACTION_PARENT=""
+        NIC_RUNTIME_TRANSACTION_MUTATED=0
+        NIC_RUNTIME_TRANSACTION_ROLLING_BACK=0
+        nic_sync_global_model
+        MULTI_NIC_ENABLED=1
+        managed_htb_interfaces_strict() { :; }
+        qdisc_guard() { :; }
+        capture_runtime_sysctls() {
+            local key
+            while IFS= read -r key; do printf '%s\t%s\n' "$key" "$(nic_test_sysctl_value "$key")"; done < <(tcp_baseline_sysctl_keys)
+        }
+        ip() {
+            case "$*" in
+                '-4 route show default')
+                    [[ "$fail_family" != 4 ]] || return 1
+                    printf 'default via 192.0.2.1 dev eth0\n'
+                    ;;
+                '-6 route show default') [[ "$fail_family" != 6 ]] ;;
+                *) return 1 ;;
+            esac
+        }
+        action_qdisc_snapshot() { printf 'WRITE:qdisc-snapshot\n' >> "$events"; }
+        apply_sysctl_profile() { printf 'WRITE:sysctl\n' >> "$events"; }
+        apply_fq() { printf 'WRITE:fq\n' >> "$events"; }
+        apply_shaping() { printf 'WRITE:shape\n' >> "$events"; }
+        apply_initial_windows() { printf 'WRITE:route-window\n' >> "$events"; }
+        restore_action_qdisc() { printf 'WRITE:restore-qdisc\n' >> "$events"; }
+        nic_restore_runtime_snapshot() { printf 'WRITE:restore-runtime\n' >> "$events"; }
+
+        expect_failure nic_apply_runtime_policies
+        [[ ! -s "$events" ]] || fail "IPv$fail_family route snapshot failure allowed runtime/qdisc work: $(<"$events")"
+        [[ -z "$NIC_RUNTIME_TRANSACTION_DIR" ]] || fail "IPv$fail_family route failure retained an otherwise removable transaction"
+        snapshot_parent="${TMPDIR:-/tmp}"
+        snapshot_dir=$(find "$snapshot_parent" -maxdepth 1 -type d -name "${SCRIPT_NAME}.multi-nic.*" -print -quit 2>/dev/null || true)
+        [[ -z "$snapshot_dir" ]] || fail "IPv$fail_family route failure left a temporary transaction: $snapshot_dir"
+    done
 )
 
 test_multi_transaction_snapshots_policy_and_legacy_interfaces() (
@@ -265,7 +565,10 @@ test_multi_transaction_snapshots_policy_and_legacy_interfaces() (
         mkdir -p "$ACTION_TRANSACTION_DIR/qdiscs"
         printf '%s\n' "$1" >> "$events"
     }
-    action_qdisc_snapshot() { printf '%s\n' "$1" >> "$events"; : > "$2"; }
+    action_qdisc_snapshot() {
+        printf '%s\n' "$1" >> "$events"
+        printf 'KIND\tnoqueue\nRATE\t\nARGS\t\nqdisc noqueue 0: root\n' > "$2"
+    }
     action_transaction_rollback() { fail "unexpected transaction rollback"; }
     MULTI_NIC_ENABLED=0
     TC_INTERFACE=eth3
@@ -285,7 +588,10 @@ test_multi_transaction_snapshot_failure_is_write_free() (
         ACTION_TRANSACTION_INTERFACES="$1"
         mkdir -p "$ACTION_TRANSACTION_DIR/qdiscs"
     }
-    action_qdisc_snapshot() { [[ "$1" != eth2 ]]; }
+    action_qdisc_snapshot() {
+        [[ "$1" != eth2 ]] || return 1
+        printf 'KIND\tnoqueue\nRATE\t\nARGS\t\nqdisc noqueue 0: root\n' > "$2"
+    }
     action_transaction_rollback() { printf 'WRITE:rollback\n' >> "$writes"; }
     MULTI_NIC_ENABLED=1
     TC_INTERFACE=auto
@@ -345,8 +651,13 @@ test_legacy_delegate_restores_v8_interfaces_first() (
 test_cli_contract() {
     local captured=""
     nic_manage() { captured="$*"; }
+    apply_configured_state() { captured=apply-configured-state; }
     cmd_nic manage --interface eth0 --mode shape --rate 100 --knee 110 --margin 4 --profile adaptive --role proxy --bandwidth 120 --rtt 80
     assert_eq 'eth0 shape 100 110 4 adaptive proxy 120 80' "$captured" "nic manage CLI mapping"
+    captured=""
+    cmd_nic apply
+    assert_eq apply-configured-state "$captured" "nic apply uses the canonical persistence entry"
+    expect_failure cmd_nic apply ignored
     expect_failure cmd_nic manage --interface eth0 --mode fq --rate 10
     expect_failure cmd_nic manage --interface auto --mode fq
     expect_failure cmd_nic manage --interface eth0 --mode shape --rate 100 --unknown value
@@ -360,8 +671,14 @@ for test_name in \
     test_tc_enable_does_not_copy_another_nic_global_model \
     test_read_only_plan_includes_aggregate_effect \
     test_ownership_gate \
+    test_restore_preflight_rejects_external_filter_before_writes \
+    test_restore_preflight_rejects_mq_queue_drift_before_writes \
     test_apply_failure_rolls_back_every_interface_and_global_runtime \
+    test_apply_rollback_failure_preserves_snapshot \
+    test_runtime_transaction_rejects_late_filter_before_global_writes \
     test_snapshot_failure_is_write_free \
+    test_policy_enumerator_failure_is_write_free \
+    test_route_snapshot_failure_is_write_free \
     test_multi_transaction_snapshots_policy_and_legacy_interfaces \
     test_multi_transaction_snapshot_failure_is_write_free \
     test_legacy_single_nic_migration \
