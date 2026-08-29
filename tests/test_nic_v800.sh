@@ -563,6 +563,9 @@ test_multi_transaction_snapshots_policy_and_legacy_interfaces() (
         ACTION_TRANSACTION_IFACE="$1"
         ACTION_TRANSACTION_INTERFACES="$1"
         mkdir -p "$ACTION_TRANSACTION_DIR/qdiscs"
+        printf 'CREATED_AT\t2026-08-29T07:00:00Z\n' > "$ACTION_TRANSACTION_DIR/transaction.meta"
+        printf 'readonly\n' > "$ACTION_TRANSACTION_DIR/transaction.state"
+        chmod 0600 "$ACTION_TRANSACTION_DIR/transaction.meta" "$ACTION_TRANSACTION_DIR/transaction.state"
         printf '%s\n' "$1" >> "$events"
     }
     action_qdisc_snapshot() {

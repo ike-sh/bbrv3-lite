@@ -2,7 +2,7 @@
 
 BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-当前版本：v8.0.2
+当前版本：v8.0.3
 
 项目不追求“sysctl 越多越好”。默认配置保持克制。命令行 `measure` 只给出结果；交互式 `auto` 会在一次总确认后完成测量、决策、应用和复验，未发现可信拐点时保持纯 FQ。
 
@@ -23,6 +23,7 @@ BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原
 - v8.0.0 真正多网卡管理：每张受管网卡拥有独立、严格解析且绑定 MAC 身份的 FQ/HTB-FQ 策略；一个 systemd 服务原子应用全部策略，允许多张网卡同时使用不同速率、不同模式和不同 BDP 元数据。
 - v8.0.1 实机兼容性修复：兼容真实 Linux 将 `tcp_rmem/tcp_wmem` 输出为 TAB 分隔三元组的行为；同时修复双栈域名在预检后重新解析到不可用 IPv6、导致必须关闭 IPv6 才能运行 iperf3 的回归。测速不会修改 IPv6 开关。
 - v8.0.2 qdisc 与路由事务精确恢复：基线和事务同时校验 root/leaf handle、可重放参数、MQ qdisc/class 对应关系和 TX queue 数；内核自动创建的 `0:` qdisc 会在事务内按需临时切换 `default_qdisc`、删除显式 root 完成重建，再恢复原全局默认值并复验两者。任何受管树上的外部 tc filter、扩展 HTB 拓扑或错误 default class 都会在写入前拒绝；IPv6 RA 路由不断递减的 `expires` 与查询 `uid` 不再被误判为换路，但 metric/proto/pref/gateway/device 等真实路由身份仍严格校验。
+- v8.0.3 发布前修复：真实 Debian/systemd 首次安装可安全处理尚不存在的 service；schema-3 TCP 基线显式绑定 sysctl schema/key 集并兼容真实 v8.0.2 基线；事务诊断与失败证据保留更清晰，永久禁用 IPv6 时会提示对未来新接口的影响。
 - 全局 TCP sysctl 与逐网卡 qdisc 明确分层：Linux TCP 缓冲区是全局资源，脚本按全部策略聚合出一个安全上界；qdisc、速率、原始队列基线和恢复则逐网卡独立处理，不再把“多网卡检测”误称为“多网卡管理”。
 - 全局 `flock`，防止两个进程同时修改 sysctl、qdisc 或配置。
 - 严格 `KEY=VALUE` 白名单解析，配置文件从不被 shell `source`。
@@ -656,6 +657,14 @@ tag 推送会触发 Release 工作流，验证 tag 与脚本版本一致，并�
 - 多网卡 apply 从一次冻结的策略文件全集生成接口清单，快照、应用、验证和回滚全程复用同一集合；事务内的 `interfaces.list` 必须与 qdisc 快照一一对应，producer 中途失败不会提交已枚举到的子集。
 - 完整卸载会在策略目录删除后以非递归 `rmdir` 清理空的 `/etc/bbrv3-lite` 父目录；若其中存在外来文件或路径是符号链接则明确保留，绝不会为追求“干净”而递归删除非项目内容。
 - Docker TC 集成覆盖显式 handle、`0:` 自动重建、外部 filter、`clsact`、闭合 HTB 和多队列 MQ；发布前还会在授权实机上验证安装、服务重放、卸载及原始 qdisc 精确回归。
+
+## v8.0.3 systemd 首装、基线兼容与事务安全修复
+
+- **Fixed**：修复 Debian/systemd 环境首次运行时 `bbrv3-lite.service` 尚不存在导致 `bbr auto` 或首次安装事务失败的问题。unit 状态统一通过 `systemctl show` 的机器字段捕获，missing unit 规范化为 `not-found/inactive`；systemd manager/D-Bus 查询失败继续 fail closed。恢复 absent service 时同时验证 unit 文件和本项目 permanent enable link 已清除。
+- **Baseline compatibility**：TCP baseline schema 升级到 3，并显式记录 `SYSCTL_SCHEMA` 与 `SYSCTL_KEYS`。真实 v8.0.2 schema-2 native/adopt-current baseline 可继续验证并精确恢复；缺少可信历史值时不会伪造未来新增 sysctl 的旧值或声称精确恢复。
+- **Transaction safety**：transaction 持久记录 `readonly/mutated` 状态与创建时间，遗留 transaction 的只读诊断更清晰；rollback 失败会保留证据，并阻止 EXIT cleanup 在无人监督时重复 rollback。
+- **UX**：永久禁用 IPv6 时明确提示 `net.ipv6.conf.default.disable_ipv6=1` 会影响未来创建的新接口。
+- **Tests**：增加真实 Debian 12 PID1 systemd missing-unit/absent-restore integration、真实 v8.0.2 native baseline fixture 和 sysctl schema provider partial-output failure regression；Debian 12/13、Ubuntu 22.04/24.04 privileged matrix 继续作为发布门禁。
 
 ## v8 与旧版的差异
 

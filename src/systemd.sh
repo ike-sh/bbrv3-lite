@@ -8,6 +8,7 @@ ACTION_TRANSACTION_INTERFACES=""
 ACTION_TRANSACTION_ROLLING_BACK=0
 ACTION_TRANSACTION_READY=0
 ACTION_TRANSACTION_MUTATED=0
+ACTION_TRANSACTION_ROLLBACK_FAILED=0
 
 current_script_path() {
     local source="${BASH_SOURCE[0]}"
@@ -175,14 +176,7 @@ restart_and_verify_persistence() {
 remove_persistence() {
     local rc=0
     if command_exists systemctl; then
-        if [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ]] ||
-            systemctl is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1 ||
-            systemctl is-enabled --quiet "$SERVICE_NAME" >/dev/null 2>&1; then
-            systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || {
-                log WARN "无法停止并禁用持久化服务: $SERVICE_NAME"
-                rc=1
-            }
-        fi
+        action_transaction_quiesce_unit_for_restore "$SERVICE_NAME" || rc=1
     fi
     rm -f -- "$SERVICE_FILE" "$PERSIST_SCRIPT" || {
         log WARN "无法删除持久化服务或脚本"
@@ -200,46 +194,88 @@ remove_persistence() {
     return "$rc"
 }
 
-query_unit_enabled_state() {
-    local unit="$1" state="" query_rc=0 printable
-    if state=$(systemctl is-enabled "$unit" 2>&1); then
+query_unit_state() {
+    local unit="$1" output="" query_rc=0 printable line key value
+    local load_state="" enabled_state="" active_state=""
+    local load_seen=0 enabled_seen=0 active_seen=0
+    if output=$(LC_ALL=C systemctl show "$unit" \
+            --property=LoadState --property=UnitFileState --property=ActiveState 2>&1); then
         query_rc=0
     else
         query_rc=$?
     fi
-    # A non-zero status is normal for disabled/masked/not-found units.  The
-    # state token, rather than the command status alone, distinguishes those
-    # states from a failed manager/D-Bus query (which has no known token).
-    case "$state" in
-        enabled|enabled-runtime|disabled|masked|masked-runtime|linked|linked-runtime|alias|static|indirect|generated|transient|not-found)
-            printf '%s\n' "$state"
-            return 0
-            ;;
+    if (( query_rc != 0 )); then
+        printable=${output//$'\n'/'; '}
+        log WARN "无法通过 systemd manager 读取 unit 状态: $unit (exit=$query_rc, output=${printable:-empty})"
+        return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *=* ]] || {
+            log WARN "systemd unit 状态输出格式非法: $unit"
+            return 1
+        }
+        key="${line%%=*}"; value="${line#*=}"
+        case "$key" in
+            LoadState)
+                (( load_seen == 0 )) || { log WARN "systemd unit 状态字段重复: $unit/$key"; return 1; }
+                load_state="$value"; load_seen=1
+                ;;
+            UnitFileState)
+                (( enabled_seen == 0 )) || { log WARN "systemd unit 状态字段重复: $unit/$key"; return 1; }
+                enabled_state="$value"; enabled_seen=1
+                ;;
+            ActiveState)
+                (( active_seen == 0 )) || { log WARN "systemd unit 状态字段重复: $unit/$key"; return 1; }
+                active_state="$value"; active_seen=1
+                ;;
+            *)
+                log WARN "systemd unit 状态含未知字段: $unit/$key"
+                return 1
+                ;;
+        esac
+    done <<< "$output"
+    (( load_seen == 1 && enabled_seen == 1 && active_seen == 1 )) || {
+        log WARN "systemd unit 状态字段不完整: $unit"
+        return 1
+    }
+
+    # A unit that has never existed is a valid, exactly restorable lifecycle
+    # baseline.  Do not call is-enabled/is-active for it: systemd versions use
+    # different localized diagnostics and exit codes for missing units.
+    if [[ "$load_state" == not-found ]]; then
+        [[ "$active_state" == inactive ]] || {
+            log WARN "不存在的 systemd unit 返回了非 inactive 状态: $unit/$active_state"
+            return 1
+        }
+        printf 'not-found\tinactive\n'
+        return 0
+    fi
+    case "$load_state" in loaded|masked|merged|stub) ;; *)
+        log WARN "systemd unit LoadState 不可安全恢复: $unit/$load_state"
+        return 1
+        ;;
     esac
-    printable=${state//$'\n'/'; '}
-    log WARN "无法读取 systemd unit-file 状态: $unit (exit=$query_rc, output=${printable:-empty})"
-    return 1
+    case "$enabled_state" in
+        enabled|enabled-runtime|disabled|masked|masked-runtime|linked|linked-runtime|alias|static|indirect|generated|transient) ;;
+        *) log WARN "systemd unit-file 状态不可安全恢复: $unit/${enabled_state:-empty}"; return 1 ;;
+    esac
+    case "$active_state" in
+        active|inactive) ;;
+        *) log WARN "systemd active 状态不可安全恢复: $unit/${active_state:-empty}"; return 1 ;;
+    esac
+    printf '%s\t%s\n' "$enabled_state" "$active_state"
+}
+
+query_unit_enabled_state() {
+    local state
+    state=$(query_unit_state "$1") || return 1
+    printf '%s\n' "${state%%$'\t'*}"
 }
 
 query_unit_active_state() {
-    local unit="$1" state="" query_rc=0 printable
-    if state=$(systemctl is-active "$unit" 2>&1); then
-        query_rc=0
-    else
-        query_rc=$?
-    fi
-    # Only stable states can be recreated by start/stop.  Treat failed and
-    # transitional states as non-restorable instead of silently recording
-    # them as inactive.
-    case "$state" in
-        active|inactive)
-            printf '%s\n' "$state"
-            return 0
-            ;;
-    esac
-    printable=${state//$'\n'/'; '}
-    log WARN "无法读取可恢复的 systemd active 状态: $unit (exit=$query_rc, output=${printable:-empty})"
-    return 1
+    local state
+    state=$(query_unit_state "$1") || return 1
+    printf '%s\n' "${state#*$'\t'}"
 }
 
 unit_enabled_state_is_mutable() {
@@ -250,11 +286,10 @@ unit_enabled_state_is_mutable() {
 }
 
 capture_unit_state() {
-    local unit="$1" file="$2" enabled active
+    local unit="$1" file="$2" state
     command_exists systemctl || { log WARN "无法捕获 systemd unit 状态（systemctl 不可用）: $unit"; return 1; }
-    enabled=$(query_unit_enabled_state "$unit") || return 1
-    active=$(query_unit_active_state "$unit") || return 1
-    printf '%s\t%s\n' "$enabled" "$active" > "$file"
+    state=$(query_unit_state "$unit") || return 1
+    printf '%s\n' "$state" > "$file"
 }
 
 unit_state_snapshot_validate() {
@@ -272,10 +307,11 @@ unit_state_snapshot_validate() {
         *) return 1 ;;
     esac
     case "$active" in active|inactive) ;; *) return 1 ;; esac
+    [[ "$enabled" != not-found || "$active" == inactive ]]
 }
 
 restore_unit_state() {
-    local unit="$1" file="$2" line enabled active current_enabled current_active
+    local unit="$1" file="$2" line enabled active current_enabled current_active enable_link=""
     local actual_enabled actual_active rc=0 remask=0
     local -a state_lines=()
     [[ -e "$file" || -L "$file" ]] || return 0
@@ -288,8 +324,9 @@ restore_unit_state() {
     enabled="${line%%$'\t'*}"
     active="${line#*$'\t'}"
     command_exists systemctl || { log WARN "无法恢复 systemd unit 状态（systemctl 不可用）: $unit"; return 1; }
-    current_enabled=$(query_unit_enabled_state "$unit") || return 1
-    current_active=$(query_unit_active_state "$unit") || return 1
+    line=$(query_unit_state "$unit") || return 1
+    current_enabled="${line%%$'\t'*}"
+    current_active="${line#*$'\t'}"
 
     # linked/alias/static/indirect/generated/transient/not-found describe how
     # the unit was supplied, not a state that `systemctl enable` can safely
@@ -460,8 +497,13 @@ restore_unit_state() {
             ;;
     esac
 
-    actual_enabled=$(query_unit_enabled_state "$unit") || actual_enabled=query-failed
-    actual_active=$(query_unit_active_state "$unit") || actual_active=query-failed
+    if line=$(query_unit_state "$unit"); then
+        actual_enabled="${line%%$'\t'*}"
+        actual_active="${line#*$'\t'}"
+    else
+        actual_enabled=query-failed
+        actual_active=query-failed
+    fi
     if [[ "$actual_enabled" != "$enabled" ]]; then
         log ERR "systemd unit-file 恢复验证失败: $unit expected=$enabled actual=$actual_enabled"
         rc=1
@@ -469,6 +511,15 @@ restore_unit_state() {
     if [[ "$actual_active" != "$active" ]]; then
         log ERR "systemd active 恢复验证失败: $unit expected=$active actual=$actual_active"
         rc=1
+    fi
+    if [[ "$enabled" == not-found ]] &&
+       { [[ "$unit" == "$SERVICE_NAME" ]] || [[ "$unit" == bbr-optimize-persist.service ]]; }; then
+        if ! enable_link=$(action_transaction_unit_enable_link_path "$unit"); then
+            rc=1
+        elif [[ -e "$enable_link" || -L "$enable_link" ]]; then
+            log ERR "systemd absent 恢复验证失败，enable 链接仍然存在: $enable_link"
+            rc=1
+        fi
     fi
     return "$rc"
 }
@@ -555,6 +606,7 @@ action_transaction_snapshot_validate() {
     local dir="$ACTION_TRANSACTION_DIR" file iface count=0
     local -A expected=() observed=()
     [[ -n "$dir" && -d "$dir" && ! -L "$dir" ]] || return 1
+    action_transaction_metadata_validate "$dir" || return 1
     [[ -f "$dir/COMPLETE" && ! -L "$dir/COMPLETE" && "$(<"$dir/COMPLETE")" == complete ]] || return 1
     [[ -f "$dir/sysctl.tsv" && ! -L "$dir/sysctl.tsv" ]] || return 1
     tcp_baseline_sysctl_validate "$dir/sysctl.tsv" >/dev/null || return 1
@@ -592,22 +644,91 @@ action_transaction_snapshot_validate() {
     unit_state_snapshot_validate "$dir/legacy-service.unit" || return 1
 }
 
+action_transaction_metadata_validate() {
+    local dir="$1" line created state
+    local -a lines=()
+    [[ -f "$dir/transaction.meta" && ! -L "$dir/transaction.meta" ]] || return 1
+    mapfile -t lines < "$dir/transaction.meta" || return 1
+    (( ${#lines[@]} == 1 )) || return 1
+    line="${lines[0]}"
+    [[ "$line" == CREATED_AT$'\t'* && "${line#*$'\t'}" != *$'\t'* ]] || return 1
+    created="${line#*$'\t'}"
+    [[ "$created" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+    [[ -f "$dir/transaction.state" && ! -L "$dir/transaction.state" ]] || return 1
+    mapfile -t lines < "$dir/transaction.state" || return 1
+    (( ${#lines[@]} == 1 )) || return 1
+    state="${lines[0]}"
+    [[ "$state" == readonly || "$state" == mutated ]]
+}
+
+action_transaction_diagnose_stale() {
+    local path="$1" created=unknown state=unknown iface interfaces="" safe_path snapshot
+    local metadata_trusted=0 interfaces_trusted=1 snapshot_count=0
+    if [[ -d "$path" && ! -L "$path" ]]; then
+        if action_transaction_metadata_validate "$path"; then
+            created="$(cut -f2- "$path/transaction.meta")"
+            state="$(<"$path/transaction.state")"
+            metadata_trusted=1
+        elif [[ -f "$path/transaction.state" && ! -L "$path/transaction.state" ]]; then
+            state="无法判断（事务 metadata/state 不完整或损坏）"
+        else
+            state="无法判断（旧事务没有可信状态 metadata）"
+        fi
+        if [[ -d "$path/qdiscs" && ! -L "$path/qdiscs" ]]; then
+            for snapshot in "$path"/qdiscs/*.snapshot; do
+                [[ -e "$snapshot" || -L "$snapshot" ]] || continue
+                [[ -f "$snapshot" && ! -L "$snapshot" ]] || { interfaces_trusted=0; break; }
+                iface="${snapshot##*/}"; iface="${iface%.snapshot}"
+                if ! validate_interface_name "$iface" || [[ "$iface" == auto ]] || ! action_qdisc_snapshot_validate "$snapshot"; then
+                    interfaces_trusted=0
+                    break
+                fi
+                interfaces+="${interfaces:+,}$iface"
+                ((snapshot_count+=1))
+            done
+            (( snapshot_count > 0 )) || interfaces_trusted=0
+        else
+            interfaces_trusted=0
+        fi
+    else
+        state="无法判断（transaction 路径不是可信目录）"
+        interfaces_trusted=0
+    fi
+    (( metadata_trusted )) || created=unknown
+    (( interfaces_trusted )) || interfaces="无法判断（qdisc snapshot 不完整或不可信）"
+    printf -v safe_path '%q' "$path"
+    log ERR "检测到未完成事务"
+    log ERR "transaction 路径: $path"
+    log ERR "创建时间: $created"
+    log ERR "受影响接口: $interfaces"
+    log ERR "事务状态: $state"
+    log ERR "建议只读检查命令: ${0##*/} status ; ${0##*/} verify ; ls -la -- $safe_path"
+}
+
 action_transaction_begin() {
     local iface="$1" dir path stale=""
     [[ -z "$ACTION_TRANSACTION_DIR" ]] || { die "已有未提交的系统配置事务"; return 1; }
     for path in "$STATE_DIR"/.transaction.*; do
         [[ -e "$path" || -L "$path" ]] || continue
         stale+="${stale:+, }$path"
+        action_transaction_diagnose_stale "$path"
     done
     if [[ -n "$stale" ]]; then
-        die "发现上次中断遗留的系统配置事务，拒绝叠加新修改: $stale。请先核验并人工恢复该快照"
+        die "发现上次中断遗留的系统配置事务，拒绝叠加新修改: $stale。不会自动恢复、删除或覆盖；请先执行上述只读检查并人工核验"
         return 1
     fi
     ensure_state_layout || return 1
     dir=$(mktemp -d "${STATE_DIR}/.transaction.XXXXXX") || return 1
     ACTION_TRANSACTION_DIR="$dir"; ACTION_TRANSACTION_IFACE="$iface"; ACTION_TRANSACTION_INTERFACES="$iface"
-    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
-    mkdir -p "$dir/files" "$dir/qdiscs" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
+    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; ACTION_TRANSACTION_ROLLBACK_FAILED=0
+    if ! mkdir -p "$dir/files" "$dir/qdiscs" ||
+       ! printf 'CREATED_AT\t%s\n' "$(utc_now)" > "$dir/transaction.meta" ||
+       ! printf 'readonly\n' > "$dir/transaction.state" ||
+       ! chmod 0600 "$dir/transaction.meta" "$dir/transaction.state"; then
+        remove_tree_within "$dir" "$STATE_DIR" || true
+        ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
+        return 1
+    fi
     action_qdisc_snapshot "$iface" "$dir/qdisc.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
     cp -- "$dir/qdisc.snapshot" "$dir/qdiscs/$iface.snapshot" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
     capture_runtime_sysctls > "$dir/sysctl.tsv" || { remove_tree_within "$dir" "$STATE_DIR"; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; return 1; }
@@ -649,9 +770,29 @@ action_transaction_add_interface() {
 }
 
 action_transaction_discard_snapshot() {
-    local dir="$ACTION_TRANSACTION_DIR"
+    local dir="$ACTION_TRANSACTION_DIR" persisted_state=""
+    if (( ACTION_TRANSACTION_MUTATED != 0 )); then
+        die "事务已经进入 mutated 状态，拒绝把它当作只读快照删除: $dir"
+        return 1
+    fi
+    if [[ -n "$dir" && -f "$dir/transaction.state" && ! -L "$dir/transaction.state" ]]; then
+        persisted_state=$(<"$dir/transaction.state")
+        if [[ "$persisted_state" == mutated ]]; then
+            die "事务已经进入 mutated 状态，拒绝把它当作只读快照删除: $dir"
+            return 1
+        fi
+    fi
+    # Once COMPLETE has been published, an unknown/corrupt persisted state is
+    # evidence, not a disposable read-only snapshot.  This also closes the
+    # signal window after the atomic readonly -> mutated rename but before the
+    # in-memory flag is updated.
+    if (( ACTION_TRANSACTION_READY == 1 )) &&
+       { ! action_transaction_metadata_validate "$dir" || [[ "$persisted_state" != readonly ]]; }; then
+        die "已完成事务快照的 metadata/state 不可信，拒绝删除证据: $dir"
+        return 1
+    fi
     ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
-    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
+    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; ACTION_TRANSACTION_ROLLBACK_FAILED=0
     [[ -z "$dir" ]] || remove_tree_within "$dir" "$STATE_DIR"
 }
 
@@ -683,6 +824,7 @@ action_transaction_begin_multi() {
 }
 
 action_transaction_mark_mutated() {
+    local temp
     [[ -n "$ACTION_TRANSACTION_DIR" && "$ACTION_TRANSACTION_READY" == 1 && "$ACTION_TRANSACTION_MUTATED" == 0 ]] || {
         die "系统配置事务尚未完成只读快照，拒绝开始写入"
         return 1
@@ -691,6 +833,11 @@ action_transaction_mark_mutated() {
         die "系统配置事务快照不完整，或运行时 qdisc filter/队列/路由身份已漂移，拒绝开始写入"
         return 1
     }
+    temp=$(mktemp "$ACTION_TRANSACTION_DIR/.transaction-state.XXXXXX") || return 1
+    if ! printf 'mutated\n' > "$temp" || ! chmod 0600 "$temp" || ! mv -- "$temp" "$ACTION_TRANSACTION_DIR/transaction.state"; then
+        rm -f -- "$temp"
+        return 1
+    fi
     ACTION_TRANSACTION_MUTATED=1
 }
 
@@ -708,7 +855,7 @@ configured_state_target_preflight() {
 }
 
 tcp_restore_runtime_preflight() {
-    local iface="$1" net_root="${BBRV3_SYS_CLASS_NET_ROOT:-/sys/class/net}" key
+    local iface="$1" net_root="${BBRV3_SYS_CLASS_NET_ROOT:-/sys/class/net}" key keys
     validate_interface_name "$iface" && [[ "$iface" != auto && -e "$net_root/$iface" ]] || {
         die "基线绑定的网卡不存在或名称非法: $iface"
         return 1
@@ -720,9 +867,17 @@ tcp_restore_runtime_preflight() {
         die "$iface 的 MQ 基线与当前 TX queue 数不一致，恢复尚未开始"
         return 1
     fi
+    keys=$(tcp_baseline_sysctl_keys) || {
+        die "无法完整枚举恢复目标 sysctl；恢复尚未开始"
+        return 1
+    }
+    [[ -n "$keys" ]] || {
+        die "恢复目标 sysctl 集合为空；恢复尚未开始"
+        return 1
+    }
     while IFS= read -r key; do
         sysctl -n "$key" >/dev/null 2>&1 || { die "无法读取恢复目标 sysctl: $key"; return 1; }
-    done < <(tcp_baseline_sysctl_keys)
+    done <<< "$keys"
     ip -4 route show default >/dev/null 2>&1 || { die "无法读取 IPv4 默认路由；恢复尚未开始"; return 1; }
     ip -6 route show default >/dev/null 2>&1 || { die "无法读取 IPv6 默认路由；恢复尚未开始"; return 1; }
     query_unit_enabled_state "$SERVICE_NAME" >/dev/null || return 1
@@ -735,31 +890,99 @@ action_transaction_commit() {
     local dir="$ACTION_TRANSACTION_DIR"
     [[ -n "$dir" ]] || return 0
     ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
-    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
+    ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; ACTION_TRANSACTION_ROLLBACK_FAILED=0
     remove_tree_within "$dir" "$STATE_DIR" || log WARN "操作已提交，但无法删除临时事务快照: $dir"
 }
 
+action_transaction_unit_enable_link_path() {
+    local unit="$1" unit_file unit_dir
+    # Both persistence units managed by this project use the fixed
+    # WantedBy=multi-user.target contract.  Keep this deliberately scoped: it
+    # is an absent-restore guard, not a general systemd unit-file resolver.
+    case "$unit" in
+        "$SERVICE_NAME") unit_file="$SERVICE_FILE" ;;
+        bbr-optimize-persist.service) unit_file="$LEGACY_SERVICE_FILE" ;;
+        *)
+            log WARN "拒绝检查非本项目受管 systemd unit 的 enable 链接: $unit"
+            return 1
+            ;;
+    esac
+    [[ "$unit" =~ ^[A-Za-z0-9_.:@-]+[.]service$ && "$unit_file" == /* ]] || {
+        log WARN "拒绝检查名称或路径不可信的 systemd unit enable 链接: $unit/$unit_file"
+        return 1
+    }
+    unit_dir=$(readlink -m -- "$(dirname -- "$unit_file")") || return 1
+    [[ "$unit_dir" == /* && "$unit_dir" != / ]] || return 1
+    printf '%s/multi-user.target.wants/%s\n' "$unit_dir" "$unit"
+}
+
+action_transaction_quiesce_unit_for_restore() {
+    local unit="$1" state="" enable_link
+    enable_link=$(action_transaction_unit_enable_link_path "$unit") || return 1
+    # `disable --now` returns non-zero for a unit that never existed.  A
+    # dangling WantedBy link is also reported by the manager as
+    # not-found/inactive, however, so a missing unit is only a no-op after the
+    # project's controlled enable-link path has been proved absent.  Plain
+    # `disable` removes a dangling link without trying (and failing) to stop an
+    # unloaded unit.
+    if ! state=$(query_unit_state "$unit"); then
+        log WARN "回滚前无法可信读取 systemd unit 状态，拒绝执行 disable/stop: $unit"
+        return 1
+    fi
+    if [[ "$state" == $'not-found\tinactive' ]]; then
+        if [[ -e "$enable_link" || -L "$enable_link" ]]; then
+            if ! systemctl disable "$unit" >/dev/null 2>&1; then
+                log WARN "回滚前无法清理缺失 systemd unit 的 enable 链接: $unit"
+                return 1
+            fi
+        fi
+    elif ! systemctl disable --now "$unit" >/dev/null 2>&1; then
+        log WARN "回滚前无法停止并禁用 systemd unit: $unit"
+        return 1
+    fi
+    if [[ -e "$enable_link" || -L "$enable_link" ]]; then
+        log WARN "回滚后 systemd unit 的 enable 链接仍然存在: $enable_link"
+        return 1
+    fi
+}
+
 action_transaction_rollback() {
-    local dir="$ACTION_TRANSACTION_DIR" iface="$ACTION_TRANSACTION_IFACE" file rc=0 had_lock="$LOCK_HELD"
+    local dir="$ACTION_TRANSACTION_DIR" iface="$ACTION_TRANSACTION_IFACE" file rc=0 had_lock="$LOCK_HELD" persisted_state=""
     [[ -n "$dir" ]] || return 0
-    (( ACTION_TRANSACTION_ROLLING_BACK == 0 )) || return 1
+    if (( ACTION_TRANSACTION_ROLLBACK_FAILED != 0 )); then
+        log ERR "本进程先前的自动回滚已经失败；拒绝无监督重试，事务证据保留在 $dir"
+        return 1
+    fi
+    if (( ACTION_TRANSACTION_ROLLING_BACK != 0 )); then
+        ACTION_TRANSACTION_ROLLBACK_FAILED=1
+        return 1
+    fi
+    if [[ -f "$dir/transaction.state" && ! -L "$dir/transaction.state" ]]; then
+        persisted_state=$(<"$dir/transaction.state")
+        [[ "$persisted_state" != mutated ]] || ACTION_TRANSACTION_MUTATED=1
+    fi
     if (( ACTION_TRANSACTION_MUTATED == 0 )); then
         log INFO "系统配置事务仍处于只读快照阶段；正在丢弃快照，不执行运行时回滚"
-        action_transaction_discard_snapshot
-        return
+        if ! action_transaction_discard_snapshot; then
+            ACTION_TRANSACTION_ROLLBACK_FAILED=1
+            return 1
+        fi
+        return 0
     fi
     if (( ACTION_TRANSACTION_READY != 1 )) ||
        [[ ! -f "$dir/COMPLETE" || -L "$dir/COMPLETE" || "$(<"$dir/COMPLETE")" != complete ]]; then
         log ERR "系统配置事务已标记写入但快照不完整；拒绝执行可能破坏系统的回滚，证据保留在 $dir"
+        ACTION_TRANSACTION_ROLLBACK_FAILED=1
         return 1
     fi
     if ! action_transaction_snapshot_validate; then
         log ERR "系统配置事务快照已损坏，或运行时 qdisc filter/队列/路由身份已漂移且不可完整验证；拒绝执行回滚，证据保留在 $dir"
+        ACTION_TRANSACTION_ROLLBACK_FAILED=1
         return 1
     fi
     ACTION_TRANSACTION_ROLLING_BACK=1
-    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-    systemctl disable --now bbr-optimize-persist.service >/dev/null 2>&1 || true
+    action_transaction_quiesce_unit_for_restore "$SERVICE_NAME" || rc=1
+    action_transaction_quiesce_unit_for_restore bbr-optimize-persist.service || rc=1
     action_transaction_restore_path "$CONFIG_FILE" config || rc=1
     action_transaction_restore_path "$SYSCTL_FILE" sysctl || rc=1
     action_transaction_restore_path "$LEGACY_SYSCTL_FILE" legacy-sysctl || rc=1
@@ -790,9 +1013,10 @@ action_transaction_rollback() {
     fi
     if (( rc == 0 )); then
         ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""
-        ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
+        ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0; ACTION_TRANSACTION_ROLLBACK_FAILED=0
         log OK "已恢复本次操作前的 qdisc、sysctl、配置和服务状态"
     else
+        ACTION_TRANSACTION_ROLLBACK_FAILED=1
         log ERR "自动回滚未完全成功；事务快照保留在 $dir"
     fi
     ACTION_TRANSACTION_ROLLING_BACK=0
@@ -1015,6 +1239,11 @@ restore_baseline() {
     tcp_baseline_validate "$BASELINE_DIR" || { die "TCP 基线校验失败；未修改运行配置"; return 1; }
     provenance="$TCP_BASELINE_VALIDATED_PROVENANCE"
     iface="$TCP_BASELINE_VALIDATED_INTERFACE"
+    if [[ "$provenance" != legacy-reference ]] &&
+       ! tcp_sysctl_snapshot_current_compatibility_validate "$BASELINE_DIR/sysctl.tsv"; then
+        die "TCP 基线与当前受管 sysctl 集合不兼容；未修改运行配置"
+        return 1
+    fi
     log INFO "TCP 基线校验通过: $TCP_BASELINE_VALIDATED_GENERATION / $provenance / $iface"
     tcp_restore_runtime_preflight "$iface" || return 1
     nic_restore_preflight || return 1

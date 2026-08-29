@@ -623,12 +623,28 @@ auto_tune_execute() {
     log INFO "扫描记录: $summary"
 }
 
+auto_tune_run_transaction() {
+    local iface="$1" rc rollback_rc=0
+    action_transaction_begin_multi "$iface" || return 1
+    action_transaction_mark_mutated || { action_transaction_discard_snapshot || true; return 1; }
+    if auto_tune_execute "$@"; then
+        action_transaction_commit
+        return
+    else
+        rc=$?
+    fi
+    log WARN "自动调优未完成，正在恢复开始前状态"
+    action_transaction_rollback || rollback_rc=$?
+    (( rollback_rc == 0 )) || return "$rollback_rc"
+    return "$rc"
+}
+
 auto_tune_wizard() {
     require_root || return 1
     require_host_network_control || return 1
     require_systemd_runtime || return 1
     [[ -t 0 ]] || { die "auto 向导需要交互终端"; return 1; }
-    local bandwidth_input nominal=0 role_choice role=mixed peer_rtt=0 tuning_rtt=0 profile=balanced estimate="动态估算" iface rc rollback_rc=0
+    local bandwidth_input nominal=0 role_choice role=mixed peer_rtt=0 tuning_rtt=0 profile=balanced estimate="动态估算" iface
     local backup_count=0 candidate_index candidate tmp_iface
     WIZARD_PEER=""; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PUBLIC_INDEX=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0; WIZARD_ROUTE_GUARD_ACTIVE=0
     WIZARD_PEER_ADDRESS=""; WIZARD_PEER_FAMILY=""; WIZARD_PEER_SOURCE=""; WIZARD_PEER_IFACE=""
@@ -703,18 +719,7 @@ auto_tune_wizard() {
 
     qdisc_guard "$iface" || return 1
     BANDWIDTH_MBIT="$nominal"; network_tuning_preflight "$iface" 1 || return 1
-    action_transaction_begin_multi "$iface" || return 1
-    action_transaction_mark_mutated || { action_transaction_discard_snapshot || true; return 1; }
-    if auto_tune_execute "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" "$peer_rtt"; then
-        action_transaction_commit
-        return
-    else
-        rc=$?
-    fi
-    log WARN "自动调优未完成，正在恢复开始前状态"
-    action_transaction_rollback || rollback_rc=$?
-    (( rollback_rc == 0 )) || return "$rollback_rc"
-    return "$rc"
+    auto_tune_run_transaction "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" "$peer_rtt"
 }
 
 menu_run() {
@@ -857,6 +862,16 @@ dns_menu() {
     done
 }
 
+confirm_ipv6_policy_apply() {
+    local policy="$1"
+    if [[ "$policy" == disabled-persistent ]]; then
+        log WARN "持久策略会写入 net.ipv6.conf.default.disable_ipv6=1。未来创建的 Docker veth、WireGuard、TUN/TAP、Tailscale、新增 NIC 及其他虚拟接口可能默认继承 IPv6 disabled。"
+        confirm '确认持久禁用非回环 IPv6，并接受未来接口的继承影响？'
+    else
+        confirm '临时禁用非回环 IPv6？'
+    fi
+}
+
 ipv6_menu() {
     local choice
     while true; do
@@ -865,8 +880,8 @@ ipv6_menu() {
         read -r -p '选择: ' choice || return 0
         case "$choice" in
             1) submenu_run ipv6_policy_status || return 90 ;; 2) submenu_run ipv6_policy_plan disabled-temporary || return 90 ;;
-            3) if confirm '临时禁用非回环 IPv6？'; then submenu_run ipv6_policy_apply disabled-temporary || return 90; else log INFO "已取消"; ui_pause; fi ;;
-            4) if confirm '持久禁用非回环 IPv6？'; then submenu_run ipv6_policy_apply disabled-persistent || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            3) if confirm_ipv6_policy_apply disabled-temporary; then submenu_run ipv6_policy_apply disabled-temporary || return 90; else log INFO "已取消"; ui_pause; fi ;;
+            4) if confirm_ipv6_policy_apply disabled-persistent; then submenu_run ipv6_policy_apply disabled-persistent || return 90; else log INFO "已取消"; ui_pause; fi ;;
             5) if confirm '恢复 IPv6 native 基线？'; then submenu_run ipv6_policy_apply native || return 90; else log INFO "已取消"; ui_pause; fi ;;
             0) return 0 ;; *) invalid_menu_choice ;;
         esac

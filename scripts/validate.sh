@@ -12,7 +12,7 @@ for file in src/*.sh scripts/*.sh tests/*.sh install-alias.sh; do bash -n "$file
 bash -n net-tcp-tune.sh
 
 echo "==> Generated artifact markers"
-grep -Fq 'SCRIPT_VERSION="8.0.2"' net-tcp-tune.sh
+grep -Fq 'SCRIPT_VERSION="8.0.3"' net-tcp-tune.sh
 grep -Fq 'Configuration is data and is never sourced' net-tcp-tune.sh
 grep -Fq 'MEASURE_PEER_PORT=""' net-tcp-tune.sh
 grep -Fq 'LOCKED_PORT' net-tcp-tune.sh

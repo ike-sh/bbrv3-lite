@@ -46,7 +46,9 @@ for image in "${IMAGES[@]}"; do
             fi
             for test_file in tests/integration_*.sh; do
                 [[ -f "$test_file" ]] || continue
-                [[ "$test_file" != tests/integration_dns_systemd.sh ]] || continue
+                case "$test_file" in
+                    tests/integration_dns_systemd.sh|tests/integration_systemd_unit_state.sh) continue ;;
+                esac
                 printf "==> %s\n" "$test_file"
                 bash "$test_file"
             done
@@ -105,6 +107,7 @@ if (( run_systemd_resolved )); then
     fi
 
     docker exec "$systemd_container" bash /src/tests/integration_dns_systemd.sh
+    docker exec "$systemd_container" bash /src/tests/integration_systemd_unit_state.sh
     docker rm -f "$systemd_container" >/dev/null
     systemd_container=""
     trap - EXIT

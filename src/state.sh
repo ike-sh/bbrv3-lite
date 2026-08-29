@@ -2,26 +2,57 @@
 # State and baseline: immutable provenance and scoped restoration.
 # -----------------------------------------------------------------------------
 
-TCP_BASELINE_SCHEMA="2"
+TCP_BASELINE_SCHEMA="3"
 TCP_BASELINE_FORMAT="bbrv3-lite-tcp-baseline"
 TCP_BASELINE_NATIVE_SCOPE="managed-paths+tcp-sysctl+qdisc+unit-lifecycle+default-route-windows"
 TCP_BASELINE_LEGACY_SCOPE="delegated-legacy-tool"
 TCP_BASELINE_ROUTE_DUMPS="diagnostic-only"
+TCP_SYSCTL_SCHEMA="1"
 TCP_BASELINE_VALIDATED_PROVENANCE=""
 TCP_BASELINE_VALIDATED_INTERFACE=""
 TCP_BASELINE_VALIDATED_GENERATION=""
+TCP_BASELINE_VALIDATED_SYSCTL_SCHEMA=""
 
 tcp_baseline_invalid() {
     log ERR "TCP 基线无效: $*"
     return 1
 }
 
-tcp_baseline_sysctl_keys() {
+tcp_sysctl_schema_1_keys() {
     printf '%s\n' \
         net.core.default_qdisc net.ipv4.tcp_congestion_control \
         net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
         net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen net.core.somaxconn \
         net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog
+}
+
+tcp_sysctl_schema_keys() {
+    case "$1" in
+        1) tcp_sysctl_schema_1_keys ;;
+        *) return 1 ;;
+    esac
+}
+
+tcp_managed_sysctl_keys() {
+    tcp_sysctl_schema_keys "$TCP_SYSCTL_SCHEMA"
+}
+
+# Compatibility name used by existing modules and sourced tests. New baseline
+# validation must select the key set recorded by its manifest, not this moving
+# current-version set.
+tcp_baseline_sysctl_keys() {
+    tcp_managed_sysctl_keys
+}
+
+tcp_sysctl_schema_keys_csv() {
+    local schema="$1" key keys result=""
+    keys=$(tcp_sysctl_schema_keys "$schema") || return 1
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        result+="${result:+,}$key"
+    done <<< "$keys"
+    [[ -n "$result" ]] || return 1
+    printf '%s\n' "$result"
 }
 
 tcp_baseline_regular_file() {
@@ -56,13 +87,38 @@ tcp_sysctl_snapshot_value_normalize() {
     esac
 }
 
+tcp_sysctl_snapshot_missing_current_keys() {
+    local file="$1" key keys missing_keys_csv=""
+    local -A captured=()
+    while IFS=$'\t' read -r key _; do
+        [[ -n "$key" ]] || continue
+        captured[$key]=1
+    done < "$file"
+    keys=$(tcp_managed_sysctl_keys) || return 1
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        [[ -n "${captured[$key]+x}" ]] || missing_keys_csv+="${missing_keys_csv:+,}$key"
+    done <<< "$keys"
+    printf '%s\n' "$missing_keys_csv"
+}
+
+tcp_sysctl_snapshot_current_compatibility_validate() {
+    local file="$1" missing_keys_csv
+    missing_keys_csv=$(tcp_sysctl_snapshot_missing_current_keys "$file") || return 1
+    if [[ -n "$missing_keys_csv" ]]; then
+        log ERR "旧 TCP 基线缺少当前版本受管 sysctl 的可信历史值: $missing_keys_csv；为避免伪造原值，拒绝声称精确恢复"
+        return 1
+    fi
+}
+
 restore_tcp_sysctl_snapshot_file() {
-    local file="$1" line key raw_value value rc=0
+    local file="$1" schema="${2:-current}" line key raw_value value rc=0
     tcp_baseline_regular_file "$file" || return 1
-    if ! tcp_baseline_sysctl_validate "$file"; then
+    if ! tcp_baseline_sysctl_validate "$file" "$schema"; then
         log WARN "拒绝恢复不完整或非法的 sysctl 快照: $file"
         return 1
     fi
+    tcp_sysctl_snapshot_current_compatibility_validate "$file" || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" != *$'\t'* ]]; then
             log WARN "无法恢复格式非法的 sysctl 快照行"
@@ -101,7 +157,7 @@ managed_bbr_script_signature() {
 }
 
 tcp_baseline_manifest_validate() {
-    local directory="$1" manifest="$1/manifest" line key value
+    local directory="$1" manifest="$1/manifest" line key value expected_sysctl_keys
     local -A fields=()
     tcp_baseline_regular_file "$manifest" || { tcp_baseline_invalid "manifest 缺失、不是常规文件或是符号链接"; return 1; }
     [[ -s "$manifest" ]] || { tcp_baseline_invalid "manifest 为空"; return 1; }
@@ -114,7 +170,7 @@ tcp_baseline_manifest_validate() {
         [[ -n "$key" && -n "$value" ]] || { tcp_baseline_invalid "manifest 含空字段"; return 1; }
         [[ -z "${fields[$key]+x}" ]] || { tcp_baseline_invalid "manifest 字段重复: $key"; return 1; }
         case "$key" in
-            SCHEMA|FORMAT|RESTORE_SCOPE|ROUTE_DUMPS|COMPLETE|CREATED_AT|CREATED_BY|PROVENANCE|INTERFACE) ;;
+            SCHEMA|FORMAT|RESTORE_SCOPE|ROUTE_DUMPS|COMPLETE|CREATED_AT|CREATED_BY|PROVENANCE|INTERFACE|SYSCTL_SCHEMA|SYSCTL_KEYS) ;;
             *) tcp_baseline_invalid "manifest 含未知字段: $key"; return 1 ;;
         esac
         fields[$key]="$value"
@@ -138,8 +194,9 @@ tcp_baseline_manifest_validate() {
         1)
             (( ${#fields[@]} == 5 )) || { tcp_baseline_invalid "旧版 manifest 字段集合不完整或混入新版字段"; return 1; }
             TCP_BASELINE_VALIDATED_GENERATION="legacy-v1"
+            TCP_BASELINE_VALIDATED_SYSCTL_SCHEMA="1"
             ;;
-        "$TCP_BASELINE_SCHEMA")
+        2)
             (( ${#fields[@]} == 9 )) || { tcp_baseline_invalid "v2 manifest 字段集合不完整"; return 1; }
             [[ "${fields[FORMAT]:-}" == "$TCP_BASELINE_FORMAT" ]] || { tcp_baseline_invalid "FORMAT 不匹配"; return 1; }
             [[ "${fields[ROUTE_DUMPS]:-}" == "$TCP_BASELINE_ROUTE_DUMPS" ]] || { tcp_baseline_invalid "ROUTE_DUMPS 不匹配"; return 1; }
@@ -150,6 +207,28 @@ tcp_baseline_manifest_validate() {
                 [[ "${fields[RESTORE_SCOPE]:-}" == "$TCP_BASELINE_NATIVE_SCOPE" ]] || { tcp_baseline_invalid "native RESTORE_SCOPE 不匹配"; return 1; }
             fi
             TCP_BASELINE_VALIDATED_GENERATION="v2"
+            TCP_BASELINE_VALIDATED_SYSCTL_SCHEMA="1"
+            ;;
+        "$TCP_BASELINE_SCHEMA")
+            (( ${#fields[@]} == 11 )) || { tcp_baseline_invalid "v3 manifest 字段集合不完整"; return 1; }
+            [[ "${fields[FORMAT]:-}" == "$TCP_BASELINE_FORMAT" ]] || { tcp_baseline_invalid "FORMAT 不匹配"; return 1; }
+            [[ "${fields[ROUTE_DUMPS]:-}" == "$TCP_BASELINE_ROUTE_DUMPS" ]] || { tcp_baseline_invalid "ROUTE_DUMPS 不匹配"; return 1; }
+            [[ "${fields[COMPLETE]:-}" == 1 ]] || { tcp_baseline_invalid "基线没有完成标记"; return 1; }
+            expected_sysctl_keys=$(tcp_sysctl_schema_keys_csv "${fields[SYSCTL_SCHEMA]:-}") || {
+                tcp_baseline_invalid "SYSCTL_SCHEMA 不支持或键集合无法枚举"
+                return 1
+            }
+            [[ "${fields[SYSCTL_KEYS]:-}" == "$expected_sysctl_keys" ]] || {
+                tcp_baseline_invalid "SYSCTL_KEYS 与记录的 sysctl schema 不匹配"
+                return 1
+            }
+            if [[ "${fields[PROVENANCE]}" == legacy-reference ]]; then
+                [[ "${fields[RESTORE_SCOPE]:-}" == "$TCP_BASELINE_LEGACY_SCOPE" ]] || { tcp_baseline_invalid "legacy RESTORE_SCOPE 不匹配"; return 1; }
+            else
+                [[ "${fields[RESTORE_SCOPE]:-}" == "$TCP_BASELINE_NATIVE_SCOPE" ]] || { tcp_baseline_invalid "native RESTORE_SCOPE 不匹配"; return 1; }
+            fi
+            TCP_BASELINE_VALIDATED_GENERATION="v3"
+            TCP_BASELINE_VALIDATED_SYSCTL_SCHEMA="${fields[SYSCTL_SCHEMA]}"
             ;;
         *) tcp_baseline_invalid "不支持的 SCHEMA: ${fields[SCHEMA]:-missing}"; return 1 ;;
     esac
@@ -158,11 +237,19 @@ tcp_baseline_manifest_validate() {
 }
 
 tcp_baseline_sysctl_validate() {
-    local file="$1" line key value
+    local file="$1" schema="${2:-current}" line key value keys
     local -A allowed=() seen=()
     tcp_baseline_regular_file "$file" || { tcp_baseline_invalid "sysctl 快照缺失或类型非法"; return 1; }
     [[ -s "$file" ]] || { tcp_baseline_invalid "sysctl 快照为空"; return 1; }
-    while IFS= read -r key; do allowed[$key]=1; done < <(tcp_baseline_sysctl_keys)
+    if [[ "$schema" == current ]]; then
+        keys=$(tcp_managed_sysctl_keys) || { tcp_baseline_invalid "无法枚举当前受管 sysctl key"; return 1; }
+    else
+        keys=$(tcp_sysctl_schema_keys "$schema") || { tcp_baseline_invalid "不支持或无法枚举的 sysctl schema: $schema"; return 1; }
+    fi
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        allowed[$key]=1
+    done <<< "$keys"
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" != *$'\t'* ]]; then
             tcp_baseline_invalid "sysctl 快照含非法字段行"
@@ -222,6 +309,10 @@ tcp_baseline_unit_state_validate() {
         *) tcp_baseline_invalid "unit-file 状态非法: ${enabled:-empty}"; return 1 ;;
     esac
     case "$active" in active|inactive) ;; *) tcp_baseline_invalid "unit active 状态不可恢复: ${active:-empty}"; return 1 ;; esac
+    if [[ "$enabled" == not-found && "$active" != inactive ]]; then
+        tcp_baseline_invalid "不存在的 unit 只能记录为 inactive"
+        return 1
+    fi
 }
 
 tcp_baseline_qdisc_validate() {
@@ -248,7 +339,7 @@ tcp_baseline_qdisc_validate() {
 
 tcp_baseline_native_validate() {
     local directory="$1" name route_file kind rows class_rows expected_count class_count handle
-    tcp_baseline_sysctl_validate "$directory/sysctl.tsv" || return 1
+    tcp_baseline_sysctl_validate "$directory/sysctl.tsv" "$TCP_BASELINE_VALIDATED_SYSCTL_SCHEMA" || return 1
     tcp_baseline_qdisc_validate "$directory/qdisc.txt" || return 1
     tcp_baseline_regular_file "$directory/class.txt" || { tcp_baseline_invalid "class 快照缺失或类型非法"; return 1; }
     kind=$(awk '$1=="qdisc" && $0~/ root([[:space:]]|$)/ {print $2; exit}' "$directory/qdisc.txt")
@@ -288,7 +379,7 @@ tcp_baseline_legacy_reference_validate() {
         tcp_baseline_invalid "legacy-tool.sh 项目签名缺失或有歧义"
         return 1
     }
-    tcp_baseline_sysctl_validate "$directory/migration-current-sysctl.tsv" || return 1
+    tcp_baseline_sysctl_validate "$directory/migration-current-sysctl.tsv" "$TCP_BASELINE_VALIDATED_SYSCTL_SCHEMA" || return 1
     tcp_baseline_regular_file "$directory/migration-current-qdisc.txt" && [[ -s "$directory/migration-current-qdisc.txt" ]] || {
         tcp_baseline_invalid "legacy migration qdisc 诊断快照缺失"
         return 1
@@ -302,6 +393,7 @@ tcp_baseline_validate() {
     TCP_BASELINE_VALIDATED_PROVENANCE=""
     TCP_BASELINE_VALIDATED_INTERFACE=""
     TCP_BASELINE_VALIDATED_GENERATION=""
+    TCP_BASELINE_VALIDATED_SYSCTL_SCHEMA=""
     [[ -d "$directory" && ! -L "$directory" ]] || { tcp_baseline_invalid "基线路径缺失、不是目录或是符号链接: $directory"; return 1; }
     tcp_baseline_manifest_validate "$directory" || return 1
     if [[ "$TCP_BASELINE_VALIDATED_PROVENANCE" == legacy-reference ]]; then
@@ -330,7 +422,7 @@ managed_artifacts_exist() {
 }
 
 import_legacy_baseline() {
-    local iface="$1" temp_dir=""
+    local iface="$1" temp_dir="" sysctl_keys_csv
     [[ -d "$LEGACY_BACKUP_DIR" && ! -L "$LEGACY_BACKUP_DIR" &&
        -n "$(find "$LEGACY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] || {
         die "旧备份目录缺失、为空或类型不安全；拒绝创建引用基线"
@@ -340,10 +432,14 @@ import_legacy_baseline() {
         die "找到旧备份，但没有可执行的旧版持久化脚本；请先用旧版本 restore，或显式 baseline adopt"
         return 1
     }
+    sysctl_keys_csv=$(tcp_sysctl_schema_keys_csv "$TCP_SYSCTL_SCHEMA") || {
+        die "无法枚举受管 sysctl key；没有创建引用基线"
+        return 1
+    }
     temp_dir=$(mktemp -d "${STATE_DIR}/.baseline.XXXXXX") || return 1
-    if ! printf 'SCHEMA\t%s\nFORMAT\t%s\nRESTORE_SCOPE\t%s\nROUTE_DUMPS\t%s\nCOMPLETE\t1\nCREATED_AT\t%s\nCREATED_BY\t%s\nPROVENANCE\tlegacy-reference\nINTERFACE\t%s\n' \
+    if ! printf 'SCHEMA\t%s\nFORMAT\t%s\nRESTORE_SCOPE\t%s\nROUTE_DUMPS\t%s\nCOMPLETE\t1\nCREATED_AT\t%s\nCREATED_BY\t%s\nPROVENANCE\tlegacy-reference\nINTERFACE\t%s\nSYSCTL_SCHEMA\t%s\nSYSCTL_KEYS\t%s\n' \
             "$TCP_BASELINE_SCHEMA" "$TCP_BASELINE_FORMAT" "$TCP_BASELINE_LEGACY_SCOPE" "$TCP_BASELINE_ROUTE_DUMPS" \
-            "$(utc_now)" "$SCRIPT_VERSION" "$iface" > "$temp_dir/manifest" ||
+            "$(utc_now)" "$SCRIPT_VERSION" "$iface" "$TCP_SYSCTL_SCHEMA" "$sysctl_keys_csv" > "$temp_dir/manifest" ||
        ! cp -a -- "$LEGACY_BACKUP_DIR" "$temp_dir/legacy-original" ||
        ! cp -a -- "$PERSIST_SCRIPT" "$temp_dir/legacy-tool.sh" ||
        ! capture_runtime_sysctls > "$temp_dir/migration-current-sysctl.tsv" ||
@@ -373,7 +469,11 @@ backup_path() {
 }
 
 capture_runtime_sysctls() {
-    local key raw_value value
+    local key keys raw_value value
+    keys=$(tcp_baseline_sysctl_keys) || {
+        log WARN "无法枚举受管 sysctl key，拒绝创建不完整快照"
+        return 1
+    }
     while IFS= read -r key; do
         [[ -n "$key" ]] || continue
         raw_value=$(sysctl -n "$key" 2>/dev/null) || {
@@ -385,12 +485,12 @@ capture_runtime_sysctls() {
             return 1
         fi
         printf '%s\t%s\n' "$key" "$value"
-    done < <(tcp_baseline_sysctl_keys)
+    done <<< "$keys"
     return 0
 }
 
 capture_baseline() {
-    local iface="$1" provenance="${2:-native}" temp_dir=""
+    local iface="$1" provenance="${2:-native}" temp_dir="" sysctl_keys_csv
     if [[ -e "$BASELINE_DIR" || -L "$BASELINE_DIR" ]]; then
         if tcp_baseline_validate "$BASELINE_DIR"; then
             return 0
@@ -410,12 +510,16 @@ capture_baseline() {
             return 1
         fi
     fi
+    sysctl_keys_csv=$(tcp_sysctl_schema_keys_csv "$TCP_SYSCTL_SCHEMA") || {
+        die "无法枚举受管 sysctl key；没有创建基线"
+        return 1
+    }
     qdisc_guard "$iface" || return 1
     ensure_state_layout || return 1
     temp_dir=$(mktemp -d "${STATE_DIR}/.baseline.XXXXXX") || return 1
-    if ! printf 'SCHEMA\t%s\nFORMAT\t%s\nRESTORE_SCOPE\t%s\nROUTE_DUMPS\t%s\nCOMPLETE\t1\nCREATED_AT\t%s\nCREATED_BY\t%s\nPROVENANCE\t%s\nINTERFACE\t%s\n' \
+    if ! printf 'SCHEMA\t%s\nFORMAT\t%s\nRESTORE_SCOPE\t%s\nROUTE_DUMPS\t%s\nCOMPLETE\t1\nCREATED_AT\t%s\nCREATED_BY\t%s\nPROVENANCE\t%s\nINTERFACE\t%s\nSYSCTL_SCHEMA\t%s\nSYSCTL_KEYS\t%s\n' \
             "$TCP_BASELINE_SCHEMA" "$TCP_BASELINE_FORMAT" "$TCP_BASELINE_NATIVE_SCOPE" "$TCP_BASELINE_ROUTE_DUMPS" \
-            "$(utc_now)" "$SCRIPT_VERSION" "$provenance" "$iface" > "$temp_dir/manifest" ||
+            "$(utc_now)" "$SCRIPT_VERSION" "$provenance" "$iface" "$TCP_SYSCTL_SCHEMA" "$sysctl_keys_csv" > "$temp_dir/manifest" ||
        ! capture_runtime_sysctls > "$temp_dir/sysctl.tsv" ||
        ! tc qdisc show dev "$iface" > "$temp_dir/qdisc.txt" 2>/dev/null ||
        ! tc class show dev "$iface" > "$temp_dir/class.txt" 2>/dev/null ||
@@ -476,7 +580,7 @@ restore_backed_path() {
 
 restore_runtime_sysctls() {
     tcp_baseline_regular_file "$BASELINE_DIR/sysctl.tsv" || return 1
-    restore_tcp_sysctl_snapshot_file "$BASELINE_DIR/sysctl.tsv"
+    restore_tcp_sysctl_snapshot_file "$BASELINE_DIR/sysctl.tsv" "$TCP_BASELINE_VALIDATED_SYSCTL_SCHEMA"
 }
 
 baseline_info() {

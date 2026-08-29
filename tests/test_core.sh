@@ -1006,16 +1006,12 @@ test_baseline_captures_persistence_lifecycle() {
         systemctl() {
             local verb="$1" unit="${2:-}"
             case "$verb:$unit" in
-                is-enabled:bbrv3-lite.service)
-                    printf '%s\n' "$service_enabled"
-                    [[ "$service_enabled" == enabled ]]
+                show:bbrv3-lite.service)
+                    printf 'LoadState=loaded\nUnitFileState=%s\nActiveState=%s\n' "$service_enabled" "$service_active"
                     ;;
-                is-active:bbrv3-lite.service)
-                    printf '%s\n' "$service_active"
-                    [[ "$service_active" == active ]]
+                show:*)
+                    printf 'LoadState=not-found\nUnitFileState=\nActiveState=inactive\n'
                     ;;
-                is-enabled:*) printf 'not-found\n'; return 1 ;;
-                is-active:*) printf 'inactive\n'; return 1 ;;
                 enable:bbrv3-lite.service)
                     events+=" enable:$unit"
                     service_enabled=enabled
@@ -1051,24 +1047,22 @@ test_systemd_lifecycle_strict_queries_and_runtime_states() {
             local verb="$1" runtime=0 unit label
             shift
             case "$verb" in
-                is-enabled)
+                show)
                     case "$query_mode" in
-                        manager-enabled) return 1 ;;
-                        unknown-enabled) printf 'mystery-state\n'; return 1 ;;
+                        manager)
+                            printf 'Failed to connect to bus: Host is down\n' >&2
+                            return 1
+                            ;;
+                        invalid_enabled)
+                            printf 'LoadState=loaded\nUnitFileState=mystery-state\nActiveState=%s\n' "$mock_active"
+                            return 0
+                            ;;
+                        invalid_active)
+                            printf 'LoadState=loaded\nUnitFileState=%s\nActiveState=maintenance\n' "$mock_enabled"
+                            return 0
+                            ;;
                     esac
-                    printf '%s\n' "$mock_enabled"
-                    case "$mock_enabled" in
-                        enabled|enabled-runtime|linked|linked-runtime|alias|static|indirect|generated|transient) return 0 ;;
-                        *) return 1 ;;
-                    esac
-                    ;;
-                is-active)
-                    case "$query_mode" in
-                        manager-active) return 1 ;;
-                        unknown-active) printf 'maintenance\n'; return 1 ;;
-                    esac
-                    printf '%s\n' "$mock_active"
-                    [[ "$mock_active" == active ]]
+                    printf 'LoadState=loaded\nUnitFileState=%s\nActiveState=%s\n' "$mock_enabled" "$mock_active"
                     ;;
                 enable|disable|mask|unmask)
                     if [[ "${1:-}" == --runtime ]]; then runtime=1; shift; fi
@@ -1106,27 +1100,27 @@ test_systemd_lifecycle_strict_queries_and_runtime_states() {
             esac
         }
 
-        query_mode=manager-enabled
+        query_mode=manager
         rm -f -- "$state_file"
         if capture_unit_state example.service "$state_file" >/dev/null 2>&1; then
-            fail "manager/D-Bus is-enabled failure was captured as a valid state"
+            fail "manager/D-Bus show failure was captured as a valid state"
         fi
         [[ ! -e "$state_file" ]] || fail "failed unit query wrote a lifecycle snapshot"
 
-        query_mode=unknown-enabled
+        query_mode=invalid_enabled
         if capture_unit_state example.service "$state_file" >/dev/null 2>&1; then
             fail "unknown unit-file state was accepted"
         fi
         [[ ! -e "$state_file" ]] || fail "unknown unit-file state wrote a lifecycle snapshot"
 
-        query_mode=manager-active; mock_enabled=disabled
+        query_mode=invalid_active; mock_enabled=disabled
         if capture_unit_state example.service "$state_file" >/dev/null 2>&1; then
-            fail "manager/D-Bus is-active failure was captured as inactive"
+            fail "unknown active state was captured as inactive"
         fi
-        [[ ! -e "$state_file" ]] || fail "failed active query wrote a lifecycle snapshot"
+        [[ ! -e "$state_file" ]] || fail "unknown active state wrote a lifecycle snapshot"
 
-        # Non-zero status from is-enabled/is-active is expected for the known
-        # disabled/inactive states and must not be confused with a query error.
+        # Machine-readable fields distinguish known disabled/inactive states
+        # from a manager failure or an unsupported state token.
         query_mode=normal; mock_enabled=disabled; mock_active=inactive
         capture_unit_state example.service "$state_file"
         assert_eq $'disabled\tinactive' "$(<"$state_file")" "known negative systemd states"
@@ -1175,7 +1169,7 @@ test_systemd_lifecycle_strict_queries_and_runtime_states() {
             local tx_root="$TEST_ROOT/systemd-manager-failure"
             STATE_DIR="$tx_root/state"; HISTORY_DIR="$STATE_DIR/history"
             ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""
-            query_mode=manager-enabled
+            query_mode=manager
             ensure_state_layout() { mkdir -p -- "$STATE_DIR" "$HISTORY_DIR"; }
             action_qdisc_snapshot() {
                 printf 'KIND\tnoqueue\nRATE\t\nARGS\t\nqdisc noqueue 0: root\n' > "$2"
@@ -1263,9 +1257,9 @@ test_self_update_rolls_back_split_install() {
         local update_root="$TEST_ROOT/self-update" installed_path candidate valid_candidate output_path="" url="" update_output="" fail_persist=1
         mkdir -p "$update_root"
         installed_path="$update_root/bbr"; candidate="$update_root/new.sh"; valid_candidate="$update_root/new.valid.sh"; PERSIST_SCRIPT="$update_root/persist.sh"
-        sed 's/^SCRIPT_VERSION="8.0.2"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
+        sed 's/^SCRIPT_VERSION="8.0.3"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
         cp "$installed_path" "$PERSIST_SCRIPT"; chmod 0755 "$installed_path" "$PERSIST_SCRIPT"
-        sed 's/^SCRIPT_VERSION="8.0.2"$/SCRIPT_VERSION="8.0.3"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
+        sed 's/^SCRIPT_VERSION="8.0.3"$/SCRIPT_VERSION="8.0.4"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
         cp "$candidate" "$valid_candidate"
         require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
         current_script_path() { printf '%s\n' "$installed_path"; }
@@ -1280,7 +1274,7 @@ test_self_update_rolls_back_split_install() {
                 esac
             done
             case "$url" in
-                */releases/latest) printf '{"tag_name":"v8.0.3"}\n' ;;
+                */releases/latest) printf '{"tag_name":"v8.0.4"}\n' ;;
                 */net-tcp-tune.sh) cp "$candidate" "$output_path" ;;
                 */SHA256SUMS)
                     printf '%s  net-tcp-tune.sh\n' "$(sha256sum "$candidate" | awk '{print $1}')" > "$output_path"
@@ -1293,7 +1287,7 @@ test_self_update_rolls_back_split_install() {
             [[ "$target" != "$PERSIST_SCRIPT" || "$fail_persist" == 0 ]] || return 9
             cp "$source" "$target"; chmod 0755 "$target"
         }
-        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.3"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
+        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.4"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
         if self_update >/dev/null 2>&1; then fail "checksum-matching false-marker update was accepted"; fi
         grep -Fq 'SCRIPT_VERSION="8.0.1"' "$installed_path" || fail "rejected false-marker update changed current command"
         cp "$valid_candidate" "$candidate"
@@ -1304,8 +1298,8 @@ test_self_update_rolls_back_split_install() {
 
         fail_persist=0
         self_update >/dev/null
-        grep -Fq 'SCRIPT_VERSION="8.0.3"' "$installed_path" || fail "successful update did not replace current command"
-        grep -Fq 'SCRIPT_VERSION="8.0.3"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
+        grep -Fq 'SCRIPT_VERSION="8.0.4"' "$installed_path" || fail "successful update did not replace current command"
+        grep -Fq 'SCRIPT_VERSION="8.0.4"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
     )
 }
 
@@ -1704,8 +1698,7 @@ test_tcp_baseline_capture_is_atomic_and_replayable() (
     }
     systemctl() {
         case "$1" in
-            is-enabled) printf 'not-found\n'; return 1 ;;
-            is-active) printf 'inactive\n'; return 3 ;;
+            show) printf 'LoadState=not-found\nUnitFileState=\nActiveState=inactive\n' ;;
             *) return 0 ;;
         esac
     }
@@ -1716,10 +1709,12 @@ test_tcp_baseline_capture_is_atomic_and_replayable() (
 
     qdisc_mode=fq
     capture_baseline eth0 adopt-current
-    grep -Fxq $'SCHEMA\t2' "$BASELINE_DIR/manifest" || fail "new TCP baseline schema missing"
+    grep -Fxq $'SCHEMA\t3' "$BASELINE_DIR/manifest" || fail "new TCP baseline schema missing"
     grep -Fxq $'COMPLETE\t1' "$BASELINE_DIR/manifest" || fail "new TCP baseline completion marker missing"
+    grep -Fxq $'SYSCTL_SCHEMA\t1' "$BASELINE_DIR/manifest" || fail "new TCP baseline sysctl schema missing"
+    grep -Fxq $'SYSCTL_KEYS\t'"$(tcp_sysctl_schema_keys_csv 1)" "$BASELINE_DIR/manifest" || fail "new TCP baseline sysctl key set missing"
     tcp_baseline_validate "$BASELINE_DIR" || fail "new atomic TCP baseline did not self-validate"
-    assert_eq v2 "$TCP_BASELINE_VALIDATED_GENERATION" "new TCP baseline generation"
+    assert_eq v3 "$TCP_BASELINE_VALIDATED_GENERATION" "new TCP baseline generation"
     for key in FORMAT RESTORE_SCOPE ROUTE_DUMPS; do grep -q "^${key}"$'\t' "$BASELINE_DIR/manifest" || fail "new baseline missing $key"; done
 )
 
@@ -1830,13 +1825,12 @@ test_valid_v1_tcp_baseline_restores() (
     systemctl() {
         verb="$1"; shift; unit="${*: -1}"
         case "$verb" in
-            is-enabled)
-                if [[ "$unit" == "$SERVICE_NAME" && -e "$SERVICE_FILE" ]]; then printf 'enabled\n'; return 0; fi
-                printf 'not-found\n'; return 1
-                ;;
-            is-active)
-                if [[ "$unit" == "$SERVICE_NAME" && -e "$SERVICE_FILE" ]]; then printf 'active\n'; return 0; fi
-                printf 'inactive\n'; return 3
+            show)
+                if [[ "$unit" == "$SERVICE_NAME" && -e "$SERVICE_FILE" ]]; then
+                    printf 'LoadState=loaded\nUnitFileState=enabled\nActiveState=active\n'
+                else
+                    printf 'LoadState=not-found\nUnitFileState=\nActiveState=inactive\n'
+                fi
                 ;;
             disable|daemon-reload|stop|start|enable|mask|unmask) events+=" systemctl:$verb $*"; return 0 ;;
             *) return 0 ;;
@@ -2656,13 +2650,14 @@ test_action_transaction_rolls_back_failed_step() {
     systemctl() {
         verb="$1"; shift
         case "$verb" in
-            is-enabled)
-                unit="$1"; printf '%s\n' "${unit_enabled[$unit]:-not-found}"
-                [[ "${unit_enabled[$unit]:-not-found}" == enabled ]]
-                ;;
-            is-active)
-                unit="$1"; printf '%s\n' "${unit_active[$unit]:-inactive}"
-                [[ "${unit_active[$unit]:-inactive}" == active ]]
+            show)
+                unit="$1"
+                if [[ "${unit_enabled[$unit]:-not-found}" == not-found ]]; then
+                    printf 'LoadState=not-found\nUnitFileState=\nActiveState=inactive\n'
+                else
+                    printf 'LoadState=loaded\nUnitFileState=%s\nActiveState=%s\n' \
+                        "${unit_enabled[$unit]}" "${unit_active[$unit]:-inactive}"
+                fi
                 ;;
             disable)
                 events+=" systemctl:$verb $*"; unit="${*: -1}"
@@ -2742,8 +2737,7 @@ test_action_transaction_rejects_late_filter_before_rollback_writes() (
     systemctl() {
         verb="$1"; shift
         case "$verb" in
-            is-enabled) printf 'disabled\n'; return 1 ;;
-            is-active) printf 'inactive\n'; return 3 ;;
+            show) printf 'LoadState=loaded\nUnitFileState=disabled\nActiveState=inactive\n' ;;
             *) printf 'WRITE:systemctl:%s %s\n' "$verb" "$*" >> "$events" ;;
         esac
     }
