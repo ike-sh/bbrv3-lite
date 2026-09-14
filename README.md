@@ -2,7 +2,7 @@
 
 BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-当前版本：v8.0.4
+当前版本：v8.0.5
 
 项目不追求“sysctl 越多越好”。默认配置保持克制。命令行 `measure` 只给出结果；交互式 `auto` 会在一次总确认后完成测量、决策、应用和复验，未发现可信拐点时保持纯 FQ。
 
@@ -25,6 +25,7 @@ BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原
 - v8.0.2 qdisc 与路由事务精确恢复：基线和事务同时校验 root/leaf handle、可重放参数、MQ qdisc/class 对应关系和 TX queue 数；内核自动创建的 `0:` qdisc 会在事务内按需临时切换 `default_qdisc`、删除显式 root 完成重建，再恢复原全局默认值并复验两者。任何受管树上的外部 tc filter、扩展 HTB 拓扑或错误 default class 都会在写入前拒绝；IPv6 RA 路由不断递减的 `expires` 与查询 `uid` 不再被误判为换路，但 metric/proto/pref/gateway/device 等真实路由身份仍严格校验。
 - v8.0.3 发布前修复：真实 Debian/systemd 首次安装可安全处理尚不存在的 service；schema-3 TCP 基线显式绑定 sysctl schema/key 集并兼容真实 v8.0.2 基线；事务诊断与失败证据保留更清晰，永久禁用 IPv6 时会提示对未来新接口的影响。
 - v8.0.4 nexthop 与公共测速可靠性修复：支持解析普通单路径 nexthop object；高重传 baseline 改为 inconclusive 并切换候选，不再冒充 clean NO_KNEE；纯 BBR+FQ 的 clean NO_KNEE 在最终 peer 仅 unavailable 时可经过严格本地 runtime、路径指纹和连通性降级复验提交，有 HTB 推荐时仍严格失败并回滚。
+- v8.0.5 测量实验重写：低速 Path Quality Control、不限速 saturation/capacity probe 与 shaped sweep 成为三个独立阶段；只有低速 control 能判定 `PATH_DIRTY`，干净 control 加高重传 saturation 会标记疑似 policer 并在同一 peer/path 完成扫描。所有容量、区间、拐点与最终验证决策使用 receiver delivered rate，sender 仅作诊断。
 - 全局 TCP sysctl 与逐网卡 qdisc 明确分层：Linux TCP 缓冲区是全局资源，脚本按全部策略聚合出一个安全上界；qdisc、速率、原始队列基线和恢复则逐网卡独立处理，不再把“多网卡检测”误称为“多网卡管理”。
 - 全局 `flock`，防止两个进程同时修改 sysctl、qdisc 或配置。
 - 严格 `KEY=VALUE` 白名单解析，配置文件从不被 shell `source`。
@@ -218,21 +219,23 @@ sudo bbr measure sweep \
 
 不传 `--cap` 时使用硬件感知上限：可信物理链路按线速留 25% 余量，未知或虚拟链路先使用 5000 Mbit/s；取得不限速基准后，自动模式会把规划上限扩展到基准的 1.5 倍（最高 1,000,000 Mbit/s），因此不会再因旧版固定 5G 上限而跳过 10G/25G/100G 机器。显式 `--cap` 是人工硬上限：即使同时给出更大的 `--high`，实际扫描上界也会收敛到 `--cap`，不会发出超限整形样本。
 
-扫描流程：
+扫描是一个显式实验状态机：
 
-1. 保存操作前 qdisc 和接口流量计数器。
-2. 使用 root FQ 做两次不超过 5 秒的单流不限速 JSON 测试并取中位数；自动模式按基准更新扫描上限，高于 10G/40G 时把后续样本缩短到 4/3 秒，兼顾稳定性和流量消耗。只有显式硬上限被超过时才停止扫描。
-3. 建立低速率重传本底。
-4. 使用与最终部署完全相同的 HTB/FQ 层级向上粗扫。
-5. 用低速干净档的 `goodput / HTB rate` 校准协议开销；粗扫和细扫都要求吞吐增益及效率比保持正常。
-6. 对最后干净档位退让 `--margin`，进行至少两次确认；吞吐离散度超过 6% 时自动增加第三次样本，仍不稳定或确认吞吐/重传不合格时不输出推荐值。
-7. 保存样本并恢复操作前 qdisc。
+1. 保存操作前 qdisc、接口流量计数器和冻结路径指纹。已知标称带宽时，先在约 40% 标称速率运行三次低速 `PATH_CONTROL`；自动带宽时，先做 saturation discovery，再以 receiver 实测速率的约 45% 运行同样的低速 control。只有这个阶段可以产生 `PATH_DIRTY`。
+2. 使用 root FQ 做短时单流 `SATURATION`。这里的 sender、receiver、字节与重传来自同一条 iperf3 JSON 样本。高重传不再叫“bad baseline”：control 干净而 saturation 高重传意味着 `POLICER_SUSPECTED=1`，继续原 peer/path；saturation 干净且 receiver 达到可信容量区间才进入 `CLEAN_NO_POLICER`，保持纯 FQ。
+3. 单流明显低于已知标称值，或自动发现面对可信高带宽链路却明显不足时，会追加一次有界多流 `CAPACITY_DISCOVERY`；多流只用于容量判别和扫描规划，绝不与单流序列混算，也不覆盖 saturation 的重传归因。多流仍明显低于已知标称值时按慢对端/不稳定测量失败，而不冒充可信 `NO_KNEE`。
+4. 扫描区间由 receiver delivered rate 推导，通常规划约 8 个粗扫点并受 `--cap` 硬限制。首个扫描点若经复测仍丢包，最多三次按约 0.75 倍向下寻找干净参考，再从干净点与已知丢包点之间细扫。
+5. 任一重传尖峰都要在同一档共做三次实验，至少 2/3 次命中才确认；一次尖峰后两次干净按公共节点瞬时竞争处理。代表结果选择一条真实完整样本，不会把一次的 receiver 吞吐与另一次的重传拼成“中位样本”。
+6. `PRE_SCAN`、`SPIKE_RECHECK`、`BETWEEN_LEVEL` 和 `PRE_VERIFY` 使用不同冷却预算；粗扫较短，尖峰确认和最终候选较长。摘要记录样本数与流量上界，超过污染、CPU 或稳定性门槛时停止并恢复。
+7. 最后干净档位按 `--margin` 退让并再次确认。最终 verify 同样使用 receiver 和低速干净参考；任何端点/来源/出口/路由/FIB/MTU 指纹漂移仍会使结果失效。
 
-结果保存在 `/var/lib/bbrv3-lite/history/`。`samples.tsv` 除原始吞吐与重传外，还记录 `RETRANS_PER_GIB`、空闲 RTT、负载 RTT 中位数/p95、bufferbloat p95、未归因后台 TX、CPU busy/steal 和污染标记；`path-rtt.tsv` 保存路径画像的原始 RTT 样本。摘要记录路径双指纹、网关/路由表、PMTU、RTT 分布与稳定性，以及硬件档位、链路/队列、扫描上限、采样时长、多流数量、样本离散度、实际样本数和 0–100 的置信度。`high/medium/low` 不是线路评级，而是对“本轮测量是否足以支撑结论”的审计信息。自动调优摘要还会记录 `PEER_RTT_MS`、`TUNING_RTT_MS`、`TUNING_RTT_SOURCE`、`ROLE`、sweep/verify 路径指纹、最终复验 peer 和公共节点切换次数。
+核心状态只有四类：`CLEAN_NO_POLICER`、`CLEAN_POLICER_FOUND`、`PATH_DIRTY`、`MEASUREMENT_UNSTABLE`。公共 peer 只有在低速 control 脏、对端不可用或过慢、服务繁忙、测量持续不稳定或路径漂移时才切换；“干净 control + lossy saturation”不会触发中途换 peer。
+
+结果保存在 `/var/lib/bbrv3-lite/history/`。`samples.tsv` 显式记录 `SENDER_MBIT`、`RECEIVER_MBIT`、双方字节、重传、receiver fallback、持续时间、流数、RTT/bufferbloat、后台 TX 和 CPU 污染。摘要记录 `PATH_CONTROL_*`、`SATURATION_*`、`CAPACITY_DISCOVERY_MODE`、`POLICER_SUSPECTED`、`SCAN_LOW/HIGH/STEP_MBIT`、`CLEAN_REFERENCE_*`、`KNEE_MBIT`、`RECOMMEND`、`SCAN_DECISION` 及 sample/decision confidence。兼容字段 `UNSHAPED_MBIT` 仍保留，但其语义明确为 saturation probe 的 receiver-delivered rate，而不是线路质量基线。
 
 这里显示的 `RETRANS_RATIO_EST_PERCENT` 是“iperf3 retransmits / 按 1448 字节估算的 TCP 段数”，用于寻找相对跳变，不是抓包意义上的真实丢包率。`RETRANS_PER_GIB` 则把重传次数按发送 1 GiB 归一化，适合比较不同持续时间和吞吐的样本，但同样不等同于丢包率。
 
-扫描同时观察相对重传跳变、吞吐增益连续停滞和相对低速干净档的效率下降。扫描到上界仍无可信边界时不会错误地把上界当作推荐值，而是保持纯 FQ。不限速路径自身重传过高时，默认拒绝给出 policer 结论；自定义 `--low/--high` 不会绕过保护，只有显式 `--force-scan` 才继续。
+扫描同时观察相对重传跳变、receiver 吞吐增益连续停滞和相对低速干净档的效率下降。扫描到上界仍无可信边界时不会把上界当作推荐值：saturation 干净时保持纯 FQ，saturation 疑似 policer 却未找到拐点时则返回不稳定/超范围结论，不会冒充 `NO_KNEE`。
 
 ### 7. 临时 A/B 对照
 
@@ -671,10 +674,20 @@ tag 推送会触发 Release 工作流，验证 tag 与脚本版本一致，并�
 
 - **Modern `nhid`**：默认路由、目标 `route get`、`fibmatch`、来源绑定复验和路径指纹统一解析 nexthop object；优先精确 `ip nexthop get id ID`，并兼容从 dump 中只选取唯一精确 ID。普通单 leaf object 会解析出接口与 gateway 并和 route 内联字段交叉核对，不再把 Debian 13 的 RA IPv6 单路径默认路由误判为 ECMP。
 - **Fail closed**：nexthop group（包括成员都在同一网卡的情况）、blackhole、缺失或异常 object、非法 ID、封装/不可用状态、地址族或 route/object 接口/gateway 不一致继续拒绝；inline multipath 防护保持不变。
-- **Baseline quality**：不限速 baseline 重传过高现在记录 `BASELINE_QUALITY=bad` 与 `SCAN_DECISION=inconclusive-bad-baseline`，返回独立质量错误，不设置 `NO_KNEE`，也不生成推荐值或自适应持久化参数。公共对端出现该状态时丢弃整轮结果，在下一个同出口候选上重新执行完整 baseline+sweep。
+- **Baseline quality（v8.0.4 历史行为）**：当时把不限速高重传降级为 inconclusive，避免误报 clean `NO_KNEE`。v8.0.5 已进一步拆分实验：不限速结果只属于 saturation，不再承担路径质量判定。
 - **Confidence semantics**：summary 分离 sample telemetry confidence 与 policer decision confidence。即使遥测样本完整，高重传 baseline 的决策置信度也固定为 low，日志不会再显示矛盾的 `high / clean` 扫描结论。
 - **Final verification**：clean NO_KNEE、无推荐值、`TC_ENABLED=0` 且 BBR/FQ runtime 已通过时，最终 iperf 仅返回 endpoint unavailable 可改用本地 runtime、原 endpoint/route 双指纹与绑定路径连通性复验，并记录 `FINAL_VERIFY_MODE=local-fallback`。性能不达标、路径漂移、运行时验证失败或任何 HTB 推荐仍失败并由外层事务完整回滚；HTB 不允许跨 host 验收。
 - **Tests**：新增普通 IPv6 `nhid`、fibmatch、group/blackhole/unresolved/mismatch/inline ECMP，以及公共 baseline failover、置信度、纯 FQ 降级验证和 HTB/性能/路径失败边界回归。
+
+## v8.0.5 measurement experiment rewrite
+
+- **Root cause**：v8.0.4 把不限速单流兼作路径质量基线与容量探针；policer 正常产生的高重传会被误归类为坏路径。采样聚合还会分别计算吞吐、重传和字节的中位数，形成现实中不存在的组合样本。
+- **State machine**：sweep 自己拥有低速 path control、saturation/capacity discovery、shaped coarse/fine sweep 和 candidate confirmation。自动标称值为 0 时也必须在 discovery 后执行 receiver-derived 低速 control，不依赖 CLI 预先调用另一个命令。
+- **Receiver semantics**：所有范围、效率、拐点、推荐和最终验证以 receiver 为准；sender、receiver、双方字节和 fallback 标志分别落盘。旧 iperf3 缺少 receiver 汇总时可退回 sender，但决策置信度扣分。
+- **Policer confirmation**：干净 control 加 lossy saturation 进入 `CLEAN_POLICER_FOUND` 候选路径并保持相同 peer；每个 loss spike 以 2/3 复现规则确认，首档丢包会最多向下寻找三次干净参考。
+- **Bounded experiments**：粗扫约 8 点，细扫最多约 8 点；control、saturation、coarse、confirmation 使用不同持续时间和阶段冷却。summary 写入最大样本数和估算流量上界。
+- **Safety**：保留 v8.0.4 的 nexthop/ECMP/来源绑定、双路径指纹、PMTU/MTU、qdisc 所有权、MQ 精确恢复、多网卡事务和最终持久化门禁。高重传 saturation 不会放宽任何这些保护。
+- **Regression fixture**：200M 夹具覆盖 control 80/0%、saturation receiver 192/8.7621%、receiver-based 180–220+ 扫描、2/3 尖峰确认、约 210M knee 和 203M 推荐；auto nominal=0 以同一高重传 saturation 推导 86M control 后也完成全扫描。另含 sender/receiver 分歧、dirty path、无 policer、慢对端拒绝、浅 policer、瞬时公共竞争、receiver verify、容量模式和流量边界。
 
 ## v8 与旧版的差异
 

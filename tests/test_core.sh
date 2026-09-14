@@ -22,6 +22,7 @@ export BBRV3_IPV6_BACKUP_DIR="$TEST_ROOT/state/ipv6"
 export BBRV3_IPV6_SYSCTL_FILE="$TEST_ROOT/etc/99-bbrv3-lite-ipv6.conf"
 export BBRV3_NIC_POLICY_DIR="$TEST_ROOT/etc/interfaces.d"
 export BBRV3_NIC_STATE_DIR="$TEST_ROOT/state/interfaces"
+export BBRV3_MEASUREMENT_COOLDOWN=0
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 # shellcheck source=../net-tcp-tune.sh
@@ -1257,9 +1258,9 @@ test_self_update_rolls_back_split_install() {
         local update_root="$TEST_ROOT/self-update" installed_path candidate valid_candidate output_path="" url="" update_output="" fail_persist=1
         mkdir -p "$update_root"
         installed_path="$update_root/bbr"; candidate="$update_root/new.sh"; valid_candidate="$update_root/new.valid.sh"; PERSIST_SCRIPT="$update_root/persist.sh"
-        sed 's/^SCRIPT_VERSION="8.0.4"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
+        sed 's/^SCRIPT_VERSION="8.0.5"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
         cp "$installed_path" "$PERSIST_SCRIPT"; chmod 0755 "$installed_path" "$PERSIST_SCRIPT"
-        sed 's/^SCRIPT_VERSION="8.0.4"$/SCRIPT_VERSION="8.0.5"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
+        sed 's/^SCRIPT_VERSION="8.0.5"$/SCRIPT_VERSION="8.0.6"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
         cp "$candidate" "$valid_candidate"
         require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
         current_script_path() { printf '%s\n' "$installed_path"; }
@@ -1274,7 +1275,7 @@ test_self_update_rolls_back_split_install() {
                 esac
             done
             case "$url" in
-                */releases/latest) printf '{"tag_name":"v8.0.5"}\n' ;;
+                */releases/latest) printf '{"tag_name":"v8.0.6"}\n' ;;
                 */net-tcp-tune.sh) cp "$candidate" "$output_path" ;;
                 */SHA256SUMS)
                     printf '%s  net-tcp-tune.sh\n' "$(sha256sum "$candidate" | awk '{print $1}')" > "$output_path"
@@ -1287,7 +1288,7 @@ test_self_update_rolls_back_split_install() {
             [[ "$target" != "$PERSIST_SCRIPT" || "$fail_persist" == 0 ]] || return 9
             cp "$source" "$target"; chmod 0755 "$target"
         }
-        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.5"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
+        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.6"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
         if self_update >/dev/null 2>&1; then fail "checksum-matching false-marker update was accepted"; fi
         grep -Fq 'SCRIPT_VERSION="8.0.1"' "$installed_path" || fail "rejected false-marker update changed current command"
         cp "$valid_candidate" "$candidate"
@@ -1298,8 +1299,8 @@ test_self_update_rolls_back_split_install() {
 
         fail_persist=0
         self_update >/dev/null
-        grep -Fq 'SCRIPT_VERSION="8.0.5"' "$installed_path" || fail "successful update did not replace current command"
-        grep -Fq 'SCRIPT_VERSION="8.0.5"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
+        grep -Fq 'SCRIPT_VERSION="8.0.6"' "$installed_path" || fail "successful update did not replace current command"
+        grep -Fq 'SCRIPT_VERSION="8.0.6"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
     )
 }
 
@@ -2270,8 +2271,12 @@ test_refine_preserves_throughput_stall_and_confirmation_gate() {
     MOCK_CONFIRM_FAIL=0
     sample_repeated() {
         local label="$6" rate goodput loss=0
-        if [[ "$label" == unshaped ]]; then
-            printf '300\t0\t1000000\t0.00000\n'
+        if [[ "$label" == path-control ]]; then
+            printf '120\t0\t1000000\t0.00000\n'
+            return
+        fi
+        if [[ "$label" == saturation ]]; then
+            printf '300\t0\t1000000\t2.00000\n'
             return
         fi
         [[ "$label" =~ (rate|refine|confirm)-([0-9]+) ]] || fail "unexpected sample label: $label"
@@ -2283,7 +2288,7 @@ test_refine_preserves_throughput_stall_and_confirmation_gate() {
     measure_sweep example.com 5201 auto 300 240 360 15 3 1 3 0.1 0 5000
     summary="$MEASURE_RUN_DIR/summary.tsv"
     assert_eq 306 "$(summary_value "$summary" LAST_OK)" "fine scan last clean"
-    assert_eq 309 "$(summary_value "$summary" BROKE_AT)" "fine scan throughput break"
+    assert_eq 308 "$(summary_value "$summary" BROKE_AT)" "fine scan throughput break"
     assert_eq 296 "$(summary_value "$summary" RECOMMEND)" "confirmed recommendation"
     assert_eq 1 "$(summary_value "$summary" CONFIRMED)" "confirmation marker"
 
@@ -2321,7 +2326,7 @@ test_sweep_hard_cap_and_setup_failure_restore() {
         measure_begin() { MEASURE_IFACE=eth0; }
         measure_restore() { ((restore_count+=1)); }
         traffic_report() { :; }; apply_fq() { :; }
-        apply_shaping() { (( $2 > max_rate )) && max_rate="$2"; }
+        apply_shaping() { (( $2 > max_rate )) && max_rate="$2"; return 0; }
         sample_repeated() {
             local label="$6" rate=300
             [[ "$label" =~ (rate|refine|confirm)-([0-9]+) ]] && rate="${BASH_REMATCH[2]}"

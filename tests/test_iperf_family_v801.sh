@@ -299,7 +299,7 @@ test_frozen_endpoint_is_not_resolved_again_and_drift_still_fails() (
     else
         rc=$?
     fi
-    assert_eq 1 "$rc" "route drift status"
+    assert_eq "$MEASURE_ROUTE_MISMATCH_RC" "$rc" "route drift status"
     assert_eq 1 "$(<"$resolve_count")" "route-drift guard re-resolved hostname"
 )
 

@@ -419,7 +419,7 @@ interactive_select_peer() {
 }
 
 auto_measure_with_peer_failover() {
-    local iface="$1" nominal="$2" index=0 count=1 rc path_rate
+    local iface="$1" nominal="$2" index=0 count=1 rc
     local duration="${WIZARD_SAMPLE_DURATION:-5}" cap="${WIZARD_SCAN_CAP:-5000}"
     if (( ${WIZARD_PUBLIC_PEER:-0} )); then count=${#PUBLIC_PEER_CANDIDATES[@]}; fi
     for ((index=0; index<count; index++)); do
@@ -441,21 +441,9 @@ auto_measure_with_peer_failover() {
         if (( ${WIZARD_ROUTE_GUARD_ACTIVE:-0} )); then
             auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-$WIZARD_PEER}" || return 1
         fi
-        if (( nominal > 0 )); then
-            path_rate=$((nominal * 40 / 100)); ((path_rate < 1)) && path_rate=1
-            if measure_path_check "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$path_rate" \
-                    "${WIZARD_PEER_ADDRESS:-}" "${WIZARD_PEER_SOURCE:-}"; then
-                :
-            else
-                rc=$?
-                if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == MEASURE_BASELINE_QUALITY_RC || rc == 2) )); then
-                    (( rc != MEASURE_BASELINE_QUALITY_RC )) || log WARN "当前公共对端 baseline 质量不足；将丢弃本次结果并在下一个候选上重新执行完整 sweep"
-                    (( index + 1 < count )) && continue
-                    break
-                fi
-                return "$rc"
-            fi
-        fi
+        # measure_sweep owns its low-rate path control. Keeping that experiment
+        # inside the same qdisc snapshot and peer lock prevents hidden CLI-only
+        # prerequisites and makes direct `measure sweep` behavior identical.
         if measure_sweep "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$nominal" 0 0 0 "$duration" 1 3 0.1 0 "$cap" auto \
                 "${WIZARD_PEER_ADDRESS:-}" "${WIZARD_PEER_SOURCE:-}"; then
             WIZARD_SWEEP_PEER="$WIZARD_PEER"
@@ -468,23 +456,23 @@ auto_measure_with_peer_failover() {
         else
             rc=$?
         fi
-        if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == MEASURE_BASELINE_QUALITY_RC || rc == 2) )); then
-            (( rc != MEASURE_BASELINE_QUALITY_RC )) || log WARN "当前公共对端 baseline 质量不足；将丢弃本次结果并在下一个候选上重新执行完整 sweep"
+        if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == MEASURE_PATH_QUALITY_RC || rc == MEASURE_ROUTE_MISMATCH_RC || rc == IPERF_UNSTABLE_RC || rc == IPERF_CONTAMINATED_RC || rc == 2) )); then
+            (( rc != MEASURE_PATH_QUALITY_RC )) || log WARN "当前公共对端低速 path control 判定 PATH_DIRTY；下一个候选将重新执行完整实验"
             (( index + 1 < count )) && continue
             break
         fi
         return "$rc"
     done
-    die "所有公共 iperf3 对端均不可用或当前路径质量不足，无法可靠完成自动扫描；请稍后重试或使用自有 iperf3 服务器"
+    die "所有公共 iperf3 对端均不可用、过慢、路径不干净或测量不稳定；请稍后重试或使用自有 iperf3 服务器"
     return 1
 }
 
 auto_verify_with_peer_failover() {
-    local iface="$1" duration="$2" expected_rate="$3" min_efficiency="$4" baseline_loss="$5"
+    local iface="$1" duration="$2" expected_rate="$3" min_efficiency="$4" clean_reference_loss="$5"
     local sweep_peer="${WIZARD_SWEEP_PEER:-$WIZARD_PEER}" sweep_address="${WIZARD_SWEEP_ADDRESS:-${WIZARD_PEER_ADDRESS:-}}"
     local sweep_source="${WIZARD_SWEEP_SOURCE:-${WIZARD_PEER_SOURCE:-}}" sweep_iface="${WIZARD_SWEEP_IFACE:-${WIZARD_PEER_IFACE:-$iface}}"
     local current_index="${WIZARD_PUBLIC_INDEX:-0}" candidate host address family source candidate_iface port rtt region provider index rc
-    if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1 \
+    if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$clean_reference_loss" 0.1 \
             "${WIZARD_PEER_ADDRESS:-}" "${WIZARD_PEER_SOURCE:-}"; then
         return 0
     else
@@ -504,7 +492,7 @@ auto_verify_with_peer_failover() {
         activate_public_peer_candidate "$index" || return 1
         ((WIZARD_FAILOVERS+=1))
         log WARN "最终复验切换到同主机备用端口: $WIZARD_PEER:$WIZARD_PORT"
-        if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$baseline_loss" 0.1 \
+        if measure_verify "$WIZARD_PEER" "$WIZARD_PORT" "$iface" "$duration" "$expected_rate" "$min_efficiency" "$clean_reference_loss" 0.1 \
                 "${WIZARD_PEER_ADDRESS:-}" "${WIZARD_PEER_SOURCE:-}"; then
             return 0
         else
@@ -557,8 +545,8 @@ auto_verify_local_fq_fallback() {
 
 auto_tune_execute() {
     local iface="$1" profile="$2" role="$3" nominal="$4" tuning_rtt="$5" peer_rtt="${6:-0}"
-    local summary recommend knee measured no_knee confirmed reject_reason min_efficiency baseline_loss expected_rate=0
-    local baseline_quality scan_decision verify_rc local_verify_state final_verify_mode=iperf final_verify_degraded=0 final_verify_reason=none
+    local summary recommend knee measured no_knee confirmed reject_reason min_efficiency clean_reference_loss expected_rate=0
+    local path_control_quality measurement_state scan_decision verify_rc local_verify_state final_verify_mode=iperf final_verify_degraded=0 final_verify_reason=none
     local role_floor rtt_source verify_summary verify_confidence_score verify_confidence_grade verify_confidence_reasons
     local sweep_path_fingerprint verify_path_fingerprint sweep_endpoint_fingerprint verify_endpoint_fingerprint path_rtt
     prepare_auto_tuning_runtime "$iface" "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" || return 1
@@ -590,15 +578,16 @@ auto_tune_execute() {
     fi
     tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
     recommend=$(summary_value "$summary" RECOMMEND)
-    knee=$(summary_value "$summary" BROKE_AT); knee="${knee:-0}"
-    measured=$(summary_value "$summary" UNSHAPED_MBIT)
+    knee=$(summary_value "$summary" KNEE_MBIT); [[ -n "$knee" ]] || knee=$(summary_value "$summary" BROKE_AT); knee="${knee:-0}"
+    measured=$(summary_value "$summary" SATURATION_RECEIVER_MBIT); [[ -n "$measured" ]] || measured=$(summary_value "$summary" UNSHAPED_MBIT)
     no_knee=$(summary_value "$summary" NO_KNEE)
-    baseline_quality=$(summary_value "$summary" BASELINE_QUALITY)
+    path_control_quality=$(summary_value "$summary" PATH_CONTROL_QUALITY); [[ -n "$path_control_quality" ]] || path_control_quality=$(summary_value "$summary" BASELINE_QUALITY)
+    measurement_state=$(summary_value "$summary" MEASUREMENT_STATE)
     scan_decision=$(summary_value "$summary" SCAN_DECISION)
     confirmed=$(summary_value "$summary" CONFIRMED)
     reject_reason=$(summary_value "$summary" REJECT_REASON)
     min_efficiency=$(summary_value "$summary" MIN_EFFICIENCY_RATIO); min_efficiency="${min_efficiency:-0.90}"
-    baseline_loss=$(summary_value "$summary" CLEAN_BASE_RETRANS_RATIO_EST_PERCENT); baseline_loss="${baseline_loss:-0}"
+    clean_reference_loss=$(summary_value "$summary" CLEAN_REFERENCE_RETRANS_EST_PERCENT); [[ -n "$clean_reference_loss" ]] || clean_reference_loss=$(summary_value "$summary" CLEAN_BASE_RETRANS_RATIO_EST_PERCENT); clean_reference_loss="${clean_reference_loss:-0}"
     role_floor=$(role_tuning_rtt_floor "$role") || return 1
     if (( peer_rtt > role_floor )); then rtt_source="path-p95"; else rtt_source="role-floor"; fi
     printf 'SWEEP_PEER\t%s\nSWEEP_PORT\t%s\nPEER_RTT_MS\t%s\nTUNING_RTT_MS\t%s\nTUNING_RTT_SOURCE\t%s\nROLE\t%s\nPUBLIC_PEER_FAILOVERS\t%s\nSWEEP_PATH_FINGERPRINT\t%s\nSWEEP_ENDPOINT_FINGERPRINT\t%s\n' \
@@ -608,17 +597,17 @@ auto_tune_execute() {
         die "扫描候选值未通过确认测试（${reject_reason:-unconfirmed}），不会应用或持久化"
         return 2
     fi
-    [[ "$baseline_quality" == good ]] || {
-        die "扫描 baseline 质量不是 good（${baseline_quality:-missing}）；不会应用或持久化 measurement-derived 参数"
-        return "$MEASURE_BASELINE_QUALITY_RC"
+    [[ "$path_control_quality" == clean || "$path_control_quality" == good ]] || {
+        die "低速 path control 不是 clean（${path_control_quality:-missing}）；不会应用或持久化 measurement-derived 参数"
+        return "$MEASURE_PATH_QUALITY_RC"
     }
     if [[ -n "$recommend" ]]; then
-        [[ "$scan_decision" == recommend && "$confirmed" == 1 ]] || {
+        [[ "$scan_decision" == recommend && "$confirmed" == 1 && ( -z "$measurement_state" || "$measurement_state" == CLEAN_POLICER_FOUND ) ]] || {
             die "扫描推荐值缺少一致的决策状态；不会应用或持久化"
             return 2
         }
     else
-        [[ "$scan_decision" == no-knee-clean && "$no_knee" == 1 ]] || {
+        [[ "$scan_decision" == no-knee-clean && "$no_knee" == 1 && ( -z "$measurement_state" || "$measurement_state" == CLEAN_NO_POLICER ) ]] || {
             die "无整形推荐的扫描结果不是可信 NO_KNEE；不会应用或持久化"
             return 2
         }
@@ -637,7 +626,7 @@ auto_tune_execute() {
         log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
     fi
     verify_runtime_tuning "$iface" || return 1
-    if auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss"; then
+    if auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$clean_reference_loss"; then
         verify_summary="$MEASURE_RUN_DIR/summary.tsv"
         verify_path_fingerprint=$(summary_value "$verify_summary" PATH_ROUTE_FINGERPRINT)
         [[ "$verify_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
@@ -673,7 +662,7 @@ auto_tune_execute() {
     else
         verify_rc=$?
         if (( verify_rc == IPERF_UNAVAILABLE_RC && expected_rate == 0 && TC_ENABLED == 0 && TC_RATE_MBIT == 0 )) &&
-           [[ -z "$recommend" && "$baseline_quality" == good && "$scan_decision" == no-knee-clean && "$no_knee" == 1 ]]; then
+           [[ -z "$recommend" && ( "$path_control_quality" == clean || "$path_control_quality" == good ) && "$scan_decision" == no-knee-clean && "$no_knee" == 1 ]]; then
             log WARN "原测速端点在最终复验阶段不可用"
             log WARN "本轮未启用 HTB，不存在需要跨测速端点验证的整形速率"
             log INFO "改用本地运行时、冻结路径指纹与网络连通性最终验证"

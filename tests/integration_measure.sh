@@ -36,18 +36,23 @@ peer_port_open 127.0.0.1 5209 || { echo "FAIL: local iperf3 server did not start
 MEASURE_IFACE=lo
 measure_set_latency_baseline 127.0.0.1
 row=$(iperf_sample 127.0.0.1 5209 3 1)
-[[ "$(awk -F'\t' '{print NF}' <<< "$row")" == 11 ]] || { echo "FAIL: unexpected raw metric field count" >&2; exit 1; }
-is_decimal "$(cut -f1 <<< "$row")" || { echo "FAIL: goodput missing" >&2; exit 1; }
+[[ "$(awk -F'\t' '{print NF}' <<< "$row")" == 16 ]] || { echo "FAIL: unexpected raw metric field count" >&2; exit 1; }
+is_decimal "$(cut -f1 <<< "$row")" || { echo "FAIL: receiver-delivered compatibility field missing" >&2; exit 1; }
 is_decimal "$(cut -f5 <<< "$row")" || { echo "FAIL: retrans/GiB missing" >&2; exit 1; }
 is_decimal "$(cut -f7 <<< "$row")" || { echo "FAIL: loaded RTT p95 missing" >&2; exit 1; }
 is_decimal "$(cut -f9 <<< "$row")" || { echo "FAIL: CPU busy metric missing" >&2; exit 1; }
+is_decimal "$(cut -f12 <<< "$row")" || { echo "FAIL: sender throughput missing" >&2; exit 1; }
+is_decimal "$(cut -f13 <<< "$row")" || { echo "FAIL: receiver throughput missing" >&2; exit 1; }
+is_uint "$(cut -f14 <<< "$row")" || { echo "FAIL: sender bytes missing" >&2; exit 1; }
+is_uint "$(cut -f15 <<< "$row")" || { echo "FAIL: receiver bytes missing" >&2; exit 1; }
+[[ "$(cut -f16 <<< "$row")" == 0 || "$(cut -f16 <<< "$row")" == 1 ]] || { echo "FAIL: receiver fallback marker missing" >&2; exit 1; }
 
 new_measure_run integration
 aggregate=$(sample_repeated 127.0.0.1 5209 3 1 2 integration)
 [[ "$(cut -f13 <<< "$aggregate")" == 2 ]] || { echo "FAIL: repeated sample count mismatch" >&2; exit 1; }
 [[ "$(wc -l < "$MEASURE_RESULT_FILE")" == 3 ]] || { echo "FAIL: measurement history row count mismatch" >&2; exit 1; }
-grep -Fq $'RETRANS_PER_GIB\tIDLE_RTT_MS\tLOADED_RTT_MEDIAN_MS' "$MEASURE_RESULT_FILE" || {
-    echo "FAIL: v7.1 measurement history columns missing" >&2
+grep -Fq $'SENDER_MBIT\tRECEIVER_MBIT\tRETRANSMITS\tSENDER_BYTES\tRECEIVER_BYTES\tRETRANS_RATIO_EST_PERCENT\tRETRANS_PER_GIB\tRECEIVER_FALLBACK' "$MEASURE_RESULT_FILE" || {
+    echo "FAIL: v8.0.5 sender/receiver measurement history columns missing" >&2
     exit 1
 }
 

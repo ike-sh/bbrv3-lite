@@ -19,6 +19,7 @@ export BBRV3_LOCK_FILE="$TEST_ROOT/bbrv3-lite.lock"
 export BBRV3_MAX_BACKGROUND_TX_PERCENT=100
 export BBRV3_MAX_CPU_STEAL_PERCENT=100
 export BBRV3_MAX_CPU_BUSY_PERCENT=100
+export BBRV3_MEASUREMENT_COOLDOWN=0
 
 for module in 00-header.sh core.sh config.sh platform.sh path.sh state.sh sysctl.sh tc.sh measure.sh; do
     # shellcheck source=/dev/null
@@ -171,7 +172,7 @@ test_post_sample_route_drift_fails_and_restores() {
         else
             rc=$?
         fi
-        assert_eq 1 "$rc" "route drift exit status"
+        assert_eq "$MEASURE_ROUTE_MISMATCH_RC" "$rc" "route drift exit status"
         [[ -f "$applied_file" ]] || fail "probe did not reach the temporary qdisc write"
         [[ -f "$restored_file" ]] || fail "route drift did not restore the qdisc transaction"
         assert_eq 203.0.113.10 "$(head -n1 "$port_file")" "formal port probe target"
@@ -198,7 +199,7 @@ test_pre_sample_route_drift_never_runs_iperf() {
         else
             rc=$?
         fi
-        assert_eq 1 "$rc" "pre-sample route drift exit status"
+        assert_eq "$MEASURE_ROUTE_MISMATCH_RC" "$rc" "pre-sample route drift exit status"
         [[ ! -f "$iperf_file" ]] || fail "iperf3 ran after the pre-sample route guard failed"
     )
 }

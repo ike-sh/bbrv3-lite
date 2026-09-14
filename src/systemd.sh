@@ -1536,7 +1536,7 @@ verify_persistence_artifacts() {
 show_status() {
     local iface="" cc available profile_state service_state service_active shaping=off config_state baseline_state buffer_state="unavailable" script_state
     local hardware_state="unavailable" queue_state="unavailable" backlog_state="unavailable" scaling_state="unavailable" path_state="none"
-    local nic_policy_state=single status_rc=0
+    local nic_policy_state=single status_rc=0 tuning_model
     load_config || return 1
     if (( MULTI_NIC_ENABLED == 1 )); then
         nic_policy_state=valid
@@ -1564,13 +1564,18 @@ show_status() {
     fi
     script_state=$(persistence_script_state)
     path_state=$(latest_path_brief 2>/dev/null || printf 'none\n')
+    if (( BANDWIDTH_MBIT == 0 && RTT_MS == 0 )); then
+        tuning_model="$ROLE / defaults only (no measurement-derived bandwidth or RTT)"
+    else
+        tuning_model="$ROLE / ${BANDWIDTH_MBIT} Mbit / ${RTT_MS} ms"
+    fi
     printf '%-20s %s\n' "Version" "v${SCRIPT_VERSION}"
     printf '%-20s %s\n' "Kernel" "$(uname -r)"
     printf '%-20s %s\n' "Congestion control" "$cc (available: $available)"
     printf '%-20s %s\n' "BBR generation" "$(bbr_generation_status "$cc")"
     printf '%-20s %s\n' "BBR compatibility" "$(bbr_compatibility_status "$cc" "$available")"
     printf '%-20s %s\n' "Sysctl profile" "$SYSCTL_PROFILE ($profile_state)"
-    printf '%-20s %s\n' "Tuning model" "$ROLE / ${BANDWIDTH_MBIT} Mbit / ${RTT_MS} ms"
+    printf '%-20s %s\n' "Tuning model" "$tuning_model"
     printf '%-20s %s\n' "Hardware model" "$hardware_state"
     printf '%-20s %s\n' "NIC model" "$queue_state"
     if [[ -n "$iface" ]]; then printf '%-20s %s\n' "NIC offloads" "$(detect_offload_summary "$iface")"; fi
@@ -1582,7 +1587,7 @@ show_status() {
     printf '%-20s %s\n' "Persistence script" "$script_state"
     printf '%-20s %s\n' "Config" "$config_state ($CONFIG_FILE)"
     printf '%-20s %s\n' "Baseline" "$baseline_state"
-    printf '%-20s %s\n' "Latest path" "$path_state"
+    printf '%-20s %s\n' "Path consistency" "$path_state"
     if (( MULTI_NIC_ENABLED == 1 )); then
         printf '%-20s %s\n' "NIC policy mode" "multi / $nic_policy_state / $(nic_policy_interface_list 2>/dev/null | grep -c . || true) managed"
         nic_inventory || status_rc=1

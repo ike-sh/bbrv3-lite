@@ -481,7 +481,7 @@ ipv6_validate_v2_metadata() {
 }
 
 ipv6_validate_v2_records() {
-    local directory="$1" capture="$2" record iface value extra rows=0 aggregate=0 default_seen=0 lo_seen=0
+    local directory="$1" capture="$2" record iface value extra row_count=0 aggregate=0 default_seen=0 lo_seen=0
     local -A interfaces=()
     [[ -f "$directory/sysctl.tsv" && ! -L "$directory/sysctl.tsv" ]] ||
         ipv6_snapshot_validation_fail "v2 快照缺少常规文件 sysctl.tsv" || return 1
@@ -498,7 +498,7 @@ ipv6_validate_v2_records() {
             ipv6_snapshot_validation_fail "sysctl.tsv disable flag 非法: $iface=$value"
             return 1
         }
-        rows=$((rows + 1))
+        row_count=$((row_count + 1))
         case "$record:$iface" in
             AGGREGATE:all)
                 aggregate=$((aggregate + 1))
@@ -528,7 +528,7 @@ ipv6_validate_v2_records() {
     done < "$directory/sysctl.tsv"
 
     if [[ "$capture" == boot-disabled ]]; then
-        (( rows == 0 )) || {
+        (( row_count == 0 )) || {
             ipv6_snapshot_validation_fail "boot-disabled 快照不得伪造运行时接口值"
             return 1
         }
@@ -541,7 +541,7 @@ ipv6_validate_v2_records() {
 }
 
 ipv6_validate_legacy_records() {
-    local directory="$1" key value extra iface rows=0
+    local directory="$1" key value extra iface row_count=0
     local -A seen=()
     [[ -f "$directory/sysctl.tsv" && ! -L "$directory/sysctl.tsv" ]] ||
         ipv6_snapshot_validation_fail "旧快照缺少常规文件 sysctl.tsv" || return 1
@@ -573,9 +573,9 @@ ipv6_validate_legacy_records() {
             return 1
         }
         seen["$key"]=1
-        rows=$((rows + 1))
+        row_count=$((row_count + 1))
     done < "$directory/sysctl.tsv"
-    (( rows > 0 )) || {
+    (( row_count > 0 )) || {
         ipv6_snapshot_validation_fail "旧 sysctl.tsv 为空"
         return 1
     }

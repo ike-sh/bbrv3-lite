@@ -18,9 +18,16 @@ MEASURE_PEER_PORT=""
 IPERF_DATA_RC=65
 IPERF_CONTAMINATED_RC=66
 IPERF_UNSTABLE_RC=67
-MEASURE_BASELINE_QUALITY_RC=68
+MEASURE_PATH_QUALITY_RC=68
+# Compatibility alias for callers written before the v8.0.5 experiment split.
+# shellcheck disable=SC2034 # Public compatibility alias for sourced callers.
+MEASURE_BASELINE_QUALITY_RC="$MEASURE_PATH_QUALITY_RC"
+MEASURE_ROUTE_MISMATCH_RC=69
 IPERF_UNAVAILABLE_RC=75
 PUBLIC_PEER_CANDIDATES=()
+MEASURE_LEVEL_ROW=""
+MEASURE_LEVEL_SPIKE_HITS=0
+MEASURE_LEVEL_SPIKE_CONFIRMED=0
 
 # Public endpoints are opt-in and used only by the interactive auto-tune wizard.
 # Providers and test traffic are disclosed before execution; a private iperf3 peer is preferred.
@@ -538,20 +545,20 @@ measure_peer_route_guard() {
     }
     if [[ -n "$MEASURE_IFACE" && "$MEASURE_IFACE" != "$MEASURE_PEER_IFACE" ]]; then
         die "测量网卡 $MEASURE_IFACE 与冻结出口 $MEASURE_PEER_IFACE 不一致"
-        return 1
+        return "$MEASURE_ROUTE_MISMATCH_RC"
     fi
     state=$(measure_capture_route_state "$MEASURE_PEER_FAMILY" "$MEASURE_PEER_ADDRESS" "$MEASURE_PEER_IFACE" "$MEASURE_PEER_SOURCE") || {
         die "测速路径已漂移；拒绝继续并恢复操作前 qdisc"
-        return 1
+        return "$MEASURE_ROUTE_MISMATCH_RC"
     }
     IFS=$'\t' read -r iface source <<< "$state"
     [[ "$iface" == "$MEASURE_PEER_IFACE" && "$source" == "$MEASURE_PEER_SOURCE" ]] || {
         die "测速路径已漂移；拒绝使用本次样本"
-        return 1
+        return "$MEASURE_ROUTE_MISMATCH_RC"
     }
     path_verify_route_identity || {
         die "测速路由、网关、路由表、MTU 或 FIB 指纹已经漂移"
-        return 1
+        return "$MEASURE_ROUTE_MISMATCH_RC"
     }
 }
 
@@ -575,7 +582,7 @@ measure_require_sample_lock() {
 
 measure_require_locked_port() {
     local peer="$1" port="$2"
-    measure_peer_route_guard || return 1
+    measure_peer_route_guard || return $?
     if [[ -n "$MEASURE_PEER_PORT" && "$MEASURE_PEER_PORT" != "$port" ]]; then
         die "请求端口 $port 与冻结端口 $MEASURE_PEER_PORT 不一致"
         return 1
@@ -743,7 +750,8 @@ sample_is_contaminated() {
 
 iperf_sample() {
     local peer="$1" port="$2" duration="$3" parallel="$4" json error_file latency_file latency_pid=""
-    local rc=0 reason="" bps bytes retrans goodput ratio retrans_per_gib loaded_median="na" loaded_p95="na"
+    local rc=0 reason="" sender_bps receiver_bps sender_bytes receiver_bytes retrans delivered ratio retrans_per_gib
+    local sender_mbit receiver_mbit receiver_fallback=0 loaded_median="na" loaded_p95="na"
     local tx_before=0 tx_after=0 background="na" cpu_before cpu_after cpu_busy="na" cpu_steal="na" contaminated=0
     local core_before core_after core_busy="na" core_steal="na" reason_parse_rc=0 cpu_metrics core_metrics latency_metrics
     local route_guard_rc=0
@@ -783,7 +791,7 @@ iperf_sample() {
     if (( route_guard_rc != 0 )); then
         rm -f -- "$json" "$error_file" "$latency_file"
         log ERR "iperf3 $peer:$port 完成后检测到路径漂移；本样本无效"
-        return 1
+        return "$route_guard_rc"
     fi
     rm -f -- "$error_file"
     if (( rc != 0 )); then
@@ -800,23 +808,32 @@ iperf_sample() {
         rm -f -- "$json" "$latency_file"
         return "$IPERF_DATA_RC"
     fi
-    if ! bps=$(jq -r '.end.sum_sent.bits_per_second // .end.sum.bits_per_second // 0' "$json") ||
-       ! bytes=$(jq -r '.end.sum_sent.bytes // .end.sum.bytes // 0' "$json") ||
+    if ! sender_bps=$(jq -r '.end.sum_sent.bits_per_second // .end.sum.bits_per_second // 0' "$json") ||
+       ! receiver_bps=$(jq -r '.end.sum_received.bits_per_second // 0' "$json") ||
+       ! sender_bytes=$(jq -r '.end.sum_sent.bytes // .end.sum.bytes // 0' "$json") ||
+       ! receiver_bytes=$(jq -r '.end.sum_received.bytes // 0' "$json") ||
        ! retrans=$(jq -r '.end.sum_sent.retransmits // ([.end.streams[]?.sender.retransmits // 0] | add) // 0' "$json"); then
         log WARN "iperf3 $peer:$port 返回的 JSON 无法解析"
         rm -f -- "$json" "$latency_file"
         return "$IPERF_DATA_RC"
     fi
     rm -f -- "$json"
-    if ! is_decimal "$bps" || ! is_uint "$bytes" || ! is_uint "$retrans" || (( bytes == 0 )) || ! awk -v b="$bps" 'BEGIN {exit !(b>0)}'; then
+    if ! is_decimal "$sender_bps" || ! is_uint "$sender_bytes" || ! is_uint "$retrans" || (( sender_bytes == 0 )) ||
+       ! awk -v b="$sender_bps" 'BEGIN {exit !(b>0)}'; then
         log WARN "iperf3 $peer:$port 返回的 JSON 结果不完整"
         rm -f -- "$latency_file"
         return "$IPERF_DATA_RC"
     fi
-    goodput=$(awk -v b="$bps" 'BEGIN {printf "%.2f", b/1000000}')
+    sender_mbit=$(awk -v b="$sender_bps" 'BEGIN {printf "%.2f", b/1000000}')
+    if ! is_decimal "$receiver_bps" || ! is_uint "$receiver_bytes" || (( receiver_bytes == 0 )) ||
+       ! awk -v b="$receiver_bps" 'BEGIN {exit !(b>0)}'; then
+        receiver_bps="$sender_bps"; receiver_bytes="$sender_bytes"; receiver_fallback=1
+    fi
+    receiver_mbit=$(awk -v b="$receiver_bps" 'BEGIN {printf "%.2f", b/1000000}')
+    delivered="$receiver_mbit"
     # An estimate, not packet loss: iperf retransmits / estimated MSS-sized segments.
-    ratio=$(awk -v r="$retrans" -v b="$bytes" 'BEGIN {n=b/1448; if(n<1)n=1; printf "%.5f", r*100/n}')
-    retrans_per_gib=$(awk -v r="$retrans" -v b="$bytes" 'BEGIN {printf "%.3f", r*1073741824/b}')
+    ratio=$(awk -v r="$retrans" -v b="$sender_bytes" 'BEGIN {n=b/1448; if(n<1)n=1; printf "%.5f", r*100/n}')
+    retrans_per_gib=$(awk -v r="$retrans" -v b="$sender_bytes" 'BEGIN {printf "%.3f", r*1073741824/b}')
     latency_metrics=$(latency_stats_from_file "$latency_file"); rm -f -- "$latency_file"
     IFS=$'\t' read -r loaded_median loaded_p95 <<< "$latency_metrics"
     cpu_metrics=$(cpu_delta_metrics "$cpu_before" "$cpu_after")
@@ -829,11 +846,14 @@ iperf_sample() {
     if is_decimal "$core_steal"; then
         if is_decimal "$cpu_steal"; then cpu_steal=$(printf '%s\n%s\n' "$cpu_steal" "$core_steal" | max_numbers); else cpu_steal="$core_steal"; fi
     fi
-    if [[ -n "$MEASURE_IFACE" ]]; then background=$(background_tx_percent "$tx_before" "$tx_after" "$bytes"); fi
+    if [[ -n "$MEASURE_IFACE" ]]; then background=$(background_tx_percent "$tx_before" "$tx_after" "$sender_bytes"); fi
     sample_is_contaminated "$background" "$cpu_steal" "$cpu_busy" && contaminated=1
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$goodput" "$retrans" "$bytes" "$ratio" "$retrans_per_gib" "$loaded_median" "$loaded_p95" \
-        "$background" "$cpu_busy" "$cpu_steal" "$contaminated"
+    # Column 1 keeps its compatibility position but now means receiver-delivered
+    # throughput. Explicit endpoint fields are appended for auditability.
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$delivered" "$retrans" "$sender_bytes" "$ratio" "$retrans_per_gib" "$loaded_median" "$loaded_p95" \
+        "$background" "$cpu_busy" "$cpu_steal" "$contaminated" "$sender_mbit" "$receiver_mbit" \
+        "$sender_bytes" "$receiver_bytes" "$receiver_fallback"
 }
 
 median_numbers() { sort -n | awk '{a[NR]=$1} END {if(NR) {if(NR%2) print a[(NR+1)/2]; else printf "%.5f\n", (a[NR/2]+a[NR/2+1])/2}}'; }
@@ -860,6 +880,7 @@ bufferbloat_delta_ms() {
 
 measurement_confidence() {
     local sample_count="$1" spread="$2" loaded_p95="$3" contaminated="$4" failovers="${5:-0}" path_score="${6:-na}"
+    local receiver_fallback="${7:-0}"
     local score=100 grade reason path_penalty=0
     local -a reasons=()
     is_uint "$sample_count" || sample_count=0
@@ -878,6 +899,7 @@ measurement_confidence() {
     if ! is_decimal "$loaded_p95"; then score=$((score - 15)); reasons+=(loaded-rtt-unavailable); fi
     if (( contaminated )); then score=$((score - 50)); reasons+=(contaminated); fi
     if (( failovers > 0 )); then score=$((score - 10)); reasons+=(peer-failover); fi
+    if [[ "$receiver_fallback" == 1 ]]; then score=$((score - 20)); reasons+=(receiver-fallback); fi
     if is_uint "$path_score" && (( path_score <= 100 )); then
         if (( path_score < 40 )); then path_penalty=35; reasons+=(path-unsafe)
         elif (( path_score < 65 )); then path_penalty=20; reasons+=(path-low-confidence)
@@ -916,11 +938,12 @@ compare_verdict() {
 sample_repeated() {
     local peer="$1" port="$2" duration="$3" parallel="$4" count="$5" label="$6"
     local max_count="${7:-$count}" stability_threshold="${8:-0}"
-    local -a goodputs=() retrans=() bytes=() ratios=() retrans_gib=() loaded_medians=() loaded_p95s=()
-    local -a backgrounds=() cpu_busies=() cpu_steals=() contaminations=()
+    local -a delivered_rates=() rows=() backgrounds=() cpu_busies=() cpu_steals=() contaminations=()
     local row i attempt sample_rc=0 attempts="${BBRV3_IPERF_ATTEMPTS:-3}" target_count="$count" contamination_retry
     local contamination_retries="${BBRV3_CONTAMINATION_RETRIES:-1}"
-    local g r b l rpg loaded_med loaded_tail background cpu_busy cpu_steal contaminated spread="0.00" bloat
+    local g r b l rpg loaded_med loaded_tail background cpu_busy cpu_steal contaminated
+    local sender_mbit receiver_mbit sender_bytes receiver_bytes receiver_fallback spread="0.00" bloat
+    local median_rate selected_row selected_distance distance index
     is_uint "$attempts" && (( attempts >= 1 && attempts <= 5 )) || attempts=3
     is_uint "$contamination_retries" && (( contamination_retries <= 3 )) || contamination_retries=1
     is_uint "$max_count" && (( max_count >= count && max_count <= 5 )) || max_count="$count"
@@ -951,14 +974,21 @@ sample_repeated() {
                 die "当前 iperf3 对端连续 ${attempts} 次不可用"
                 return "$sample_rc"
             }
-            IFS=$'\t' read -r g r b l rpg loaded_med loaded_tail background cpu_busy cpu_steal contaminated <<< "$row"
+            IFS=$'\t' read -r g r b l rpg loaded_med loaded_tail background cpu_busy cpu_steal contaminated \
+                sender_mbit receiver_mbit sender_bytes receiver_bytes receiver_fallback <<< "$row"
             rpg="${rpg:-$(awk -v rv="$r" -v bv="$b" 'BEGIN {if(bv>0) printf "%.3f", rv*1073741824/bv; else print "0.000"}')}"
             loaded_med="${loaded_med:-na}"; loaded_tail="${loaded_tail:-na}"; background="${background:-na}"
             cpu_busy="${cpu_busy:-na}"; cpu_steal="${cpu_steal:-na}"; contaminated="${contaminated:-0}"
+            sender_mbit="${sender_mbit:-$g}"; receiver_mbit="${receiver_mbit:-$g}"
+            sender_bytes="${sender_bytes:-$b}"; receiver_bytes="${receiver_bytes:-$b}"; receiver_fallback="${receiver_fallback:-1}"
+            row=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+                "$g" "$r" "$b" "$l" "$rpg" "$loaded_med" "$loaded_tail" "$background" "$cpu_busy" "$cpu_steal" \
+                "$contaminated" "$sender_mbit" "$receiver_mbit" "$sender_bytes" "$receiver_bytes" "$receiver_fallback")
             bloat=$(bufferbloat_delta_ms "$MEASURE_IDLE_RTT_MS" "$loaded_tail")
-            [[ -n "$MEASURE_RESULT_FILE" ]] && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "$(utc_now)" "$label" "$g" "$r" "$b" "$l" "$rpg" "$MEASURE_IDLE_RTT_MS" "$loaded_med" "$loaded_tail" \
-                "$bloat" "$background" "$cpu_busy" "$cpu_steal" "$contaminated" >> "$MEASURE_RESULT_FILE"
+            [[ -n "$MEASURE_RESULT_FILE" ]] && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(utc_now)" "$label" "$sender_mbit" "$receiver_mbit" "$r" "$sender_bytes" "$receiver_bytes" "$l" "$rpg" \
+                "$receiver_fallback" "$MEASURE_IDLE_RTT_MS" "$loaded_med" "$loaded_tail" "$bloat" "$background" "$cpu_busy" "$cpu_steal" \
+                "$contaminated" "$duration" "$parallel" >> "$MEASURE_RESULT_FILE"
             if [[ "$contaminated" == 1 && "$contamination_retry" -lt "$contamination_retries" ]]; then
                 ((contamination_retry+=1))
                 log WARN "样本受到后台流量、CPU 饱和或 steal 污染，2 秒后重采（${contamination_retry}/${contamination_retries}）"
@@ -971,14 +1001,12 @@ sample_repeated() {
             die "连续样本受到后台流量、CPU 饱和或 steal 污染；停止测量以避免误判拐点"
             return "$IPERF_CONTAMINATED_RC"
         fi
-        goodputs+=("$g"); retrans+=("$r"); bytes+=("$b"); ratios+=("$l"); retrans_gib+=("$rpg")
-        is_decimal "$loaded_med" && loaded_medians+=("$loaded_med")
-        is_decimal "$loaded_tail" && loaded_p95s+=("$loaded_tail")
+        delivered_rates+=("$g"); rows+=("$row")
         is_decimal "$background" && backgrounds+=("$background")
         is_decimal "$cpu_busy" && cpu_busies+=("$cpu_busy")
         is_decimal "$cpu_steal" && cpu_steals+=("$cpu_steal")
         contaminations+=("$contaminated")
-        spread=$(relative_spread_percent "${goodputs[@]}")
+        spread=$(relative_spread_percent "${delivered_rates[@]}")
         if (( i >= count && i < max_count )) && awk -v s="$spread" -v t="$stability_threshold" 'BEGIN {exit !(t>0 && s>t)}'; then
             target_count=$((i + 1))
             log WARN "吞吐离散度 ${spread}% 超过 ${stability_threshold}%，追加第 ${target_count} 个样本"
@@ -989,31 +1017,98 @@ sample_repeated() {
         die "${target_count} 个样本后吞吐离散度仍为 ${spread}%（上限 ${stability_threshold}%）；停止测量以避免使用不稳定结果"
         return "$IPERF_UNSTABLE_RC"
     fi
-    bloat=$(bufferbloat_delta_ms "$MEASURE_IDLE_RTT_MS" "$(median_or_na "${loaded_p95s[@]}")")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$(printf '%s\n' "${goodputs[@]}" | median_numbers)" \
-        "$(printf '%s\n' "${retrans[@]}" | median_numbers)" \
-        "$(printf '%s\n' "${bytes[@]}" | median_numbers)" \
-        "$(printf '%s\n' "${ratios[@]}" | median_numbers)" \
-        "$(printf '%s\n' "${retrans_gib[@]}" | median_numbers)" \
-        "$(median_or_na "${loaded_medians[@]}")" "$(median_or_na "${loaded_p95s[@]}")" \
+    # Pick a real sample nearest the receiver median. The decision tuple is
+    # never assembled from unrelated runs.
+    median_rate=$(printf '%s\n' "${delivered_rates[@]}" | median_numbers)
+    selected_distance=""; selected_row=""
+    for ((index=0; index<${#rows[@]}; index++)); do
+        distance=$(awk -v a="${delivered_rates[$index]}" -v b="$median_rate" 'BEGIN {d=a-b; if(d<0)d=-d; printf "%.8f",d}')
+        if [[ -z "$selected_distance" ]] || awk -v a="$distance" -v b="$selected_distance" 'BEGIN {exit !(a<b)}'; then
+            selected_distance="$distance"; selected_row="${rows[$index]}"
+        fi
+    done
+    IFS=$'\t' read -r g r b l rpg loaded_med loaded_tail background cpu_busy cpu_steal contaminated \
+        sender_mbit receiver_mbit sender_bytes receiver_bytes receiver_fallback <<< "$selected_row"
+    bloat=$(bufferbloat_delta_ms "$MEASURE_IDLE_RTT_MS" "$loaded_tail")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$g" "$r" "$b" "$l" "$rpg" "$loaded_med" "$loaded_tail" \
         "$(max_or_na "${backgrounds[@]}")" "$(max_or_na "${cpu_busies[@]}")" "$(max_or_na "${cpu_steals[@]}")" \
-        "$(printf '%s\n' "${contaminations[@]}" | max_numbers)" "$spread" "$target_count" "$bloat"
+        "$(printf '%s\n' "${contaminations[@]}" | max_numbers)" "$spread" "$target_count" "$bloat" \
+        "$sender_mbit" "$receiver_mbit" "$sender_bytes" "$receiver_bytes" "$receiver_fallback"
 }
 
 loss_spike() {
     local value="$1" threshold="$2" base="$3"
     awk -v v="$value" -v t="$threshold" -v b="$base" 'BEGIN {
-        if (v <= t) exit 1;
-        if (b > 0 && v < b*5) exit 1;
+        need=t;
+        if (b > 0 && b*5 > need) need=b*5;
+        if (need > 1) need=1;
+        if (v <= need) exit 1;
         exit 0
     }'
 }
 
-baseline_retrans_too_high() {
-    local value="$1" threshold="$2"
-    is_decimal "$value" && is_decimal "$threshold" || return 0
-    awk -v v="$value" -v t="$threshold" 'BEGIN {limit=t*10; if(limit<1)limit=1; exit !(v>limit)}'
+measurement_cooldown() {
+    local stage="$1" rate="${2:-0}" duration="${3:-3}" seconds
+    if [[ "${BBRV3_MEASUREMENT_COOLDOWN:-1}" == 0 ]]; then return 0; fi
+    is_decimal "$rate" || rate=0; is_uint "$duration" || duration=3
+    case "$stage" in
+        PRE_SCAN) seconds=$(awk -v r="$rate" -v d="$duration" 'BEGIN {v=int(d*0.8+r/1000+0.99); if(v<3)v=3; if(v>10)v=10; print v}') ;;
+        SPIKE_RECHECK) seconds=$(awk -v r="$rate" -v d="$duration" 'BEGIN {v=int(d*0.4+r/2000+0.99); if(v<2)v=2; if(v>6)v=6; print v}') ;;
+        BETWEEN_LEVEL) seconds=$(awk -v r="$rate" -v d="$duration" 'BEGIN {v=int(d*0.25+r/4000+0.99); if(v<1)v=1; if(v>4)v=4; print v}') ;;
+        PRE_VERIFY) seconds=$(awk -v r="$rate" -v d="$duration" 'BEGIN {v=int(d*0.8+r/1000+0.99); if(v<3)v=3; if(v>10)v=10; print v}') ;;
+        *) die "未知测量冷却阶段: $stage"; return 1 ;;
+    esac
+    log INFO "$stage 冷却 ${seconds}s（rate=${rate} Mbit/s, sample=${duration}s）"
+    sleep "$seconds"
+}
+
+measure_level_with_confirmation() {
+    local peer="$1" port="$2" duration="$3" confirm_duration="$4" parallel="$5" label="$6"
+    local threshold="$7" base_loss="$8" row loss rc=0 index hits=0 selected="" selected_loss="" gp
+    local -a rows=() spike_rows=() clean_rows=()
+    MEASURE_LEVEL_ROW=""; MEASURE_LEVEL_SPIKE_HITS=0; MEASURE_LEVEL_SPIKE_CONFIRMED=0
+    row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "$label") || return $?
+    rows+=("$row")
+    loss=$(cut -f4 <<< "$row")
+    if loss_spike "$loss" "$threshold" "$base_loss"; then
+        hits=1; spike_rows+=("$row")
+        for index in 2 3; do
+            measurement_cooldown SPIKE_RECHECK "$(cut -f1 <<< "$row")" "$confirm_duration" || return 1
+            row=$(sample_repeated "$peer" "$port" "$confirm_duration" "$parallel" 1 "${label}-recheck-${index}") || return $?
+            rows+=("$row"); loss=$(cut -f4 <<< "$row")
+            if loss_spike "$loss" "$threshold" "$base_loss"; then
+                ((hits+=1)); spike_rows+=("$row")
+            else
+                clean_rows+=("$row")
+            fi
+        done
+        if (( hits >= 2 )); then
+            MEASURE_LEVEL_SPIKE_CONFIRMED=1
+            for row in "${spike_rows[@]}"; do
+                loss=$(cut -f4 <<< "$row")
+                if [[ -z "$selected" ]] || awk -v a="$loss" -v b="$selected_loss" 'BEGIN {exit !(a<b)}'; then
+                    selected="$row"; selected_loss="$loss"
+                fi
+            done
+        else
+            for row in "${clean_rows[@]}"; do
+                gp=$(cut -f1 <<< "$row")
+                if [[ -z "$selected" ]] || awk -v a="$gp" -v b="$(cut -f1 <<< "$selected")" 'BEGIN {exit !(a>b)}'; then selected="$row"; fi
+            done
+            [[ -n "$selected" ]] || selected="${rows[0]}"
+        fi
+    else
+        clean_rows+=("$row"); selected="$row"
+    fi
+    MEASURE_LEVEL_ROW="$selected"
+    # shellcheck disable=SC2034 # Exposed to diagnostics and regression tests.
+    MEASURE_LEVEL_SPIKE_HITS="$hits"
+    if (( MEASURE_LEVEL_SPIKE_CONFIRMED )); then
+        log WARN "$label: 重传跳变经 3 次实验确认（${hits}/3）"
+    elif (( hits > 0 )); then
+        log INFO "$label: 单次重传尖峰未复现（${hits}/3），按瞬时公共对端竞争处理"
+    fi
 }
 
 minimum_efficiency_ratio() {
@@ -1036,14 +1131,37 @@ throughput_stalled() {
 }
 
 measurement_sample_acceptable() {
-    local goodput="$1" loss="$2" rate="$3" min_efficiency="$4" threshold="$5" baseline_loss="$6"
-    loss_spike "$loss" "$threshold" "$baseline_loss" && return 1
+    local goodput="$1" loss="$2" rate="$3" min_efficiency="$4" threshold="$5" clean_reference_loss="$6"
+    loss_spike "$loss" "$threshold" "$clean_reference_loss" && return 1
     awk -v g="$goodput" -v r="$rate" -v e="$min_efficiency" 'BEGIN {exit !(r<=0 || g>=r*e)}'
 }
 
 estimate_sweep_bytes() {
     local high="$1" duration="$2" tests="$3"
     awk -v r="$high" -v d="$duration" -v n="$tests" 'BEGIN {printf "%.0f", r*1000000/8*d*n*1.08}'
+}
+
+estimate_measurement_plan_bytes() {
+    local control_rate="$1" control_duration="$2" capacity_rate="$3" saturation_duration="$4"
+    local high="$5" coarse_duration="$6" confirm_duration="$7" aggregate="${8:-0}"
+    awk -v cr="$control_rate" -v cd="$control_duration" -v cap="$capacity_rate" -v sd="$saturation_duration" \
+        -v hi="$high" -v coarse="$coarse_duration" -v confirm="$confirm_duration" -v aggregate="$aggregate" 'BEGIN {
+        # Three control/saturation samples; at most eight coarse and eight fine
+        # levels, with two longer rechecks at the first spike in each pass;
+        # finally three candidate confirmations. Aggregate capacity discovery
+        # adds at most three saturation-duration samples.
+        mbit_seconds=cr*cd*3 + cap*sd*3 + hi*((8*coarse+2*confirm)*2 + 3*confirm)
+        if(aggregate) mbit_seconds+=cap*sd*3
+        printf "%.0f", mbit_seconds*1000000/8*1.08
+    }'
+}
+
+estimate_control_saturation_bytes() {
+    local control_rate="$1" control_duration="$2" capacity_rate="$3" saturation_duration="$4" aggregate="${5:-0}"
+    awk -v cr="$control_rate" -v cd="$control_duration" -v cap="$capacity_rate" -v sd="$saturation_duration" -v aggregate="$aggregate" 'BEGIN {
+        mbit_seconds=cr*cd*3 + cap*sd*3; if(aggregate) mbit_seconds+=cap*sd*3
+        printf "%.0f", mbit_seconds*1000000/8*1.08
+    }'
 }
 
 new_measure_run() {
@@ -1059,7 +1177,7 @@ new_measure_run() {
     chmod 0700 "$dir"
     MEASURE_RESULT_FILE="$dir/samples.tsv"
     MEASURE_RUN_DIR="$dir"
-    printf 'TIME\tLABEL\tGOODPUT_MBIT\tRETRANSMITS\tBYTES\tRETRANS_RATIO_EST_PERCENT\tRETRANS_PER_GIB\tIDLE_RTT_MS\tLOADED_RTT_MEDIAN_MS\tLOADED_RTT_P95_MS\tBUFFERBLOAT_P95_MS\tBACKGROUND_TX_PERCENT\tCPU_BUSY_PERCENT\tCPU_STEAL_PERCENT\tCONTAMINATED\n' > "$MEASURE_RESULT_FILE"
+    printf 'TIME\tLABEL\tSENDER_MBIT\tRECEIVER_MBIT\tRETRANSMITS\tSENDER_BYTES\tRECEIVER_BYTES\tRETRANS_RATIO_EST_PERCENT\tRETRANS_PER_GIB\tRECEIVER_FALLBACK\tIDLE_RTT_MS\tLOADED_RTT_MEDIAN_MS\tLOADED_RTT_P95_MS\tBUFFERBLOAT_P95_MS\tBACKGROUND_TX_PERCENT\tCPU_BUSY_PERCENT\tCPU_STEAL_PERCENT\tCONTAMINATED\tDURATION_SECONDS\tFLOWS\n' > "$MEASURE_RESULT_FILE"
 }
 
 measure_path_profile() {
@@ -1093,7 +1211,7 @@ measure_probe() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" duration="$4" parallel="$5" preferred_address="${6:-}" preferred_source="${7:-}"
-    local iface dir row rc=0 speed estimate
+    local iface dir row rc=0 speed estimate sender receiver receiver_fallback
     local confidence confidence_score confidence_grade confidence_reasons
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && is_uint "$parallel" && ((duration>=3 && duration<=120 && parallel>=1 && parallel<=32)) || { die "duration/parallel 超出安全范围"; return 1; }
@@ -1111,15 +1229,19 @@ measure_probe() {
     measure_set_latency_baseline "$peer" || return 1
     measure_begin "$iface" || return 1
     if apply_fq "$iface" && row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 unshaped 3 6); then
-        confidence=$(measurement_confidence "$(cut -f13 <<< "$row")" "$(cut -f12 <<< "$row")" "$(cut -f7 <<< "$row")" "$(cut -f11 <<< "$row")" 0 "$PATH_PROFILE_SCORE")
+        receiver=$(cut -f16 <<< "$row"); receiver="${receiver:-$(cut -f1 <<< "$row")}"; sender=$(cut -f15 <<< "$row"); sender="${sender:-$receiver}"
+        receiver_fallback=$(cut -f19 <<< "$row"); receiver_fallback="${receiver_fallback:-1}"
+        confidence=$(measurement_confidence "$(cut -f13 <<< "$row")" "$(cut -f12 <<< "$row")" "$(cut -f7 <<< "$row")" "$(cut -f11 <<< "$row")" 0 "$PATH_PROFILE_SCORE" "$receiver_fallback")
         IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
-        printf 'TYPE\tprobe\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nGOODPUT_MBIT\t%s\nRETRANS_RATIO_EST_PERCENT\t%s\nRETRANS_PER_GIB\t%s\nIDLE_RTT_MS\t%s\nLOADED_RTT_P95_MS\t%s\nBUFFERBLOAT_P95_MS\t%s\nGOODPUT_SPREAD_PERCENT\t%s\nSAMPLE_COUNT\t%s\nBACKGROUND_TX_PERCENT_MAX\t%s\nCPU_BUSY_PERCENT_MAX\t%s\nCPU_STEAL_PERCENT_MAX\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
-            "$peer" "$port" "$iface" "$(cut -f1 <<< "$row")" "$(cut -f4 <<< "$row")" "$(cut -f5 <<< "$row")" \
-            "$MEASURE_IDLE_RTT_MS" "$(cut -f7 <<< "$row")" "$(cut -f14 <<< "$row")" "$(cut -f12 <<< "$row")" "$(cut -f13 <<< "$row")" \
+        printf 'TYPE\tprobe\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nSENDER_MBIT\t%s\nRECEIVER_MBIT\t%s\nRECEIVER_FALLBACK\t%s\nGOODPUT_MBIT\t%s\nRETRANS_RATIO_EST_PERCENT\t%s\nRETRANS_PER_GIB\t%s\nIDLE_RTT_MS\t%s\nLOADED_RTT_P95_MS\t%s\nBUFFERBLOAT_P95_MS\t%s\nRECEIVER_SPREAD_PERCENT\t%s\nGOODPUT_SPREAD_PERCENT\t%s\nSAMPLE_COUNT\t%s\nBACKGROUND_TX_PERCENT_MAX\t%s\nCPU_BUSY_PERCENT_MAX\t%s\nCPU_STEAL_PERCENT_MAX\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
+            "$peer" "$port" "$iface" "$sender" "$receiver" "$receiver_fallback" \
+            "$(cut -f1 <<< "$row")" "$(cut -f4 <<< "$row")" "$(cut -f5 <<< "$row")" \
+            "$MEASURE_IDLE_RTT_MS" "$(cut -f7 <<< "$row")" "$(cut -f14 <<< "$row")" "$(cut -f12 <<< "$row")" "$(cut -f12 <<< "$row")" \
+            "$(cut -f13 <<< "$row")" \
             "$(cut -f8 <<< "$row")" "$(cut -f9 <<< "$row")" "$(cut -f10 <<< "$row")" \
             "$confidence_score" "$confidence_grade" "$confidence_reasons" > "$dir/summary.tsv"
         measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
-        log OK "可用带宽中位数: $(cut -f1 <<< "$row") Mbit/s，重传 $(cut -f5 <<< "$row") 次/GiB，负载 RTT p95 $(cut -f7 <<< "$row") ms"
+        log OK "receiver 可用带宽代表样本: ${receiver} Mbit/s（sender ${sender}），重传 $(cut -f5 <<< "$row") 次/GiB"
         log INFO "测量置信度: ${confidence_grade} (${confidence_score}/100, ${confidence_reasons})"
         log INFO "结果: $dir"
     else rc=$?; fi
@@ -1135,11 +1257,16 @@ measure_sweep() {
     local duration="$8" parallel="$9" margin="${10}" threshold="${11}" force_scan="${12}" cap="${13}"
     local result_mode="${14:-manual}"
     local preferred_address="${15:-}" preferred_source="${16:-}"
-    local iface dir baseline_row baseline_gp baseline_loss base_row base_gp base_loss rate row gp loss
+    local iface dir saturation_row saturation_loss base_row base_gp base_loss rate row gp loss
+    local path_control_row="" path_control_rate=0 path_control_sender="" path_control_receiver="" path_control_loss=""
+    local path_control_quality=unknown saturation_sender="" saturation_receiver="" saturation_state=unstable
+    local saturation_fallback=0 capacity_mode=single capacity_receiver="" policer_suspected=0 measurement_state=MEASUREMENT_UNSTABLE
+    local clean_reference_rate="" clean_reference_receiver="" clean_reference_loss="" first_scan_lossy=0 lower_attempts=0
     local last_ok="" last_ok_gp="" broke_at="" fine_start fine_step recommend="" candidate="" confirm_row confirm_gp="" confirm_loss=""
-    local min_efficiency="0.90" confirmed=0 reject_reason="" estimated tests rc=0 no_knee=0 above_cap=0 baseline_duration
+    local min_efficiency="0.90" confirmed=0 reject_reason="" estimated tests rc=0 no_knee=0 above_cap=0
+    local control_duration saturation_duration coarse_duration confirm_duration target_points scan_width
     local auto_cap=0 nominal_was_auto=0 observed_cap
-    local baseline_quality=unknown scan_decision=inconclusive no_knee_reason=""
+    local legacy_baseline_quality=unknown scan_decision=inconclusive no_knee_reason=""
     local confidence_row confidence confidence_score confidence_grade confidence_reasons
     local sample_confidence_score sample_confidence_grade sample_confidence_reasons
     local decision_confidence_score decision_confidence_grade decision_confidence_reasons
@@ -1167,27 +1294,99 @@ measure_sweep() {
     }
     measure_begin "$iface" || return 1
 
-    baseline_duration="$duration"; ((baseline_duration>5)) && baseline_duration=5
-    if ! apply_fq "$iface"; then
-        rc=1
-    elif baseline_row=$(sample_repeated "$peer" "$port" "$baseline_duration" 1 2 unshaped 3 6); then
-        baseline_gp=$(cut -f1 <<< "$baseline_row"); baseline_loss=$(cut -f4 <<< "$baseline_row")
-        if baseline_retrans_too_high "$baseline_loss" "$threshold"; then
-            if (( force_scan )); then
-                baseline_quality=forced-bad
-                log WARN "不限速路径重传估算 ${baseline_loss}% 过高；已按 --force-scan 继续，结论置信度将强制降级"
+    control_duration="$duration"; ((control_duration < 5)) && control_duration=5; ((control_duration > 8)) && control_duration=8
+    saturation_duration="$duration"; ((saturation_duration > 6)) && saturation_duration=6
+    coarse_duration="$duration"; ((coarse_duration > 5)) && coarse_duration=5
+    confirm_duration=$((duration + 2)); ((confirm_duration < 6)) && confirm_duration=6; ((confirm_duration > 10)) && confirm_duration=10
+
+    # Known-rate runs establish path quality before any saturation traffic.
+    # Auto-rate runs do the same control after capacity discovery has supplied
+    # a safe 40-50% receiver-derived target.
+    if (( nominal > 0 )); then
+        path_control_rate=$((nominal * 40 / 100)); ((path_control_rate < 1)) && path_control_rate=1
+        log INFO "PATH_CONTROL: ${path_control_rate} Mbit/s（标称速率的 40%）"
+        if ! apply_shaping "$iface" "$path_control_rate"; then
+            rc=1
+        elif path_control_row=$(sample_repeated "$peer" "$port" "$control_duration" 1 3 path-control 3 8); then
+            path_control_receiver=$(cut -f1 <<< "$path_control_row"); path_control_sender=$(cut -f15 <<< "$path_control_row")
+            path_control_sender="${path_control_sender:-$path_control_receiver}"; path_control_loss=$(cut -f4 <<< "$path_control_row")
+            if awk -v g="$path_control_receiver" -v r="$path_control_rate" 'BEGIN {exit !(g<r*0.70)}'; then
+                path_control_quality=slow-peer; measurement_state=MEASUREMENT_UNSTABLE; reject_reason="path-control-peer-too-slow"; rc=2
+            elif loss_spike "$path_control_loss" 0.5 0; then
+                path_control_quality=dirty; legacy_baseline_quality=bad; measurement_state=PATH_DIRTY
+                scan_decision="path-dirty"; reject_reason="path-control-dirty"; rc="$MEASURE_PATH_QUALITY_RC"
             else
-                baseline_quality=bad
-                scan_decision=inconclusive-bad-baseline
-                reject_reason="baseline-retrans-too-high"
-                log WARN "不限速路径重传估算 ${baseline_loss}% 过高，无法可靠定位 policer；本次 peer/path 结论为 inconclusive"
-                rc="$MEASURE_BASELINE_QUALITY_RC"
+                path_control_quality=clean; legacy_baseline_quality=good
             fi
+        else rc=$?; fi
+    fi
+
+    if (( rc == 0 )); then measurement_cooldown PRE_SCAN "${path_control_rate:-0}" "$control_duration" || rc=$?; fi
+    if (( rc != 0 )); then
+        :
+    elif ! apply_fq "$iface"; then
+        rc=1
+    elif saturation_row=$(sample_repeated "$peer" "$port" "$saturation_duration" 1 2 saturation 3 6); then
+        saturation_receiver=$(cut -f1 <<< "$saturation_row"); saturation_loss=$(cut -f4 <<< "$saturation_row")
+        saturation_sender=$(cut -f15 <<< "$saturation_row"); saturation_sender="${saturation_sender:-$saturation_receiver}"
+        saturation_fallback=$(cut -f19 <<< "$saturation_row"); saturation_fallback="${saturation_fallback:-1}"
+        if loss_spike "$saturation_loss" "$threshold" "${path_control_loss:-0}"; then
+            saturation_state=lossy; policer_suspected=1
+            log INFO "SATURATION: receiver ${saturation_receiver} Mbit/s, retrans-est ${saturation_loss}%（疑似 policer；不是脏路径判据）"
         else
-            baseline_quality=good
+            saturation_state=clean
+            log INFO "SATURATION: receiver ${saturation_receiver} Mbit/s, retrans-est ${saturation_loss}%（未见 policer 跳变）"
+        fi
+
+        if (( nominal_was_auto && rc == 0 )); then
+            path_control_rate=$(awk -v g="$saturation_receiver" 'BEGIN {v=int(g*0.45+0.5); if(v<1)v=1; print v}')
+            log INFO "PATH_CONTROL: ${path_control_rate} Mbit/s（不限速 receiver 的 45%）"
+            measurement_cooldown BETWEEN_LEVEL "$saturation_receiver" "$saturation_duration" || rc=$?
+            if (( rc == 0 )) && ! apply_shaping "$iface" "$path_control_rate"; then
+                rc=1
+            elif (( rc == 0 )); then
+                if path_control_row=$(sample_repeated "$peer" "$port" "$control_duration" 1 3 path-control 3 8); then
+                    path_control_receiver=$(cut -f1 <<< "$path_control_row"); path_control_sender=$(cut -f15 <<< "$path_control_row")
+                    path_control_sender="${path_control_sender:-$path_control_receiver}"; path_control_loss=$(cut -f4 <<< "$path_control_row")
+                    if awk -v g="$path_control_receiver" -v r="$path_control_rate" 'BEGIN {exit !(g<r*0.70)}'; then
+                        path_control_quality=slow-peer; measurement_state=MEASUREMENT_UNSTABLE; reject_reason="path-control-peer-too-slow"; rc=2
+                    elif loss_spike "$path_control_loss" 0.5 0; then
+                        path_control_quality=dirty; legacy_baseline_quality=bad; measurement_state=PATH_DIRTY
+                        scan_decision="path-dirty"; reject_reason="path-control-dirty"; rc="$MEASURE_PATH_QUALITY_RC"
+                    else
+                        path_control_quality=clean; legacy_baseline_quality=good
+                    fi
+                else rc=$?; fi
+            fi
+        fi
+
+        if (( rc == 0 )) && [[ "$path_control_quality" == clean ]]; then
+            if (( policer_suspected )); then measurement_state=CLEAN_POLICER_FOUND
+            else
+                measurement_state=CLEAN_NO_POLICER; no_knee=1; no_knee_reason=saturation-clean; scan_decision=no-knee-clean
+                (( force_scan )) && { no_knee=0; no_knee_reason=""; scan_decision=forced-scan; }
+            fi
+        fi
+        capacity_receiver="$saturation_receiver"
+        # Aggregate mode is capacity discovery only. It never replaces the
+        # single-flow saturation tuple used for retransmission attribution.
+        if (( rc == 0 )) && {
+           { (( ! nominal_was_auto && nominal > 0 )) && awk -v g="$capacity_receiver" -v n="$nominal" 'BEGIN {exit !(g<n*0.70)}'; } ||
+           { (( nominal_was_auto )) && [[ "$HARDWARE_LINK_TRUST" == trusted ]] && is_uint "$HARDWARE_LINK_MBIT" &&
+              (( HARDWARE_LINK_MBIT >= 2500 )) && awk -v g="$capacity_receiver" -v n="$HARDWARE_LINK_MBIT" 'BEGIN {exit !(g<n*0.70)}'; }
+        }; then
+            local capacity_row capacity_parallel=8 aggregate_receiver
+            log INFO "CAPACITY_DISCOVERY: 单流明显低于高带宽标称值，追加 ${capacity_parallel} 流容量探针"
+            if ! apply_fq "$iface"; then
+                rc=1
+            elif capacity_row=$(sample_repeated "$peer" "$port" "$saturation_duration" "$capacity_parallel" 2 capacity-aggregate 3 8); then
+                aggregate_receiver=$(cut -f1 <<< "$capacity_row")
+                if awk -v a="$aggregate_receiver" -v b="$capacity_receiver" 'BEGIN {exit !(a>b)}'; then capacity_receiver="$aggregate_receiver"; fi
+                capacity_mode=single+aggregate
+            else rc=$?; fi
         fi
         if (( rc == 0 && auto_cap )); then
-            if observed_cap=$(expanded_scan_cap "$cap" "$baseline_gp"); then
+            if observed_cap=$(expanded_scan_cap "$cap" "$capacity_receiver"); then
                 if (( observed_cap > cap )); then
                     log INFO "根据不限速基准将扫描上限从 ${cap} 调整为 ${observed_cap} Mbit/s"
                     cap="$observed_cap"
@@ -1196,26 +1395,51 @@ measure_sweep() {
                 rc=$?
             fi
         fi
+        # A clean, stable saturation result that remains far below a known
+        # nominal rate proves neither a policer nor usable endpoint capacity.
+        # The aggregate discovery above gets one bounded chance to rule out a
+        # single-flow/window limitation; otherwise fail over instead of
+        # declaring a trusted CLEAN_NO_POLICER result.
+        if (( rc == 0 && ! nominal_was_auto && nominal > 0 && ! policer_suspected )) &&
+           awk -v g="$capacity_receiver" -v n="$nominal" 'BEGIN {exit !(g<n*0.70)}'; then
+            saturation_state=unstable; measurement_state=MEASUREMENT_UNSTABLE
+            no_knee=0; no_knee_reason=""; scan_decision=inconclusive-peer-too-slow
+            reject_reason="capacity-below-nominal-after-aggregate"; rc=2
+        fi
         if (( rc == 0 )); then
-            if awk -v g="$baseline_gp" -v c="$cap" 'BEGIN {exit !(g>c)}'; then
+            if awk -v g="$capacity_receiver" -v c="$cap" 'BEGIN {exit !(g>c)}'; then
                 above_cap=1; no_knee=1; no_knee_reason=above-scan-cap
-                if [[ "$baseline_quality" == good ]]; then scan_decision=no-knee-clean; else scan_decision=no-knee-forced; fi
-                log WARN "不限速单流达到 ${baseline_gp} Mbit/s，超过扫描上限 ${cap} Mbit/s；跳过整形扫描"
+                if (( policer_suspected )); then
+                    scan_decision=inconclusive-above-cap; measurement_state=MEASUREMENT_UNSTABLE; reject_reason=policer-suspected-above-cap
+                else scan_decision=no-knee-clean
+                fi
+                log WARN "容量探针 receiver 达到 ${capacity_receiver} Mbit/s，超过扫描上限 ${cap} Mbit/s"
             fi
-            (( nominal > 0 )) || nominal=$(awk -v g="$baseline_gp" 'BEGIN {printf "%d", g+0.5}')
+            (( nominal > 0 )) || nominal=$(awk -v g="$capacity_receiver" 'BEGIN {printf "%d", g+0.5}')
             if (( nominal_was_auto )) && [[ "$result_mode" == auto ]]; then
                 if duration=$(recommended_measure_duration "$iface" "$nominal"); then :; else rc=$?; fi
             fi
         fi
-        if (( rc == 0 )); then
-            (( low > 0 )) || low=$(awk -v g="$baseline_gp" 'BEGIN {v=g*0.80; if(v<1)v=1; printf "%d", v}')
-            (( high > 0 )) || high=$(awk -v g="$baseline_gp" 'BEGIN {v=g*1.30; if(v<2)v=2; printf "%d", v}')
-            (( step > 0 )) || { step=$((nominal / 20)); ((step < 5)) && step=5; }
+        if (( rc == 0 && ! no_knee )); then
+            if (( low == 0 )); then
+                if (( nominal_was_auto )); then low=$(awk -v g="$capacity_receiver" 'BEGIN {v=int(g*0.91+0.5); if(v<1)v=1; print v}')
+                else low=$((nominal * 91 / 100)); ((low < 1)) && low=1
+                fi
+            fi
+            if (( high == 0 )); then
+                high=$(awk -v g="$capacity_receiver" -v n="$nominal" -v l="$saturation_loss" 'BEGIN {
+                    v=g*(1.15+l/100*1.5); nmax=n*1.15; if(nmax>v)v=nmax; if(v<2)v=2; printf "%d",v+0.5
+                }')
+            fi
+            if (( step == 0 )); then
+                scan_width=$((high-low)); target_points=8
+                step=$(( (scan_width + target_points - 2) / (target_points - 1) )); ((step < 1)) && step=1
+            fi
             if (( ! above_cap && high > cap )); then
                 log WARN "扫描上界 ${high} Mbit/s 超过硬上限 ${cap} Mbit/s，已收敛到硬上限"
                 high="$cap"
             fi
-            if (( ! above_cap && low >= cap )); then
+            if (( low >= cap )); then
                 die "扫描下界 ${low} Mbit/s 必须低于硬上限 ${cap} Mbit/s"
                 rc=1
             elif (( high <= low )); then
@@ -1227,43 +1451,77 @@ measure_sweep() {
         rc=$?
     fi
 
-    if (( rc == 0 && (step <= 0 || high <= low) )); then
+    if (( rc == 0 && ! no_knee && (step <= 0 || high <= low) )); then
         die "无法根据基准样本生成有效扫描区间"
         rc=1
     fi
 
     if (( rc == 0 )); then
-        # Baseline, low-rate reference and confirmation may each add a third
-        # sample when the first pair is unstable.
-        tests=$((3 + 3 + (high-low)/step + 4 + 3))
-        estimated=$(estimate_sweep_bytes "$high" "$duration" "$tests")
-        log INFO "计划最多采集 $tests 个样本、产生约 $(human_bytes "$estimated") 出站流量（不含失败重试）"
+        if (( no_knee )); then
+            tests=6; [[ "$capacity_mode" == single+aggregate ]] && tests=9
+            estimated=$(estimate_control_saturation_bytes "$path_control_rate" "$control_duration" "$capacity_receiver" \
+                "$saturation_duration" "$([[ "$capacity_mode" == single+aggregate ]] && echo 1 || echo 0)")
+        else
+            tests=29; [[ "$capacity_mode" == single+aggregate ]] && tests=32
+            estimated=$(estimate_measurement_plan_bytes "$path_control_rate" "$control_duration" "$capacity_receiver" \
+                "$saturation_duration" "$high" "$coarse_duration" "$confirm_duration" "$([[ "$capacity_mode" == single+aggregate ]] && echo 1 || echo 0)")
+        fi
+        log INFO "计划最多采集 $tests 个样本、产生约 $(human_bytes "$estimated") 出站流量（上界估算，不含失败重试）"
 
-        if (( above_cap )); then
+        if (( no_knee || above_cap )); then
             :
         else
-            apply_shaping "$iface" "$low" || rc=$?
+            measurement_cooldown PRE_SCAN "$capacity_receiver" "$saturation_duration" || rc=$?
+            if (( rc == 0 )); then apply_shaping "$iface" "$low" || rc=$?; fi
             if (( rc == 0 )); then
-                base_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "rate-${low}" 3 6) || rc=$?
+                measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
+                    "rate-${low}" "$threshold" "$path_control_loss" || rc=$?
+                base_row="$MEASURE_LEVEL_ROW"
                 base_gp=$(cut -f1 <<< "${base_row:-$'0\t0\t0\t0'}")
                 base_loss=$(cut -f4 <<< "${base_row:-$'0\t0\t0\t0'}")
-                min_efficiency=$(minimum_efficiency_ratio "$base_gp" "$low")
-                log INFO "低速档效率基准: ${base_gp}/${low}，后续最低可接受效率比 ${min_efficiency}"
             fi
-            if (( rc == 0 )) && loss_spike "$base_loss" "$threshold" 0; then
-                die "扫描下界 ${low} Mbit 已有明显重传，无法建立干净本底；请降低 --low 或更换 peer"
-                rc=2
+            if (( rc == 0 && MEASURE_LEVEL_SPIKE_CONFIRMED )); then
+                local known_broke="$low" lower_rate="$low"
+                first_scan_lossy=1
+                while (( lower_attempts < 3 )); do
+                    ((lower_attempts+=1)); lower_rate=$((lower_rate * 3 / 4)); ((lower_rate < 1)) && lower_rate=1
+                    log WARN "首个扫描点 ${known_broke} Mbit/s 已确认重传跳变；向下检查控制点 ${lower_rate} Mbit/s（${lower_attempts}/3）"
+                    measurement_cooldown BETWEEN_LEVEL "$lower_rate" "$coarse_duration" || { rc=$?; break; }
+                    apply_shaping "$iface" "$lower_rate" || { rc=$?; break; }
+                    measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
+                        "lower-control-${lower_rate}" "$threshold" "$path_control_loss" || { rc=$?; break; }
+                    if (( ! MEASURE_LEVEL_SPIKE_CONFIRMED )); then
+                        base_row="$MEASURE_LEVEL_ROW"; base_gp=$(cut -f1 <<< "$base_row"); base_loss=$(cut -f4 <<< "$base_row")
+                        last_ok="$lower_rate"; last_ok_gp="$base_gp"; broke_at="$known_broke"
+                        clean_reference_rate="$lower_rate"; clean_reference_receiver="$base_gp"; clean_reference_loss="$base_loss"
+                        break
+                    fi
+                done
+                if (( rc == 0 )) && [[ -z "$last_ok" ]]; then
+                    measurement_state=MEASUREMENT_UNSTABLE; scan_decision=inconclusive-first-point-lossy
+                    reject_reason="first-scan-point-lossy-after-controls"; rc=2
+                fi
             fi
             if (( rc == 0 )); then
                 local previous_gp previous_rate stall_count=0 stalled_rate=""
-                last_ok="$low"
-                last_ok_gp="$base_gp"; previous_gp="$base_gp"; previous_rate="$low"
-                for ((rate=low+step; rate<=high; rate+=step)); do
+                if (( ! first_scan_lossy )); then
+                    min_efficiency=$(minimum_efficiency_ratio "$base_gp" "$low")
+                    clean_reference_rate="$low"; clean_reference_receiver="$base_gp"; clean_reference_loss="$base_loss"
+                    last_ok="$low"; last_ok_gp="$base_gp"; previous_gp="$base_gp"; previous_rate="$low"
+                else
+                    min_efficiency=$(minimum_efficiency_ratio "$last_ok_gp" "$last_ok")
+                    previous_gp="$last_ok_gp"; previous_rate="$last_ok"
+                fi
+                log INFO "低速干净参考: ${clean_reference_receiver}/${clean_reference_rate}，后续最低可接受效率比 ${min_efficiency}"
+                for ((rate=low+step; first_scan_lossy==0 && rate<=high; rate+=step)); do
+                    measurement_cooldown BETWEEN_LEVEL "$rate" "$coarse_duration" || { rc=$?; break; }
                     apply_shaping "$iface" "$rate" || { rc=$?; break; }
-                    row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "rate-${rate}") || { rc=$?; break; }
+                    measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
+                        "rate-${rate}" "$threshold" "$clean_reference_loss" || { rc=$?; break; }
+                    row="$MEASURE_LEVEL_ROW"
                     gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
                     printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%%\n' "$rate" "$gp" "$loss"
-                    if loss_spike "$loss" "$threshold" "$base_loss"; then broke_at="$rate"; break; fi
+                    if (( MEASURE_LEVEL_SPIKE_CONFIRMED )); then broke_at="$rate"; break; fi
                     if throughput_stalled "$gp" "$previous_gp" "$rate" "$previous_rate" "$min_efficiency"; then
                         ((stall_count+=1)); [[ -n "$stalled_rate" ]] || stalled_rate="$rate"
                         if (( stall_count >= 2 )); then broke_at="$stalled_rate"; break; fi
@@ -1273,15 +1531,18 @@ measure_sweep() {
                 done
             fi
             if (( rc == 0 )) && [[ -n "$broke_at" ]]; then
-                fine_step=$((step / 5)); ((fine_step < 1)) && fine_step=1
+                fine_step=$(( (broke_at-last_ok+7) / 8 )); ((fine_step < 1)) && fine_step=1
                 fine_start=$((last_ok + fine_step))
                 previous_gp="$last_ok_gp"; previous_rate="$last_ok"; stall_count=0; stalled_rate=""
                 for ((rate=fine_start; rate<broke_at; rate+=fine_step)); do
+                    measurement_cooldown BETWEEN_LEVEL "$rate" "$coarse_duration" || { rc=$?; break; }
                     apply_shaping "$iface" "$rate" || { rc=$?; break; }
-                    row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "refine-${rate}") || { rc=$?; break; }
+                    measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
+                        "refine-${rate}" "$threshold" "$clean_reference_loss" || { rc=$?; break; }
+                    row="$MEASURE_LEVEL_ROW"
                     gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
                     printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%% (refine)\n' "$rate" "$gp" "$loss"
-                    if loss_spike "$loss" "$threshold" "$base_loss"; then broke_at="$rate"; break; fi
+                    if (( MEASURE_LEVEL_SPIKE_CONFIRMED )); then broke_at="$rate"; break; fi
                     if throughput_stalled "$gp" "$previous_gp" "$rate" "$previous_rate" "$min_efficiency"; then
                         ((stall_count+=1)); [[ -n "$stalled_rate" ]] || stalled_rate="$rate"
                         if (( stall_count >= 2 )); then broke_at="$stalled_rate"; break; fi
@@ -1292,9 +1553,10 @@ measure_sweep() {
             fi
             if (( rc == 0 )) && [[ -n "$last_ok" && -n "$broke_at" ]]; then
                 candidate=$(( last_ok * (100-margin) / 100 )); ((candidate < 1)) && candidate=1
-                apply_shaping "$iface" "$candidate" || rc=$?
+                measurement_cooldown BETWEEN_LEVEL "$candidate" "$confirm_duration" || rc=$?
+                if (( rc == 0 )); then apply_shaping "$iface" "$candidate" || rc=$?; fi
                 if (( rc == 0 )); then
-                    confirm_row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 "confirm-${candidate}" 3 6) || rc=$?
+                    confirm_row=$(sample_repeated "$peer" "$port" "$confirm_duration" "$parallel" 2 "confirm-${candidate}" 3 6) || rc=$?
                     confirm_gp=$(cut -f1 <<< "${confirm_row:-$'0\t0\t0\t999'}")
                     confirm_loss=$(cut -f4 <<< "${confirm_row:-$'0\t0\t0\t999'}")
                     if (( rc == 0 )) && measurement_sample_acceptable "$confirm_gp" "$confirm_loss" "$candidate" "$min_efficiency" "$threshold" "$base_loss"; then
@@ -1305,31 +1567,43 @@ measure_sweep() {
                     fi
                 fi
             elif (( rc == 0 )); then
-                no_knee=1
-                no_knee_reason=scan-complete-no-knee
-                if [[ "$baseline_quality" == good ]]; then scan_decision=no-knee-clean; else scan_decision=no-knee-forced; fi
-                log WARN "扫描到上界仍未发现拐点，不建议基于本次结果启用整形"
+                if (( policer_suspected )); then
+                    measurement_state=MEASUREMENT_UNSTABLE; scan_decision=inconclusive-policer-out-of-range
+                    reject_reason=policer-suspected-but-knee-not-located; rc=2
+                    log WARN "饱和探针疑似 policer，但扫描到上界仍未定位拐点"
+                else
+                    no_knee=1; no_knee_reason=scan-complete-no-knee; measurement_state=CLEAN_NO_POLICER
+                    scan_decision=no-knee-clean
+                fi
             fi
         fi
     fi
 
-    if (( rc == 0 )) && [[ -n "${recommend:-}" ]]; then scan_decision=recommend; fi
+    if (( rc == 0 )) && [[ -n "${recommend:-}" ]]; then scan_decision=recommend; measurement_state=CLEAN_POLICER_FOUND; fi
     if (( rc == 0 )) && [[ "$reject_reason" == confirmation-failed ]]; then scan_decision=inconclusive-confirmation; fi
 
-    if (( rc == 0 || rc == MEASURE_BASELINE_QUALITY_RC )); then
+    if (( rc == 0 || rc == MEASURE_PATH_QUALITY_RC || rc == 2 )); then
         printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nHARDWARE_CLASS\t%s\nLINK_MBIT\t%s\nRX_QUEUES\t%s\nTX_QUEUES\t%s\nSCAN_CAP_MBIT\t%s\nSAMPLE_DURATION_SECONDS\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nCLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t%s\nBASELINE_QUALITY\t%s\nSCAN_DECISION\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nMIN_EFFICIENCY_RATIO\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nCANDIDATE\t%s\nCONFIRM_MBIT\t%s\nCONFIRM_RETRANS_RATIO_EST_PERCENT\t%s\nCONFIRMED\t%s\nREJECT_REASON\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nNO_KNEE_REASON\t%s\nABOVE_CAP\t%s\n' \
             "$peer" "$port" "$iface" "$HARDWARE_CLASS" "$HARDWARE_LINK_MBIT" "$HARDWARE_RX_QUEUES" "$HARDWARE_TX_QUEUES" "$cap" "$duration" \
-            "${baseline_gp:-}" "${baseline_loss:-}" "${base_loss:-0}" "$baseline_quality" "$scan_decision" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$no_knee_reason" "$above_cap" > "$dir/summary.tsv"
-        confidence_row="${confirm_row:-${baseline_row:-}}"
+            "${saturation_receiver:-}" "${saturation_loss:-}" "${clean_reference_loss:-${path_control_loss:-0}}" "$legacy_baseline_quality" "$scan_decision" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$no_knee_reason" "$above_cap" > "$dir/summary.tsv"
+        printf 'MEASUREMENT_STATE\t%s\nPATH_CONTROL_RATE_MBIT\t%s\nPATH_CONTROL_SENDER_MBIT\t%s\nPATH_CONTROL_RECEIVER_MBIT\t%s\nPATH_CONTROL_RETRANS_EST_PERCENT\t%s\nPATH_CONTROL_QUALITY\t%s\nSATURATION_SENDER_MBIT\t%s\nSATURATION_RECEIVER_MBIT\t%s\nSATURATION_RETRANS_EST_PERCENT\t%s\nSATURATION_STATE\t%s\nCAPACITY_DISCOVERY_MODE\t%s\nCAPACITY_RECEIVER_MBIT\t%s\nPOLICER_SUSPECTED\t%s\nSCAN_LOW_MBIT\t%s\nSCAN_HIGH_MBIT\t%s\nSCAN_STEP_MBIT\t%s\nCLEAN_REFERENCE_RATE_MBIT\t%s\nCLEAN_REFERENCE_RECEIVER_MBIT\t%s\nCLEAN_REFERENCE_RETRANS_EST_PERCENT\t%s\nKNEE_MBIT\t%s\nUNSHAPED_SEMANTICS\treceiver-delivered-saturation-probe\n' \
+            "$measurement_state" "$path_control_rate" "${path_control_sender:-}" "${path_control_receiver:-}" "${path_control_loss:-}" "$path_control_quality" \
+            "${saturation_sender:-}" "${saturation_receiver:-}" "${saturation_loss:-}" "$saturation_state" "$capacity_mode" "${capacity_receiver:-}" \
+            "$policer_suspected" "$low" "$high" "$step" "${clean_reference_rate:-$path_control_rate}" \
+            "${clean_reference_receiver:-$path_control_receiver}" "${clean_reference_loss:-$path_control_loss}" "${last_ok:-}" >> "$dir/summary.tsv"
+        printf 'CONTROL_DURATION_SECONDS\t%s\nSATURATION_DURATION_SECONDS\t%s\nCOARSE_DURATION_SECONDS\t%s\nCONFIRM_DURATION_SECONDS\t%s\nPLANNED_SAMPLE_UPPER_BOUND\t%s\nESTIMATED_TRAFFIC_BYTES_UPPER_BOUND\t%s\n' \
+            "$control_duration" "$saturation_duration" "$coarse_duration" "$confirm_duration" "${tests:-0}" "${estimated:-0}" >> "$dir/summary.tsv"
+        printf 'BASELINE_QUALITY_SEMANTICS\tpath-control-compatibility-alias\n' >> "$dir/summary.tsv"
+        confidence_row="${confirm_row:-${saturation_row:-}}"
         if [[ -n "$confidence_row" ]]; then
-            confidence=$(measurement_confidence "$(cut -f13 <<< "$confidence_row")" "$(cut -f12 <<< "$confidence_row")" "$(cut -f7 <<< "$confidence_row")" "$(cut -f11 <<< "$confidence_row")" 0 "$PATH_PROFILE_SCORE")
+            confidence=$(measurement_confidence "$(cut -f13 <<< "$confidence_row")" "$(cut -f12 <<< "$confidence_row")" "$(cut -f7 <<< "$confidence_row")" "$(cut -f11 <<< "$confidence_row")" 0 "$PATH_PROFILE_SCORE" "$(cut -f19 <<< "$confidence_row")")
             IFS=$'\t' read -r sample_confidence_score sample_confidence_grade sample_confidence_reasons <<< "$confidence"
         else
             sample_confidence_score=0; sample_confidence_grade=low; sample_confidence_reasons=no-usable-sample
         fi
-        if [[ "$scan_decision" == inconclusive-* || "$baseline_quality" == forced-bad ]]; then
+        if [[ "$scan_decision" == inconclusive-* || "$path_control_quality" != clean ]]; then
             decision_confidence_score=0; decision_confidence_grade=low
-            decision_confidence_reasons="${reject_reason:-baseline-retrans-too-high}"
+            decision_confidence_reasons="${reject_reason:-measurement-unstable}"
             confidence_score="$decision_confidence_score"; confidence_grade="$decision_confidence_grade"; confidence_reasons="$decision_confidence_reasons"
         else
             decision_confidence_score="$sample_confidence_score"; decision_confidence_grade="$sample_confidence_grade"
@@ -1337,8 +1611,8 @@ measure_sweep() {
             confidence_score="$sample_confidence_score"; confidence_grade="$sample_confidence_grade"; confidence_reasons="$sample_confidence_reasons"
         fi
         printf 'IDLE_RTT_MS\t%s\nUNSHAPED_RETRANS_PER_GIB\t%s\nUNSHAPED_LOADED_RTT_P95_MS\t%s\nUNSHAPED_BUFFERBLOAT_P95_MS\t%s\nUNSHAPED_BACKGROUND_TX_PERCENT_MAX\t%s\nUNSHAPED_CPU_BUSY_PERCENT_MAX\t%s\nUNSHAPED_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_RETRANS_PER_GIB\t%s\nCONFIRM_LOADED_RTT_P95_MS\t%s\nCONFIRM_BUFFERBLOAT_P95_MS\t%s\nCONFIRM_BACKGROUND_TX_PERCENT_MAX\t%s\nCONFIRM_CPU_BUSY_PERCENT_MAX\t%s\nCONFIRM_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_GOODPUT_SPREAD_PERCENT\t%s\nCONFIRM_SAMPLE_COUNT\t%s\nSAMPLE_CONFIDENCE_SCORE\t%s\nSAMPLE_CONFIDENCE_GRADE\t%s\nSAMPLE_CONFIDENCE_REASONS\t%s\nDECISION_CONFIDENCE_SCORE\t%s\nDECISION_CONFIDENCE_GRADE\t%s\nDECISION_CONFIDENCE_REASONS\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
-            "$MEASURE_IDLE_RTT_MS" "$(cut -f5 <<< "${baseline_row:-}")" "$(cut -f7 <<< "${baseline_row:-}")" "$(cut -f14 <<< "${baseline_row:-}")" \
-            "$(cut -f8 <<< "${baseline_row:-}")" "$(cut -f9 <<< "${baseline_row:-}")" "$(cut -f10 <<< "${baseline_row:-}")" \
+            "$MEASURE_IDLE_RTT_MS" "$(cut -f5 <<< "${saturation_row:-}")" "$(cut -f7 <<< "${saturation_row:-}")" "$(cut -f14 <<< "${saturation_row:-}")" \
+            "$(cut -f8 <<< "${saturation_row:-}")" "$(cut -f9 <<< "${saturation_row:-}")" "$(cut -f10 <<< "${saturation_row:-}")" \
             "$(cut -f5 <<< "${confirm_row:-}")" "$(cut -f7 <<< "${confirm_row:-}")" "$(cut -f14 <<< "${confirm_row:-}")" \
             "$(cut -f8 <<< "${confirm_row:-}")" "$(cut -f9 <<< "${confirm_row:-}")" "$(cut -f10 <<< "${confirm_row:-}")" \
             "$(cut -f12 <<< "${confirm_row:-}")" "$(cut -f13 <<< "${confirm_row:-}")" \
@@ -1375,7 +1649,7 @@ measure_path_check() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" rate="$4" preferred_address="${5:-}" preferred_source="${6:-}"
-    local iface dir row="" gp="" loss="" rc=0 accepted=0
+    local iface dir row="" gp="" sender="" loss="" quality=unknown rc=0 accepted=0
     validate_peer "$peer" "$port" || return 1
     is_uint "$rate" && (( rate > 0 )) || { die "路径检查速率无效"; return 1; }
     measure_lock_requested_peer "$peer" "$port" "$requested" "$preferred_address" "$preferred_source" || return $?
@@ -1393,24 +1667,27 @@ measure_path_check() {
     log INFO "路径预检: 临时整形 ${rate} Mbit/s，检查对端是否足以承载测量"
     if ! apply_shaping "$iface" "$rate"; then
         rc=1
-    elif row=$(sample_repeated "$peer" "$port" 5 1 1 path-check); then
+    elif row=$(sample_repeated "$peer" "$port" 5 1 3 path-check 3 8); then
         gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
-        if awk -v g="$gp" -v r="$rate" 'BEGIN {exit !(g < r*0.60)}'; then
+        sender=$(cut -f15 <<< "$row"); sender="${sender:-$gp}"
+        if awk -v g="$gp" -v r="$rate" 'BEGIN {exit !(g < r*0.70)}'; then
+            quality=slow-peer
             log ERR "路径预检仅达到 ${gp} Mbit/s，明显低于 ${rate} Mbit/s；更换更近对端后重试"
             rc=2
         elif loss_spike "$loss" 0.5 0; then
-            log ERR "路径预检重传比例过高 (${loss}%)；本次对端不适合寻找 policer 拐点"
-            rc=2
+            quality=dirty
+            log ERR "低速路径控制重传比例过高 (${loss}%)；PATH_DIRTY"
+            rc="$MEASURE_PATH_QUALITY_RC"
         else
-            accepted=1
-            log OK "路径预检通过: ${gp} Mbit/s，重传估算 ${loss}%"
+            quality=clean; accepted=1
+            log OK "低速路径控制通过: receiver ${gp} Mbit/s，sender ${sender} Mbit/s，重传估算 ${loss}%"
         fi
     else
         rc=$?
     fi
     if [[ -n "$row" ]]; then
-        printf 'TYPE\tpath-check\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nRATE_MBIT\t%s\nGOODPUT_MBIT\t%s\nRETRANS_RATIO_EST_PERCENT\t%s\nACCEPTED\t%s\n' \
-            "$peer" "$port" "$iface" "$rate" "$gp" "$loss" "$accepted" > "$dir/summary.tsv"
+        printf 'TYPE\tpath-check\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nRATE_MBIT\t%s\nPATH_CONTROL_RATE_MBIT\t%s\nPATH_CONTROL_SENDER_MBIT\t%s\nPATH_CONTROL_RECEIVER_MBIT\t%s\nPATH_CONTROL_RETRANS_EST_PERCENT\t%s\nPATH_CONTROL_QUALITY\t%s\nGOODPUT_MBIT\t%s\nRETRANS_RATIO_EST_PERCENT\t%s\nACCEPTED\t%s\n' \
+            "$peer" "$port" "$iface" "$rate" "$rate" "$sender" "$gp" "$loss" "$quality" "$gp" "$loss" "$accepted" > "$dir/summary.tsv"
         measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         log INFO "路径预检结果: $dir"
     fi
@@ -1422,7 +1699,7 @@ measure_verify() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" duration="${4:-8}" expected_rate="${5:-0}" min_efficiency="${6:-0.90}"
-    local baseline_loss="${7:-0}" threshold="${8:-0.1}" iface dir one multi one_gp one_loss multi_gp multi_loss rc=0 accepted=1 reject_reason=""
+    local clean_reference_loss="${7:-0}" threshold="${8:-0.1}" iface dir one multi one_gp one_loss multi_gp multi_loss rc=0 accepted=1 reject_reason=""
     local preferred_address="${9:-}" preferred_source="${10:-}"
     local multi_parallel
     local one_count multi_count combined_count one_spread multi_spread combined_spread combined_loaded combined_contaminated
@@ -1430,8 +1707,8 @@ measure_verify() {
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && (( duration >= 3 && duration <= 120 )) || { die "verify duration 超出安全范围"; return 1; }
     is_uint "$expected_rate" && (( expected_rate <= 1000000 )) || { die "verify 期望速率无效"; return 1; }
-    is_decimal "$min_efficiency" && is_decimal "$baseline_loss" && is_decimal "$threshold" || { die "verify 验收参数无效"; return 1; }
-    awk -v e="$min_efficiency" -v b="$baseline_loss" -v t="$threshold" 'BEGIN {exit !(e>0 && e<=1 && b>=0 && b<=100 && t>=0 && t<=100)}' || {
+    is_decimal "$min_efficiency" && is_decimal "$clean_reference_loss" && is_decimal "$threshold" || { die "verify 验收参数无效"; return 1; }
+    awk -v e="$min_efficiency" -v b="$clean_reference_loss" -v t="$threshold" 'BEGIN {exit !(e>0 && e<=1 && b>=0 && b<=100 && t>=0 && t<=100)}' || {
         die "verify 验收参数超出安全范围"
         return 1
     }
@@ -1448,17 +1725,20 @@ measure_verify() {
         return "$rc"
     }
     measure_begin "$iface" || return 1
-    one=$(sample_repeated "$peer" "$port" "$duration" 1 2 verify-single 3 6) || rc=$?
+    measurement_cooldown PRE_VERIFY "$expected_rate" "$duration" || rc=$?
+    if (( rc == 0 )); then one=$(sample_repeated "$peer" "$port" "$duration" 1 2 verify-single 3 6) || rc=$?; fi
     if (( rc == 0 )); then multi=$(sample_repeated "$peer" "$port" "$duration" "$multi_parallel" 2 "verify-multi-${multi_parallel}" 3 6) || rc=$?; fi
     if (( rc == 0 )); then
         one_gp=$(cut -f1 <<< "$one"); one_loss=$(cut -f4 <<< "$one")
         multi_gp=$(cut -f1 <<< "$multi"); multi_loss=$(cut -f4 <<< "$multi")
         if (( expected_rate > 0 )); then
-            if ! measurement_sample_acceptable "$one_gp" "$one_loss" "$expected_rate" "$min_efficiency" "$threshold" "$baseline_loss"; then
+            if ! measurement_sample_acceptable "$one_gp" "$one_loss" "$expected_rate" "$min_efficiency" "$threshold" "$clean_reference_loss"; then
                 accepted=0; reject_reason="single-flow-below-threshold"
-            elif ! measurement_sample_acceptable "$multi_gp" "$multi_loss" "$expected_rate" "$min_efficiency" "$threshold" "$baseline_loss"; then
+            elif ! measurement_sample_acceptable "$multi_gp" "$multi_loss" "$expected_rate" "$min_efficiency" "$threshold" "$clean_reference_loss"; then
                 accepted=0; reject_reason="multi-flow-below-threshold"
             fi
+        elif loss_spike "$one_loss" "$threshold" "$clean_reference_loss" || loss_spike "$multi_loss" "$threshold" "$clean_reference_loss"; then
+            accepted=0; reject_reason="final-retrans-above-clean-reference"
         fi
         one_count=$(cut -f13 <<< "$one"); multi_count=$(cut -f13 <<< "$multi")
         is_uint "$one_count" || one_count=0; is_uint "$multi_count" || multi_count=0
@@ -1475,13 +1755,15 @@ measure_verify() {
             combined_loaded=na
         fi
         combined_contaminated=$(printf '%s\n%s\n' "$(cut -f11 <<< "$one")" "$(cut -f11 <<< "$multi")" | max_numbers)
-        confidence=$(measurement_confidence "$combined_count" "$combined_spread" "$combined_loaded" "$combined_contaminated" 0 "$PATH_PROFILE_SCORE")
+        local receiver_fallback=0
+        if [[ "$(cut -f19 <<< "$one")" == 1 || "$(cut -f19 <<< "$multi")" == 1 ]]; then receiver_fallback=1; fi
+        confidence=$(measurement_confidence "$combined_count" "$combined_spread" "$combined_loaded" "$combined_contaminated" 0 "$PATH_PROFILE_SCORE" "$receiver_fallback")
         IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
-        printf 'TYPE\tverify\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nEXPECTED_RATE_MBIT\t%s\nMIN_EFFICIENCY_RATIO\t%s\nIDLE_RTT_MS\t%s\nSINGLE_MBIT\t%s\nSINGLE_RETRANS_EST_PERCENT\t%s\nSINGLE_RETRANS_PER_GIB\t%s\nSINGLE_LOADED_RTT_P95_MS\t%s\nSINGLE_BUFFERBLOAT_P95_MS\t%s\nSINGLE_GOODPUT_SPREAD_PERCENT\t%s\nSINGLE_SAMPLE_COUNT\t%s\nMULTI_FLOWS\t%s\nMULTI_MBIT\t%s\nMULTI_RETRANS_EST_PERCENT\t%s\nMULTI_RETRANS_PER_GIB\t%s\nMULTI_LOADED_RTT_P95_MS\t%s\nMULTI_BUFFERBLOAT_P95_MS\t%s\nMULTI_GOODPUT_SPREAD_PERCENT\t%s\nMULTI_SAMPLE_COUNT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\nACCEPTED\t%s\nREJECT_REASON\t%s\n' \
+        printf 'TYPE\tverify\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nEXPECTED_RATE_MBIT\t%s\nMIN_EFFICIENCY_RATIO\t%s\nIDLE_RTT_MS\t%s\nSINGLE_SENDER_MBIT\t%s\nSINGLE_RECEIVER_MBIT\t%s\nSINGLE_MBIT\t%s\nSINGLE_RETRANS_EST_PERCENT\t%s\nSINGLE_RETRANS_PER_GIB\t%s\nSINGLE_LOADED_RTT_P95_MS\t%s\nSINGLE_BUFFERBLOAT_P95_MS\t%s\nSINGLE_GOODPUT_SPREAD_PERCENT\t%s\nSINGLE_SAMPLE_COUNT\t%s\nMULTI_FLOWS\t%s\nMULTI_SENDER_MBIT\t%s\nMULTI_RECEIVER_MBIT\t%s\nMULTI_MBIT\t%s\nMULTI_RETRANS_EST_PERCENT\t%s\nMULTI_RETRANS_PER_GIB\t%s\nMULTI_LOADED_RTT_P95_MS\t%s\nMULTI_BUFFERBLOAT_P95_MS\t%s\nMULTI_GOODPUT_SPREAD_PERCENT\t%s\nMULTI_SAMPLE_COUNT\t%s\nRECEIVER_FALLBACK\t%s\nCLEAN_REFERENCE_RETRANS_EST_PERCENT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\nACCEPTED\t%s\nREJECT_REASON\t%s\n' \
             "$peer" "$port" "$iface" "$expected_rate" "$min_efficiency" "$MEASURE_IDLE_RTT_MS" \
-            "$one_gp" "$one_loss" "$(cut -f5 <<< "$one")" "$(cut -f7 <<< "$one")" "$(cut -f14 <<< "$one")" "$one_spread" "$one_count" \
-            "$multi_parallel" "$multi_gp" "$multi_loss" "$(cut -f5 <<< "$multi")" "$(cut -f7 <<< "$multi")" "$(cut -f14 <<< "$multi")" "$multi_spread" "$multi_count" \
-            "$confidence_score" "$confidence_grade" "$confidence_reasons" "$accepted" "$reject_reason" > "$dir/summary.tsv"
+            "$(cut -f15 <<< "$one")" "$(cut -f16 <<< "$one")" "$one_gp" "$one_loss" "$(cut -f5 <<< "$one")" "$(cut -f7 <<< "$one")" "$(cut -f14 <<< "$one")" "$one_spread" "$one_count" \
+            "$multi_parallel" "$(cut -f15 <<< "$multi")" "$(cut -f16 <<< "$multi")" "$multi_gp" "$multi_loss" "$(cut -f5 <<< "$multi")" "$(cut -f7 <<< "$multi")" "$(cut -f14 <<< "$multi")" "$multi_spread" "$multi_count" \
+            "$receiver_fallback" "$clean_reference_loss" "$confidence_score" "$confidence_grade" "$confidence_reasons" "$accepted" "$reject_reason" > "$dir/summary.tsv"
         measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         if (( accepted )); then
             log OK "验证完成: 单流 ${one_gp} Mbit/s，多流(${multi_parallel}) ${multi_gp} Mbit/s"
@@ -1504,7 +1786,7 @@ measure_compare() {
     local preferred_address="${7:-}" preferred_source="${8:-}"
     local iface dir speed estimate_rate estimate rc=0 round mode row verdict confidence
     local fq_gp shaped_gp fq_rpg shaped_rpg fq_bloat shaped_bloat fq_spread shaped_spread combined_spread combined_loaded
-    local confidence_score confidence_grade confidence_reasons throughput_delta
+    local confidence_score confidence_grade confidence_reasons throughput_delta receiver_fallback=0
     local -a fq_goodputs=() shaped_goodputs=() fq_retrans_gib=() shaped_retrans_gib=() fq_bloats=() shaped_bloats=()
     validate_peer "$peer" "$port" || return 1
     is_uint "$rate" && (( rate >= 1 && rate <= 1000000 )) || { die "compare rate 必须是 1–1000000 的整数"; return 1; }
@@ -1530,6 +1812,7 @@ measure_compare() {
                 apply_shaping "$iface" "$rate" || { rc=$?; break 2; }
             fi
             row=$(sample_repeated "$peer" "$port" "$duration" 1 1 "compare-${mode}-r${round}") || { rc=$?; break 2; }
+            [[ "$(cut -f19 <<< "$row")" != 1 ]] || receiver_fallback=1
             if [[ "$mode" == fq ]]; then
                 fq_goodputs+=("$(cut -f1 <<< "$row")"); fq_retrans_gib+=("$(cut -f5 <<< "$row")")
                 is_decimal "$(cut -f14 <<< "$row")" && fq_bloats+=("$(cut -f14 <<< "$row")")
@@ -1552,13 +1835,13 @@ measure_compare() {
             combined_loaded=na
         fi
         verdict=$(compare_verdict "$fq_gp" "$shaped_gp" "$fq_bloat" "$shaped_bloat" "$fq_rpg" "$shaped_rpg")
-        confidence=$(measurement_confidence "$rounds" "$combined_spread" "$combined_loaded" 0 0 "$PATH_PROFILE_SCORE")
+        confidence=$(measurement_confidence "$rounds" "$combined_spread" "$combined_loaded" 0 0 "$PATH_PROFILE_SCORE" "$receiver_fallback")
         IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
         throughput_delta=$(awk -v f="$fq_gp" -v s="$shaped_gp" 'BEGIN {if(f<=0) print "na"; else printf "%.2f", (s-f)*100/f}')
-        printf 'TYPE\tcompare\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nRATE_MBIT\t%s\nDURATION_SECONDS\t%s\nROUNDS\t%s\nORDER\tinterleaved\nIDLE_RTT_MS\t%s\nFQ_GOODPUT_MBIT\t%s\nFQ_RETRANS_PER_GIB\t%s\nFQ_BUFFERBLOAT_P95_MS\t%s\nFQ_GOODPUT_SPREAD_PERCENT\t%s\nSHAPED_GOODPUT_MBIT\t%s\nSHAPED_RETRANS_PER_GIB\t%s\nSHAPED_BUFFERBLOAT_P95_MS\t%s\nSHAPED_GOODPUT_SPREAD_PERCENT\t%s\nSHAPED_THROUGHPUT_DELTA_PERCENT\t%s\nVERDICT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\nPERSISTED\t0\n' \
+        printf 'TYPE\tcompare\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nRATE_MBIT\t%s\nDURATION_SECONDS\t%s\nROUNDS\t%s\nORDER\tinterleaved\nIDLE_RTT_MS\t%s\nFQ_RECEIVER_MBIT\t%s\nFQ_GOODPUT_MBIT\t%s\nFQ_RETRANS_PER_GIB\t%s\nFQ_BUFFERBLOAT_P95_MS\t%s\nFQ_GOODPUT_SPREAD_PERCENT\t%s\nSHAPED_RECEIVER_MBIT\t%s\nSHAPED_GOODPUT_MBIT\t%s\nSHAPED_RETRANS_PER_GIB\t%s\nSHAPED_BUFFERBLOAT_P95_MS\t%s\nSHAPED_GOODPUT_SPREAD_PERCENT\t%s\nSHAPED_THROUGHPUT_DELTA_PERCENT\t%s\nRECEIVER_FALLBACK\t%s\nVERDICT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\nPERSISTED\t0\n' \
             "$peer" "$port" "$iface" "$rate" "$duration" "$rounds" "$MEASURE_IDLE_RTT_MS" \
-            "$fq_gp" "$fq_rpg" "$fq_bloat" "$fq_spread" "$shaped_gp" "$shaped_rpg" "$shaped_bloat" "$shaped_spread" \
-            "$throughput_delta" "$verdict" "$confidence_score" "$confidence_grade" "$confidence_reasons" > "$dir/summary.tsv"
+            "$fq_gp" "$fq_gp" "$fq_rpg" "$fq_bloat" "$fq_spread" "$shaped_gp" "$shaped_gp" "$shaped_rpg" "$shaped_bloat" "$shaped_spread" \
+            "$throughput_delta" "$receiver_fallback" "$verdict" "$confidence_score" "$confidence_grade" "$confidence_reasons" > "$dir/summary.tsv"
         measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         log OK "A/B 完成: FQ ${fq_gp} Mbit/s / ${fq_bloat} ms，整形 ${shaped_gp} Mbit/s / ${shaped_bloat} ms，结论 ${verdict}"
         log INFO "对照置信度: ${confidence_grade} (${confidence_score}/100, ${confidence_reasons})；未写入配置或服务"

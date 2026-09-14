@@ -15,6 +15,7 @@ export BBRV3_SYSCTL_FILE="$TEST_ROOT/99-bbrv3-lite.conf"
 export BBRV3_LOCK_FILE="$TEST_ROOT/bbrv3-lite.lock"
 export BBRV3_NIC_POLICY_DIR="$TEST_ROOT/etc/interfaces.d"
 export BBRV3_NIC_STATE_DIR="$TEST_ROOT/state/interfaces"
+export BBRV3_MEASUREMENT_COOLDOWN=0
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 for module in 00-header.sh core.sh config.sh platform.sh path.sh state.sh sysctl.sh tc.sh nic.sh measure.sh systemd.sh cli.sh; do
@@ -120,6 +121,7 @@ install_sweep_quality_mocks() {
     acquire_lock() { :; }
     tc_dependencies() { :; }
     require_commands() { :; }
+    detect_interface() { printf 'eth0\n'; }
     measure_lock_peer() {
         MEASURE_PEER_HOST="$1"; MEASURE_PEER_ADDRESS=203.0.113.10; MEASURE_PEER_SOURCE=192.0.2.10
         MEASURE_PEER_FAMILY=4; MEASURE_PEER_IFACE=eth0; MEASURE_PEER_PORT="$3"
@@ -139,56 +141,57 @@ install_sweep_quality_mocks() {
     apply_shaping() { :; }
 }
 
-test_bad_baseline_is_inconclusive_and_low_confidence() (
-    local summary output rc=0 output_file="$TEST_ROOT/bad-baseline.log"
+test_dirty_path_control_is_inconclusive_and_low_confidence() (
+    local summary output rc=0 output_file="$TEST_ROOT/dirty-path-control.log"
     install_sweep_quality_mocks
     sample_repeated() {
         printf '100.00\t100\t1000000\t12.74263\t107374.182\t5\t6\t0\t10\t0\t0\t0.00\t2\t5\n'
     }
-    if measure_sweep bad.example 5201 eth0 0 0 0 0 3 1 3 0.1 0 5000 auto >"$output_file" 2>&1; then
-        fail "bad baseline was reported as a successful no-knee sweep"
+    if measure_sweep dirty.example 5201 eth0 0 0 0 0 3 1 3 0.1 0 5000 auto >"$output_file" 2>&1; then
+        fail "dirty path control was reported as a successful no-knee sweep"
     else
         rc=$?
     fi
     output=$(<"$output_file")
-    assert_eq "$MEASURE_BASELINE_QUALITY_RC" "$rc" "bad baseline result status"
+    assert_eq "$MEASURE_PATH_QUALITY_RC" "$rc" "dirty path-control result status"
     summary="$MEASURE_RUN_DIR/summary.tsv"
-    assert_eq bad "$(summary_value "$summary" BASELINE_QUALITY)" "bad baseline quality"
-    assert_eq inconclusive-bad-baseline "$(summary_value "$summary" SCAN_DECISION)" "bad baseline decision"
-    assert_eq 0 "$(summary_value "$summary" NO_KNEE)" "bad baseline no-knee marker"
-    assert_eq '' "$(summary_value "$summary" RECOMMEND)" "bad baseline recommendation"
+    assert_eq bad "$(summary_value "$summary" BASELINE_QUALITY)" "legacy path-control compatibility quality"
+    assert_eq path-dirty "$(summary_value "$summary" SCAN_DECISION)" "dirty path-control decision"
+    assert_eq PATH_DIRTY "$(summary_value "$summary" MEASUREMENT_STATE)" "dirty path state"
+    assert_eq 0 "$(summary_value "$summary" NO_KNEE)" "dirty path no-knee marker"
+    assert_eq '' "$(summary_value "$summary" RECOMMEND)" "dirty path recommendation"
     assert_eq high "$(summary_value "$summary" SAMPLE_CONFIDENCE_GRADE)" "sample telemetry confidence"
     assert_eq low "$(summary_value "$summary" DECISION_CONFIDENCE_GRADE)" "decision confidence downgrade"
-    assert_eq baseline-retrans-too-high "$(summary_value "$summary" CONFIDENCE_REASONS)" "legacy confidence reason"
+    assert_eq path-control-dirty "$(summary_value "$summary" CONFIDENCE_REASONS)" "path-control confidence reason"
     [[ "$output" != *'扫描置信度: high'* && "$output" != *'100/100, clean'* ]] || fail "inconclusive baseline was displayed as high/clean"
 )
 
-test_public_bad_baseline_restarts_on_next_peer() (
+test_public_dirty_path_restarts_on_next_peer() (
     local events=""
     PUBLIC_PEER_CANDIDATES=(
-        'bad.example|203.0.113.10|4|192.0.2.10|eth0|5201|1|坏基线|ProviderA'
+        'dirty.example|203.0.113.10|4|192.0.2.10|eth0|5201|1|脏路径|ProviderA'
         'clean.example|198.51.100.10|4|192.0.2.10|eth0|5201|2|干净|ProviderB'
     )
     WIZARD_PUBLIC_PEER=1; WIZARD_PUBLIC_INDEX=0; WIZARD_FAILOVERS=0; WIZARD_ROUTE_GUARD_ACTIVE=0
     WIZARD_SAMPLE_DURATION=5; WIZARD_SCAN_CAP=5000
     measure_sweep() {
-        events+=" $1:baseline+sweep"
-        [[ "$1" != bad.example ]] || return "$MEASURE_BASELINE_QUALITY_RC"
+        events+=" $1:control+sweep"
+        [[ "$1" != dirty.example ]] || return "$MEASURE_PATH_QUALITY_RC"
         return 0
     }
     auto_measure_with_peer_failover eth0 0 >/dev/null
-    assert_eq ' bad.example:baseline+sweep clean.example:baseline+sweep' "$events" "public peer full-sweep restart"
+    assert_eq ' dirty.example:control+sweep clean.example:control+sweep' "$events" "public peer full-sweep restart"
     assert_eq clean.example "$WIZARD_SWEEP_PEER" "clean sweep peer"
-    assert_eq 1 "$WIZARD_FAILOVERS" "baseline quality failover count"
+    assert_eq 1 "$WIZARD_FAILOVERS" "dirty path failover count"
 )
 
-test_all_public_bad_rolls_back_without_persisting() (
+test_all_public_dirty_rolls_back_without_persisting() (
     local events=""
     PUBLIC_PEER_CANDIDATES=(
-        'bad-a.example|203.0.113.10|4|192.0.2.10|eth0|5201|1|坏基线 A|ProviderA'
-        'bad-b.example|198.51.100.10|4|192.0.2.10|eth0|5201|2|坏基线 B|ProviderB'
+        'dirty-a.example|203.0.113.10|4|192.0.2.10|eth0|5201|1|脏路径 A|ProviderA'
+        'dirty-b.example|198.51.100.10|4|192.0.2.10|eth0|5201|2|脏路径 B|ProviderB'
     )
-    WIZARD_PEER=bad-a.example; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=1; WIZARD_PUBLIC_INDEX=0
+    WIZARD_PEER=dirty-a.example; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=1; WIZARD_PUBLIC_INDEX=0
     WIZARD_FAILOVERS=0; WIZARD_ROUTE_GUARD_ACTIVE=0; WIZARD_PEER_IFACE=eth0
     WIZARD_SAMPLE_DURATION=5; WIZARD_SCAN_CAP=5000
     action_transaction_begin_multi() { events+=' begin'; }
@@ -196,11 +199,11 @@ test_all_public_bad_rolls_back_without_persisting() (
     action_transaction_commit() { events+=' commit'; }
     action_transaction_rollback() { events+=' rollback'; }
     prepare_auto_tuning_runtime() { events+=' prepare'; }
-    measure_sweep() { events+=" $1:baseline+sweep"; return "$MEASURE_BASELINE_QUALITY_RC"; }
+    measure_sweep() { events+=" $1:control+sweep"; return "$MEASURE_PATH_QUALITY_RC"; }
     persist_current_tuning() { events+=' persist'; }
     if auto_tune_run_transaction eth0 balanced mixed 0 100 1 >/dev/null 2>&1; then fail "all-bad public peer transaction reported success"; fi
-    assert_eq ' begin mark prepare bad-a.example:baseline+sweep bad-b.example:baseline+sweep rollback' "$events" "all-bad public peer rollback"
-    [[ "$events" != *persist* && "$events" != *commit* ]] || fail "all-bad public peer transaction persisted or committed"
+    assert_eq ' begin mark prepare dirty-a.example:control+sweep dirty-b.example:control+sweep rollback' "$events" "all-dirty public peer rollback"
+    [[ "$events" != *persist* && "$events" != *commit* ]] || fail "all-dirty public peer transaction persisted or committed"
 )
 
 write_auto_summary() {
@@ -298,9 +301,9 @@ run_test test_single_ipv6_nhid_default_passes
 run_test test_fibmatch_single_nhid_passes
 run_test test_nhid_exact_get_dump_fallback
 run_test test_nhid_fail_closed_matrix
-run_test test_bad_baseline_is_inconclusive_and_low_confidence
-run_test test_public_bad_baseline_restarts_on_next_peer
-run_test test_all_public_bad_rolls_back_without_persisting
+run_test test_dirty_path_control_is_inconclusive_and_low_confidence
+run_test test_public_dirty_path_restarts_on_next_peer
+run_test test_all_public_dirty_rolls_back_without_persisting
 run_test test_final_verification_fallback_boundaries
 run_test test_local_fallback_rechecks_frozen_path
 printf 'v8.0.4 regression tests: PASS\n'
