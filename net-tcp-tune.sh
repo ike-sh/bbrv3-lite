@@ -3,7 +3,7 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="8.0.3"
+SCRIPT_VERSION="8.0.4"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
@@ -388,9 +388,11 @@ default_route_output() {
 }
 
 default_route_interface_for_family() {
-    local family="$1" output
+    local family="$1" output route
     output=$(default_route_output "$family") || return 1
-    route_output_interfaces <<< "$output" | sed -n '1p'
+    route=$(awk '$1=="default" {print; exit}' <<< "$output")
+    [[ -n "$route" ]] || return 0
+    route_unique_path_iface "$route" "IPv${family#-} 默认路由" "${family#-}"
 }
 
 default_route_interface() {
@@ -408,7 +410,7 @@ default_route_count() {
 
 route_output_has_multipath() {
     local output="$1"
-    [[ "$output" == *"nexthop"* ]] && return 0
+    [[ "$output" =~ (^|[[:space:]])nexthop([[:space:]]|$) ]] && return 0
     awk '
         {
             devs=0
@@ -419,9 +421,211 @@ route_output_has_multipath() {
     ' <<< "$output"
 }
 
-route_output_has_unresolved_nhid() {
-    local output="$1"
-    [[ "$output" =~ (^|[[:space:]])nhid([[:space:]]|$) ]]
+route_output_token_values() {
+    local token="$1"
+    awk -v token="$token" '{for (i=1; i<NF; i++) if ($i==token) print $(i+1)}'
+}
+
+route_output_token_count() {
+    local output="$1" token="$2"
+    awk -v token="$token" '{for (i=1; i<=NF; i++) if ($i==token) count++} END {print count+0}' <<< "$output"
+}
+
+route_output_nhids() {
+    route_output_token_values nhid | awk '/^[0-9]+$/ && $0 != "0" && !seen[$0]++'
+}
+
+route_output_via_records() {
+    awk '
+        function family_of(value) {return index(value, ":") ? 6 : 4}
+        {
+            for (i=1; i<NF; i++) {
+                if ($i != "via") continue
+                family=""; value=$(i+1)
+                if (value=="inet" || value=="inet6") {
+                    family=(value=="inet" ? 4 : 6)
+                    if (i+2>NF) continue
+                    value=$(i+2)
+                } else {
+                    family=family_of(value)
+                }
+                print family "\t" value
+            }
+        }
+    ' | awk -F'\t' '!seen[$0]++'
+}
+
+nexthop_object_output() {
+    local id="$1" family="${2:-}" output
+    # iproute2 6.15 can return "Unknown attribute type" for RTM_GETNEXTHOP
+    # against kernels that still provide a usable RTM_GETNEXTHOP dump.  Prefer
+    # the exact lookup, then conservatively select the exact ID from a dump;
+    # the caller still requires exactly one structurally valid record.
+    output=$(ip nexthop get id "$id" 2>/dev/null) || output=""
+    if [[ -z "$output" && ( "$family" == 4 || "$family" == 6 ) ]]; then
+        output=$(ip "-$family" nexthop get id "$id" 2>/dev/null) || output=""
+    fi
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output"
+        return 0
+    fi
+    ip nexthop show 2>/dev/null | awk -v id="$id" '$1=="id" && ($2 "")== (id "") {print}'
+}
+
+# Resolve a route-referenced nexthop object into one ordinary leaf.  Groups are
+# deliberately rejected as a class: even members on the same interface can
+# represent different gateways/hash paths, and accepting a singleton-looking
+# group would require proving concurrent group membership did not change.
+# Output: interface, gateway-or-none, gateway-family-or-none, nhid.
+nexthop_object_leaf_record() {
+    local id="$1" context="$2" expected_family="${3:-}" output line_count object_id
+    local interfaces iface interface_count gateways gateway_count gateway_family gateway
+    is_uint "$id" && (( id > 0 && id <= 4294967295 )) || {
+        die "$context 引用了非法 nexthop object ID: ${id:-missing}"
+        return 1
+    }
+    if ! output=$(nexthop_object_output "$id" "$expected_family") || [[ -z "$output" ]]; then
+        die "$context 引用 nhid $id，但无法解析该 nexthop object；为避免错误选择出口，已停止"
+        return 1
+    fi
+    line_count=$(awk 'NF {count++} END {print count+0}' <<< "$output")
+    if ! is_uint "$line_count" || (( line_count != 1 )); then
+        die "$context 引用 nhid $id，但查询返回了异常的 nexthop object 记录数；已停止"
+        return 1
+    fi
+    object_id=$(awk '$1=="id" {print $2; exit}' <<< "$output")
+    if [[ "$object_id" != "$id" ]] || (( $(route_output_token_count "$output" id) != 1 )); then
+        die "$context 引用 nhid $id，但 nexthop object 身份不一致或结构异常；已停止"
+        return 1
+    fi
+    if [[ "$output" =~ (^|[[:space:]])group([[:space:]]|$) ]]; then
+        die "$context 引用的 nhid $id 是 nexthop group；无法证明唯一 leaf 路径，已停止"
+        return 1
+    fi
+    if [[ "$output" =~ (^|[[:space:]])blackhole([[:space:]]|$) ]]; then
+        die "$context 引用的 nhid $id 是 blackhole；拒绝将其作为网络出口"
+        return 1
+    fi
+    if [[ "$output" =~ (^|[[:space:]])(unresolved|dead|linkdown|trap)([[:space:]]|$) ]] ||
+       [[ "$output" =~ (^|[[:space:]])encap([[:space:]]|$) ]]; then
+        die "$context 引用的 nhid $id 带有无法安全自动处理的状态或封装；已停止"
+        return 1
+    fi
+    interfaces=$(route_output_interfaces <<< "$output")
+    interface_count=$(awk 'NF {count++} END {print count+0}' <<< "$interfaces")
+    if ! is_uint "$interface_count" || (( interface_count != 1 )); then
+        die "$context 引用的 nhid $id 无法解析为唯一出口网卡"
+        return 1
+    fi
+    iface=$(sed -n '1p' <<< "$interfaces")
+    validate_interface_name "$iface" && [[ "$iface" != auto ]] || {
+        die "$context 引用的 nhid $id 返回非法出口网卡: ${iface:-missing}"
+        return 1
+    }
+    gateways=$(route_output_via_records <<< "$output")
+    gateway_count=$(awk 'NF {count++} END {print count+0}' <<< "$gateways")
+    if ! is_uint "$gateway_count" || (( gateway_count > 1 )); then
+        die "$context 引用的 nhid $id 返回多个或异常 gateway；已停止"
+        return 1
+    fi
+    gateway=none; gateway_family=none
+    if (( gateway_count == 1 )); then
+        IFS=$'\t' read -r gateway_family gateway <<< "$gateways"
+        [[ -n "$gateway" && "$gateway" != -* && "$gateway" != *[[:space:]]* ]] || {
+            die "$context 引用的 nhid $id 返回非法 gateway；已停止"
+            return 1
+        }
+        if [[ -n "$expected_family" && "$gateway_family" != "$expected_family" ]]; then
+            die "$context 引用的 nhid $id gateway 地址族为 IPv$gateway_family，与路由 IPv$expected_family 不一致；已停止"
+            return 1
+        fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$iface" "$gateway" "$gateway_family" "$id"
+}
+
+# Validate either a traditional route or a route backed by one nexthop object.
+# This is the single route-uniqueness gate used by default-route selection,
+# route-get/fibmatch, source-bound measurement and path fingerprints.
+# Output: interface, gateway-or-none, gateway-family-or-none, nhid-or-none.
+route_unique_path_record() {
+    local output="$1" context="$2" expected_family="${3:-}" nhid_tokens nhids nhid_count nhid
+    local route_interfaces route_iface_count route_iface route_gateways route_gateway_count
+    local route_gateway_family=none route_gateway=none leaf leaf_iface leaf_gateway leaf_family leaf_id
+    [[ "$expected_family" == "" || "$expected_family" == 4 || "$expected_family" == 6 ]] || return 1
+    [[ -n "$output" ]] || { die "$context 没有返回路由记录"; return 1; }
+    if route_output_has_multipath "$output"; then
+        die "$context 包含 inline ECMP/nexthop；无法证明出口唯一，已停止"
+        return 1
+    fi
+
+    nhid_tokens=$(route_output_token_count "$output" nhid)
+    nhids=$(route_output_nhids <<< "$output")
+    nhid_count=$(awk 'NF {count++} END {print count+0}' <<< "$nhids")
+    if ! is_uint "$nhid_tokens" || ! is_uint "$nhid_count" || (( nhid_tokens != nhid_count || nhid_count > 1 )); then
+        die "$context 包含缺失、重复或非法的 nhid；无法证明出口唯一，已停止"
+        return 1
+    fi
+
+    route_interfaces=$(route_output_interfaces <<< "$output")
+    route_iface_count=$(awk 'NF {count++} END {print count+0}' <<< "$route_interfaces")
+    if ! is_uint "$route_iface_count" || (( route_iface_count > 1 )); then
+        die "$context 无法确定唯一出口网卡"
+        return 1
+    fi
+    [[ "$route_iface_count" == 0 ]] || route_iface=$(sed -n '1p' <<< "$route_interfaces")
+    if [[ -n "${route_iface:-}" ]]; then
+        validate_interface_name "$route_iface" && [[ "$route_iface" != auto ]] || {
+            die "$context 返回非法出口网卡: $route_iface"
+            return 1
+        }
+    fi
+
+    route_gateways=$(route_output_via_records <<< "$output")
+    route_gateway_count=$(awk 'NF {count++} END {print count+0}' <<< "$route_gateways")
+    if ! is_uint "$route_gateway_count" || (( route_gateway_count > 1 )); then
+        die "$context 返回多个或异常 gateway；无法证明路径唯一"
+        return 1
+    fi
+    if (( route_gateway_count == 1 )); then
+        IFS=$'\t' read -r route_gateway_family route_gateway <<< "$route_gateways"
+        if [[ -n "$expected_family" && "$route_gateway_family" != "$expected_family" ]]; then
+            die "$context gateway 地址族为 IPv$route_gateway_family，与路由 IPv$expected_family 不一致；已停止"
+            return 1
+        fi
+    fi
+
+    if (( nhid_count == 0 )); then
+        (( route_iface_count == 1 )) || { die "$context 无法确定唯一出口网卡"; return 1; }
+        printf '%s\t%s\t%s\tnone\n' "$route_iface" "$route_gateway" "$route_gateway_family"
+        return 0
+    fi
+
+    nhid=$(sed -n '1p' <<< "$nhids")
+    leaf=$(nexthop_object_leaf_record "$nhid" "$context" "$expected_family") || return 1
+    IFS=$'\t' read -r leaf_iface leaf_gateway leaf_family leaf_id <<< "$leaf"
+    if [[ -n "${route_iface:-}" && "$route_iface" != "$leaf_iface" ]]; then
+        die "$context 的 route dev $route_iface 与 nhid $nhid leaf dev $leaf_iface 不一致；已停止"
+        return 1
+    fi
+    if [[ "$route_gateway" != none && "$leaf_gateway" == none ]]; then
+        die "$context 显示 gateway $route_gateway，但 nhid $nhid leaf 没有 gateway；已停止"
+        return 1
+    fi
+    if [[ "$route_gateway" != none && "$route_gateway" != "$leaf_gateway" ]]; then
+        die "$context 的 route gateway $route_gateway 与 nhid $nhid leaf gateway $leaf_gateway 不一致；已停止"
+        return 1
+    fi
+    if [[ "$route_gateway_family" != none && "$leaf_family" != none && "$route_gateway_family" != "$leaf_family" ]]; then
+        die "$context 的 route/nhid gateway 地址族不一致；已停止"
+        return 1
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$leaf_iface" "$leaf_gateway" "$leaf_family" "$leaf_id"
+}
+
+route_unique_path_iface() {
+    local record
+    record=$(route_unique_path_record "$@") || return 1
+    cut -f1 <<< "$record"
 }
 
 default_route_has_multipath() {
@@ -450,7 +654,7 @@ resolve_route_target_addresses() {
 }
 
 target_route_records() {
-    local target="$1" family address output fibmatch iface fib_iface dev_count fib_dev_count addresses
+    local target="$1" family address output fibmatch iface fib_iface addresses
     local resolved_count=0 verified_count=0
     addresses=$(resolve_route_target_addresses "$target") || return 1
     [[ -n "$addresses" ]] || { die "无法解析测速目标 $target 的任何路由候选地址"; return 1; }
@@ -461,21 +665,7 @@ target_route_records() {
             die "测速目标 $address 无法完成 route-get；所有解析候选都必须可核验，已停止"
             return 1
         fi
-        if route_output_has_unresolved_nhid "$output"; then
-            die "测速目标 $address 的 route-get 包含未解析的 nexthop object (nhid)；无法证明出口唯一，已停止"
-            return 1
-        fi
-        if route_output_has_multipath "$output"; then
-            die "测速目标 $address 的 route-get 返回 ECMP/nexthop；v${SCRIPT_VERSION} 不会在多路径上自动调优"
-            return 1
-        fi
-        dev_count=$(route_output_interfaces <<< "$output" | wc -l | awk '{print $1}')
-        if ! is_uint "${dev_count:-}" || (( dev_count != 1 )); then
-            die "测速目标 $address 的 route-get 无法确定唯一出口"
-            return 1
-        fi
-        iface=$(route_output_interfaces <<< "$output" | sed -n '1p')
-        validate_interface_name "$iface" || { die "测速目标 $address 返回非法出口网卡: $iface"; return 1; }
+        iface=$(route_unique_path_iface "$output" "测速目标 $address 的 route-get" "$family") || return 1
 
         # `route get` can hash an ECMP route and expose only one selected dev.
         # fibmatch returns the underlying FIB entry (including its nexthops).
@@ -483,21 +673,7 @@ target_route_records() {
             die "当前 iproute2 无法用 fibmatch 核验测速目标 $address；不完整的 route-show fallback 不能证明策略路由出口，已停止"
             return 1
         fi
-        if route_output_has_unresolved_nhid "$fibmatch"; then
-            die "测速目标 $address 的 FIB 匹配包含未解析的 nexthop object (nhid)；无法证明出口唯一，已停止"
-            return 1
-        fi
-        if route_output_has_multipath "$fibmatch"; then
-            die "测速目标 $address 的 FIB 匹配包含 ECMP/nexthop；v${SCRIPT_VERSION} 不会自动选择其中一条路径"
-            return 1
-        fi
-        fib_dev_count=$(route_output_interfaces <<< "$fibmatch" | wc -l | awk '{print $1}')
-        if ! is_uint "${fib_dev_count:-}" || (( fib_dev_count != 1 )); then
-            die "测速目标 $address 的 fibmatch 无法确定唯一出口"
-            return 1
-        fi
-        fib_iface=$(route_output_interfaces <<< "$fibmatch" | sed -n '1p')
-        validate_interface_name "$fib_iface" || { die "测速目标 $address 的 fibmatch 返回非法出口网卡: $fib_iface"; return 1; }
+        fib_iface=$(route_unique_path_iface "$fibmatch" "测速目标 $address 的 fibmatch" "$family") || return 1
         [[ "$fib_iface" == "$iface" ]] || {
             die "测速目标 $address 的 route-get/fibmatch 出口不一致（$iface/$fib_iface）；无法证明路径稳定，已停止"
             return 1
@@ -516,7 +692,7 @@ target_route_records() {
 # measurement freezes one literal/source/interface tuple. Ambiguous paths fail
 # closed and no route is altered.
 auto_tune_route_guard() {
-    local expected_iface="$1" target="${2:-}" family output count v4_iface v6_iface records
+    local expected_iface="$1" target="${2:-}" family output count v4_iface v6_iface records route route_iface
     local route_family address iface first_iface=""
     validate_interface_name "$expected_iface" || { die "自动调优选中了非法网卡: $expected_iface"; return 1; }
 
@@ -542,14 +718,15 @@ auto_tune_route_guard() {
     for family in -4 -6; do
         output=$(default_route_output "$family") || return 1
         count=$(awk '$1=="default" {count++} END {print count+0}' <<< "$output")
-        if route_output_has_unresolved_nhid "$output"; then
-            die "IPv${family#-} 默认路由包含未解析的 nexthop object (nhid)；无法证明出口唯一，已停止"
-            return 1
-        fi
-        if [[ "$output" == *"nexthop"* ]] || default_route_has_multipath "$family"; then
+        if default_route_has_multipath "$family"; then
             die "IPv${family#-} 默认路由包含 ECMP/nexthop；v${SCRIPT_VERSION} 不会自动选择其中一条路径"
             return 1
         fi
+        while IFS= read -r route; do
+            [[ -n "$route" && "$route" =~ (^|[[:space:]])nhid([[:space:]]|$) ]] || continue
+            route_iface=$(route_unique_path_iface "$route" "IPv${family#-} 默认路由" "${family#-}") || return 1
+            [[ -n "$route_iface" ]] || return 1
+        done <<< "$output"
         if (( count > 1 )); then
             log WARN "检测到 ${count} 条 IPv${family#-} 默认路由；将以具体测速目标的 route-get 结果决定是否可安全继续"
         fi
@@ -941,7 +1118,7 @@ path_hash_payload() {
 path_capture_route_identity() {
     local family="$1" address="$2" source="$3" iface="$4"
     local route fib route_norm fib_norm gateway table iface_mtu route_mtu route_payload
-    local route_fp endpoint_fp route_iface fib_iface
+    local route_fp endpoint_fp route_state fib_state route_iface fib_iface
     [[ "$family" == 4 || "$family" == 6 ]] || return 1
     measure_source_address_is_valid "$family" "$source" || return 1
     validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
@@ -949,8 +1126,10 @@ path_capture_route_identity() {
     route=$(ip "-$family" route get "$address" from "$source" 2>/dev/null) || return 1
     fib=$(ip "-$family" route get fibmatch "$address" from "$source" 2>/dev/null) || return 1
     [[ -n "$route" && -n "$fib" ]] || return 1
-    route_iface=$(measure_unique_route_iface "$route" "路径指纹 route-get") || return 1
-    fib_iface=$(measure_unique_route_iface "$fib" "路径指纹 fibmatch") || return 1
+    route_state=$(route_unique_path_record "$route" "路径指纹 route-get" "$family") || return 1
+    fib_state=$(route_unique_path_record "$fib" "路径指纹 fibmatch" "$family") || return 1
+    route_iface=$(cut -f1 <<< "$route_state")
+    fib_iface=$(cut -f1 <<< "$fib_state")
     [[ "$route_iface" == "$iface" && "$fib_iface" == "$iface" ]] || {
         die "路径指纹出口与冻结网卡不一致（route=$route_iface, fib=$fib_iface, expected=$iface）"
         return 1
@@ -965,8 +1144,8 @@ path_capture_route_identity() {
     route_mtu=$(path_token_after mtu <<< "$route")
     if ! is_uint "${route_mtu:-}"; then route_mtu="$iface_mtu"; fi
 
-    route_payload=$(printf 'family=%s\nsource=%s\ninterface=%s\ngateway=%s\ntable=%s\ninterface_mtu=%s\nroute_mtu=%s\nroute=%s\nfib=%s\n' \
-        "$family" "$source" "$iface" "$gateway" "$table" "$iface_mtu" "$route_mtu" "$route_norm" "$fib_norm") || return 1
+    route_payload=$(printf 'family=%s\nsource=%s\ninterface=%s\ngateway=%s\ntable=%s\ninterface_mtu=%s\nroute_mtu=%s\nroute_state=%s\nfib_state=%s\nroute=%s\nfib=%s\n' \
+        "$family" "$source" "$iface" "$gateway" "$table" "$iface_mtu" "$route_mtu" "$route_state" "$fib_state" "$route_norm" "$fib_norm") || return 1
     route_fp=$(path_hash_payload <<< "$route_payload") || return 1
     endpoint_fp=$(printf '%saddress=%s\n' "$route_payload" "$address" | path_hash_payload) || return 1
     [[ "$route_fp" =~ ^[0-9a-f]{64}$ && "$endpoint_fp" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -4582,6 +4761,7 @@ MEASURE_PEER_PORT=""
 IPERF_DATA_RC=65
 IPERF_CONTAMINATED_RC=66
 IPERF_UNSTABLE_RC=67
+MEASURE_BASELINE_QUALITY_RC=68
 IPERF_UNAVAILABLE_RC=75
 PUBLIC_PEER_CANDIDATES=()
 
@@ -4860,23 +5040,7 @@ measure_source_address_is_valid() {
 }
 
 measure_unique_route_iface() {
-    local output="$1" context="$2" iface count
-    if route_output_has_unresolved_nhid "$output"; then
-        die "$context 包含未解析的 nexthop object (nhid)；测速路径不再唯一"
-        return 1
-    fi
-    if route_output_has_multipath "$output"; then
-        die "$context 包含 ECMP/nexthop；测速路径不再唯一"
-        return 1
-    fi
-    count=$(route_output_interfaces <<< "$output" | awk 'END {print NR+0}')
-    if ! is_uint "${count:-}" || (( count != 1 )); then
-        die "$context 无法确定唯一出口网卡"
-        return 1
-    fi
-    iface=$(route_output_interfaces <<< "$output" | sed -n '1p')
-    validate_interface_name "$iface" || { die "$context 返回非法出口网卡: $iface"; return 1; }
-    printf '%s\n' "$iface"
+    route_unique_path_iface "$1" "$2" "${3:-}"
 }
 
 # Revalidate one already-resolved literal through the platform's strict
@@ -4902,7 +5066,7 @@ measure_capture_route_state() {
         die "测速地址 $address 无法取得 route-get 来源地址"
         return 1
     fi
-    iface=$(measure_unique_route_iface "$output" "测速地址 $address 的 route-get") || return 1
+    iface=$(measure_unique_route_iface "$output" "测速地址 $address 的 route-get" "$family") || return 1
     [[ "$iface" == "$expected_iface" ]] || {
         die "测速地址 $address 的出口已从 $expected_iface 漂移到 $iface"
         return 1
@@ -4927,7 +5091,7 @@ measure_capture_route_state() {
         die "测速地址 $address 无法用冻结来源地址 $source 完成 route-get"
         return 1
     fi
-    bound_iface=$(measure_unique_route_iface "$bound_output" "测速地址 $address 的来源绑定 route-get") || return 1
+    bound_iface=$(measure_unique_route_iface "$bound_output" "测速地址 $address 的来源绑定 route-get" "$family") || return 1
     [[ "$bound_iface" == "$expected_iface" ]] || {
         die "绑定来源地址 $source 后，测速出口从 $expected_iface 变为 $bound_iface"
         return 1
@@ -4936,7 +5100,7 @@ measure_capture_route_state() {
         die "无法用 fibmatch 核验测速地址 $address 的来源绑定路径"
         return 1
     fi
-    bound_fib_iface=$(measure_unique_route_iface "$bound_fibmatch" "测速地址 $address 的来源绑定 fibmatch") || return 1
+    bound_fib_iface=$(measure_unique_route_iface "$bound_fibmatch" "测速地址 $address 的来源绑定 fibmatch" "$family") || return 1
     [[ "$bound_fib_iface" == "$expected_iface" ]] || {
         die "绑定来源地址 $source 后，测速 fibmatch 出口从 $expected_iface 变为 $bound_fib_iface"
         return 1
@@ -5589,6 +5753,12 @@ loss_spike() {
     }'
 }
 
+baseline_retrans_too_high() {
+    local value="$1" threshold="$2"
+    is_decimal "$value" && is_decimal "$threshold" || return 0
+    awk -v v="$value" -v t="$threshold" 'BEGIN {limit=t*10; if(limit<1)limit=1; exit !(v>limit)}'
+}
+
 minimum_efficiency_ratio() {
     local goodput="$1" rate="$2"
     awk -v g="$goodput" -v r="$rate" 'BEGIN {
@@ -5712,7 +5882,10 @@ measure_sweep() {
     local last_ok="" last_ok_gp="" broke_at="" fine_start fine_step recommend="" candidate="" confirm_row confirm_gp="" confirm_loss=""
     local min_efficiency="0.90" confirmed=0 reject_reason="" estimated tests rc=0 no_knee=0 above_cap=0 baseline_duration
     local auto_cap=0 nominal_was_auto=0 observed_cap
+    local baseline_quality=unknown scan_decision=inconclusive no_knee_reason=""
     local confidence_row confidence confidence_score confidence_grade confidence_reasons
+    local sample_confidence_score sample_confidence_grade sample_confidence_reasons
+    local decision_confidence_score decision_confidence_grade decision_confidence_reasons
     validate_peer "$peer" "$port" || return 1
     [[ "$result_mode" == manual || "$result_mode" == auto ]] || { die "扫描结果模式只支持 manual/auto"; return 1; }
     for value in "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$force_scan" "$cap"; do is_uint "$value" || { die "扫描参数必须为非负整数"; return 1; }; done
@@ -5742,7 +5915,21 @@ measure_sweep() {
         rc=1
     elif baseline_row=$(sample_repeated "$peer" "$port" "$baseline_duration" 1 2 unshaped 3 6); then
         baseline_gp=$(cut -f1 <<< "$baseline_row"); baseline_loss=$(cut -f4 <<< "$baseline_row")
-        if (( auto_cap )); then
+        if baseline_retrans_too_high "$baseline_loss" "$threshold"; then
+            if (( force_scan )); then
+                baseline_quality=forced-bad
+                log WARN "不限速路径重传估算 ${baseline_loss}% 过高；已按 --force-scan 继续，结论置信度将强制降级"
+            else
+                baseline_quality=bad
+                scan_decision=inconclusive-bad-baseline
+                reject_reason="baseline-retrans-too-high"
+                log WARN "不限速路径重传估算 ${baseline_loss}% 过高，无法可靠定位 policer；本次 peer/path 结论为 inconclusive"
+                rc="$MEASURE_BASELINE_QUALITY_RC"
+            fi
+        else
+            baseline_quality=good
+        fi
+        if (( rc == 0 && auto_cap )); then
             if observed_cap=$(expanded_scan_cap "$cap" "$baseline_gp"); then
                 if (( observed_cap > cap )); then
                     log INFO "根据不限速基准将扫描上限从 ${cap} 调整为 ${observed_cap} Mbit/s"
@@ -5754,7 +5941,8 @@ measure_sweep() {
         fi
         if (( rc == 0 )); then
             if awk -v g="$baseline_gp" -v c="$cap" 'BEGIN {exit !(g>c)}'; then
-                above_cap=1; no_knee=1
+                above_cap=1; no_knee=1; no_knee_reason=above-scan-cap
+                if [[ "$baseline_quality" == good ]]; then scan_decision=no-knee-clean; else scan_decision=no-knee-forced; fi
                 log WARN "不限速单流达到 ${baseline_gp} Mbit/s，超过扫描上限 ${cap} Mbit/s；跳过整形扫描"
             fi
             (( nominal > 0 )) || nominal=$(awk -v g="$baseline_gp" 'BEGIN {printf "%d", g+0.5}')
@@ -5796,9 +5984,6 @@ measure_sweep() {
 
         if (( above_cap )); then
             :
-        elif (( ! force_scan )) && awk -v v="$baseline_loss" -v t="$threshold" 'BEGIN {limit=t*10; if(limit<1)limit=1; exit !(v>limit)}'; then
-            no_knee=1
-            log WARN "不限速路径重传估算 ${baseline_loss}% 过高，无法可靠定位 policer；更换对端或使用 --force-scan"
         else
             apply_shaping "$iface" "$low" || rc=$?
             if (( rc == 0 )); then
@@ -5864,28 +6049,44 @@ measure_sweep() {
                 fi
             elif (( rc == 0 )); then
                 no_knee=1
+                no_knee_reason=scan-complete-no-knee
+                if [[ "$baseline_quality" == good ]]; then scan_decision=no-knee-clean; else scan_decision=no-knee-forced; fi
                 log WARN "扫描到上界仍未发现拐点，不建议基于本次结果启用整形"
             fi
         fi
     fi
 
-    if (( rc == 0 )); then
-        printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nHARDWARE_CLASS\t%s\nLINK_MBIT\t%s\nRX_QUEUES\t%s\nTX_QUEUES\t%s\nSCAN_CAP_MBIT\t%s\nSAMPLE_DURATION_SECONDS\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nCLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nMIN_EFFICIENCY_RATIO\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nCANDIDATE\t%s\nCONFIRM_MBIT\t%s\nCONFIRM_RETRANS_RATIO_EST_PERCENT\t%s\nCONFIRMED\t%s\nREJECT_REASON\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nABOVE_CAP\t%s\n' \
+    if (( rc == 0 )) && [[ -n "${recommend:-}" ]]; then scan_decision=recommend; fi
+    if (( rc == 0 )) && [[ "$reject_reason" == confirmation-failed ]]; then scan_decision=inconclusive-confirmation; fi
+
+    if (( rc == 0 || rc == MEASURE_BASELINE_QUALITY_RC )); then
+        printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nHARDWARE_CLASS\t%s\nLINK_MBIT\t%s\nRX_QUEUES\t%s\nTX_QUEUES\t%s\nSCAN_CAP_MBIT\t%s\nSAMPLE_DURATION_SECONDS\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nCLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t%s\nBASELINE_QUALITY\t%s\nSCAN_DECISION\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nMIN_EFFICIENCY_RATIO\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nCANDIDATE\t%s\nCONFIRM_MBIT\t%s\nCONFIRM_RETRANS_RATIO_EST_PERCENT\t%s\nCONFIRMED\t%s\nREJECT_REASON\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nNO_KNEE_REASON\t%s\nABOVE_CAP\t%s\n' \
             "$peer" "$port" "$iface" "$HARDWARE_CLASS" "$HARDWARE_LINK_MBIT" "$HARDWARE_RX_QUEUES" "$HARDWARE_TX_QUEUES" "$cap" "$duration" \
-            "${baseline_gp:-}" "${baseline_loss:-}" "${base_loss:-0}" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$above_cap" > "$dir/summary.tsv"
+            "${baseline_gp:-}" "${baseline_loss:-}" "${base_loss:-0}" "$baseline_quality" "$scan_decision" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$no_knee_reason" "$above_cap" > "$dir/summary.tsv"
         confidence_row="${confirm_row:-${baseline_row:-}}"
         if [[ -n "$confidence_row" ]]; then
             confidence=$(measurement_confidence "$(cut -f13 <<< "$confidence_row")" "$(cut -f12 <<< "$confidence_row")" "$(cut -f7 <<< "$confidence_row")" "$(cut -f11 <<< "$confidence_row")" 0 "$PATH_PROFILE_SCORE")
-            IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
+            IFS=$'\t' read -r sample_confidence_score sample_confidence_grade sample_confidence_reasons <<< "$confidence"
         else
-            confidence_score=0; confidence_grade=low; confidence_reasons=no-usable-sample
+            sample_confidence_score=0; sample_confidence_grade=low; sample_confidence_reasons=no-usable-sample
         fi
-        printf 'IDLE_RTT_MS\t%s\nUNSHAPED_RETRANS_PER_GIB\t%s\nUNSHAPED_LOADED_RTT_P95_MS\t%s\nUNSHAPED_BUFFERBLOAT_P95_MS\t%s\nUNSHAPED_BACKGROUND_TX_PERCENT_MAX\t%s\nUNSHAPED_CPU_BUSY_PERCENT_MAX\t%s\nUNSHAPED_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_RETRANS_PER_GIB\t%s\nCONFIRM_LOADED_RTT_P95_MS\t%s\nCONFIRM_BUFFERBLOAT_P95_MS\t%s\nCONFIRM_BACKGROUND_TX_PERCENT_MAX\t%s\nCONFIRM_CPU_BUSY_PERCENT_MAX\t%s\nCONFIRM_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_GOODPUT_SPREAD_PERCENT\t%s\nCONFIRM_SAMPLE_COUNT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
+        if [[ "$scan_decision" == inconclusive-* || "$baseline_quality" == forced-bad ]]; then
+            decision_confidence_score=0; decision_confidence_grade=low
+            decision_confidence_reasons="${reject_reason:-baseline-retrans-too-high}"
+            confidence_score="$decision_confidence_score"; confidence_grade="$decision_confidence_grade"; confidence_reasons="$decision_confidence_reasons"
+        else
+            decision_confidence_score="$sample_confidence_score"; decision_confidence_grade="$sample_confidence_grade"
+            decision_confidence_reasons="$sample_confidence_reasons"
+            confidence_score="$sample_confidence_score"; confidence_grade="$sample_confidence_grade"; confidence_reasons="$sample_confidence_reasons"
+        fi
+        printf 'IDLE_RTT_MS\t%s\nUNSHAPED_RETRANS_PER_GIB\t%s\nUNSHAPED_LOADED_RTT_P95_MS\t%s\nUNSHAPED_BUFFERBLOAT_P95_MS\t%s\nUNSHAPED_BACKGROUND_TX_PERCENT_MAX\t%s\nUNSHAPED_CPU_BUSY_PERCENT_MAX\t%s\nUNSHAPED_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_RETRANS_PER_GIB\t%s\nCONFIRM_LOADED_RTT_P95_MS\t%s\nCONFIRM_BUFFERBLOAT_P95_MS\t%s\nCONFIRM_BACKGROUND_TX_PERCENT_MAX\t%s\nCONFIRM_CPU_BUSY_PERCENT_MAX\t%s\nCONFIRM_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_GOODPUT_SPREAD_PERCENT\t%s\nCONFIRM_SAMPLE_COUNT\t%s\nSAMPLE_CONFIDENCE_SCORE\t%s\nSAMPLE_CONFIDENCE_GRADE\t%s\nSAMPLE_CONFIDENCE_REASONS\t%s\nDECISION_CONFIDENCE_SCORE\t%s\nDECISION_CONFIDENCE_GRADE\t%s\nDECISION_CONFIDENCE_REASONS\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
             "$MEASURE_IDLE_RTT_MS" "$(cut -f5 <<< "${baseline_row:-}")" "$(cut -f7 <<< "${baseline_row:-}")" "$(cut -f14 <<< "${baseline_row:-}")" \
             "$(cut -f8 <<< "${baseline_row:-}")" "$(cut -f9 <<< "${baseline_row:-}")" "$(cut -f10 <<< "${baseline_row:-}")" \
             "$(cut -f5 <<< "${confirm_row:-}")" "$(cut -f7 <<< "${confirm_row:-}")" "$(cut -f14 <<< "${confirm_row:-}")" \
             "$(cut -f8 <<< "${confirm_row:-}")" "$(cut -f9 <<< "${confirm_row:-}")" "$(cut -f10 <<< "${confirm_row:-}")" \
             "$(cut -f12 <<< "${confirm_row:-}")" "$(cut -f13 <<< "${confirm_row:-}")" \
+            "$sample_confidence_score" "$sample_confidence_grade" "$sample_confidence_reasons" \
+            "$decision_confidence_score" "$decision_confidence_grade" "$decision_confidence_reasons" \
             "$confidence_score" "$confidence_grade" "$confidence_reasons" >> "$dir/summary.tsv"
         measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         if [[ -n "${recommend:-}" ]]; then
@@ -5896,7 +6097,11 @@ measure_sweep() {
                 log INFO "确认业务表现后执行: ${0##*/} tc enable ${recommend} --knee ${broke_at:-0} --margin ${margin} --interface ${requested}"
             fi
         fi
-        log INFO "扫描置信度: ${confidence_grade} (${confidence_score}/100, ${confidence_reasons})"
+        if [[ "$scan_decision" == inconclusive-* ]]; then
+            log WARN "扫描结论: inconclusive（${decision_confidence_reasons}）；不会生成或持久化 measurement-derived 参数"
+        else
+            log INFO "扫描结论: ${scan_decision}；决策置信度 ${decision_confidence_grade} (${decision_confidence_score}/100, ${decision_confidence_reasons})"
+        fi
         log INFO "完整结果: $dir"
     fi
     traffic_report "$iface"
@@ -11196,7 +11401,8 @@ auto_measure_with_peer_failover() {
                 :
             else
                 rc=$?
-                if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == 2) )); then
+                if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == MEASURE_BASELINE_QUALITY_RC || rc == 2) )); then
+                    (( rc != MEASURE_BASELINE_QUALITY_RC )) || log WARN "当前公共对端 baseline 质量不足；将丢弃本次结果并在下一个候选上重新执行完整 sweep"
                     (( index + 1 < count )) && continue
                     break
                 fi
@@ -11208,19 +11414,21 @@ auto_measure_with_peer_failover() {
             WIZARD_SWEEP_PEER="$WIZARD_PEER"
             WIZARD_SWEEP_PORT="$WIZARD_PORT"
             WIZARD_SWEEP_ADDRESS="${WIZARD_PEER_ADDRESS:-}"
+            WIZARD_SWEEP_FAMILY="${WIZARD_PEER_FAMILY:-}"
             WIZARD_SWEEP_SOURCE="${WIZARD_PEER_SOURCE:-}"
             WIZARD_SWEEP_IFACE="${WIZARD_PEER_IFACE:-$iface}"
             return 0
         else
             rc=$?
         fi
-        if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == 2) )); then
+        if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == MEASURE_BASELINE_QUALITY_RC || rc == 2) )); then
+            (( rc != MEASURE_BASELINE_QUALITY_RC )) || log WARN "当前公共对端 baseline 质量不足；将丢弃本次结果并在下一个候选上重新执行完整 sweep"
             (( index + 1 < count )) && continue
             break
         fi
         return "$rc"
     done
-    die "所有已预检的公共 iperf3 对端都不可用或不适合当前路径；请稍后重试或使用自有服务器"
+    die "所有公共 iperf3 对端均不可用或当前路径质量不足，无法可靠完成自动扫描；请稍后重试或使用自有 iperf3 服务器"
     return 1
 }
 
@@ -11261,9 +11469,49 @@ auto_verify_with_peer_failover() {
     return "$IPERF_UNAVAILABLE_RC"
 }
 
+auto_verify_local_fq_fallback() {
+    local iface="$1" expected_path_fingerprint="$2" expected_endpoint_fingerprint="$3"
+    local family="${WIZARD_SWEEP_FAMILY:-${WIZARD_PEER_FAMILY:-}}"
+    local address="${WIZARD_SWEEP_ADDRESS:-}" source="${WIZARD_SWEEP_SOURCE:-}"
+    local sweep_iface="${WIZARD_SWEEP_IFACE:-$iface}" state route_fp endpoint_fp
+    [[ "$family" == 4 || "$family" == 6 ]] || { die "本地降级复验缺少合法地址族"; return 1; }
+    measure_source_address_is_valid "$family" "$address" || { die "本地降级复验缺少合法测速地址"; return 1; }
+    measure_source_address_is_valid "$family" "$source" || { die "本地降级复验缺少合法来源地址"; return 1; }
+    [[ "$sweep_iface" == "$iface" ]] || { die "本地降级复验网卡与 sweep 网卡不一致"; return 1; }
+    [[ "$expected_path_fingerprint" =~ ^[0-9a-f]{64}$ && "$expected_endpoint_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+        die "本地降级复验缺少可信 sweep 路径指纹"
+        return 1
+    }
+
+    verify_runtime_tuning "$iface" || return 1
+    auto_tune_route_guard "$iface" "$address" || return 1
+    state=$(path_capture_route_identity "$family" "$address" "$source" "$iface") || {
+        die "本地降级复验无法重新建立网络路径指纹"
+        return 1
+    }
+    IFS=$'\t' read -r route_fp endpoint_fp _ <<< "$state"
+    [[ "$route_fp" == "$expected_path_fingerprint" && "$endpoint_fp" == "$expected_endpoint_fingerprint" ]] || {
+        die "本地降级复验检测到 route/path fingerprint 改变；拒绝提交"
+        return 1
+    }
+    if ! ping "-$family" -I "$iface" -I "$source" -n -W 2 -c 3 -- "$address" >/dev/null 2>&1; then
+        die "本地降级复验未能确认冻结路径的网络连通性；拒绝提交"
+        return 1
+    fi
+    state=$(path_capture_route_identity "$family" "$address" "$source" "$iface") || return 1
+    IFS=$'\t' read -r route_fp endpoint_fp _ <<< "$state"
+    [[ "$route_fp" == "$expected_path_fingerprint" && "$endpoint_fp" == "$expected_endpoint_fingerprint" ]] || {
+        die "连通性检查后 route/path fingerprint 改变；拒绝提交"
+        return 1
+    }
+    verify_runtime_tuning "$iface" || return 1
+    printf '%s\t%s\n' "$route_fp" "$endpoint_fp"
+}
+
 auto_tune_execute() {
     local iface="$1" profile="$2" role="$3" nominal="$4" tuning_rtt="$5" peer_rtt="${6:-0}"
     local summary recommend knee measured no_knee confirmed reject_reason min_efficiency baseline_loss expected_rate=0
+    local baseline_quality scan_decision verify_rc local_verify_state final_verify_mode=iperf final_verify_degraded=0 final_verify_reason=none
     local role_floor rtt_source verify_summary verify_confidence_score verify_confidence_grade verify_confidence_reasons
     local sweep_path_fingerprint verify_path_fingerprint sweep_endpoint_fingerprint verify_endpoint_fingerprint path_rtt
     prepare_auto_tuning_runtime "$iface" "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" || return 1
@@ -11298,6 +11546,8 @@ auto_tune_execute() {
     knee=$(summary_value "$summary" BROKE_AT); knee="${knee:-0}"
     measured=$(summary_value "$summary" UNSHAPED_MBIT)
     no_knee=$(summary_value "$summary" NO_KNEE)
+    baseline_quality=$(summary_value "$summary" BASELINE_QUALITY)
+    scan_decision=$(summary_value "$summary" SCAN_DECISION)
     confirmed=$(summary_value "$summary" CONFIRMED)
     reject_reason=$(summary_value "$summary" REJECT_REASON)
     min_efficiency=$(summary_value "$summary" MIN_EFFICIENCY_RATIO); min_efficiency="${min_efficiency:-0.90}"
@@ -11310,6 +11560,21 @@ auto_tune_execute() {
     if [[ -n "$reject_reason" || ( -n "$knee" && "$knee" != 0 && "$confirmed" != 1 ) ]]; then
         die "扫描候选值未通过确认测试（${reject_reason:-unconfirmed}），不会应用或持久化"
         return 2
+    fi
+    [[ "$baseline_quality" == good ]] || {
+        die "扫描 baseline 质量不是 good（${baseline_quality:-missing}）；不会应用或持久化 measurement-derived 参数"
+        return "$MEASURE_BASELINE_QUALITY_RC"
+    }
+    if [[ -n "$recommend" ]]; then
+        [[ "$scan_decision" == recommend && "$confirmed" == 1 ]] || {
+            die "扫描推荐值缺少一致的决策状态；不会应用或持久化"
+            return 2
+        }
+    else
+        [[ "$scan_decision" == no-knee-clean && "$no_knee" == 1 ]] || {
+            die "无整形推荐的扫描结果不是可信 NO_KNEE；不会应用或持久化"
+            return 2
+        }
     fi
     if [[ -n "$measured" && "$tuning_rtt" -gt 0 ]]; then
         nic_stage_candidate_global_model "$iface" adaptive "$role" "$(awk -v g="$measured" 'BEGIN {printf "%d", g+0.5}')" "$tuning_rtt" || return 1
@@ -11325,47 +11590,65 @@ auto_tune_execute() {
         log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
     fi
     verify_runtime_tuning "$iface" || return 1
-    auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss" || return $?
-    verify_summary="$MEASURE_RUN_DIR/summary.tsv"
-    verify_path_fingerprint=$(summary_value "$verify_summary" PATH_ROUTE_FINGERPRINT)
-    [[ "$verify_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
-        die "最终复验缺少合法网络路径指纹；不会持久化"
-        return 1
-    }
-    verify_endpoint_fingerprint=$(summary_value "$verify_summary" PATH_ENDPOINT_FINGERPRINT)
-    [[ "$verify_endpoint_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
-        die "最终复验缺少合法测速端点指纹；不会持久化"
-        return 1
-    }
-    [[ "$verify_endpoint_fingerprint" == "$sweep_endpoint_fingerprint" ]] || {
-        die "扫描与最终复验使用了不同测速端点；拒绝把跨端点结果持久化"
-        return 2
-    }
-    [[ "$verify_path_fingerprint" == "$sweep_path_fingerprint" ]] || {
-        die "扫描与最终复验经过不同网络路径；拒绝把跨路径结果持久化"
-        return 2
-    }
-    verify_confidence_score=$(summary_value "$verify_summary" CONFIDENCE_SCORE); verify_confidence_score="${verify_confidence_score:-0}"
-    verify_confidence_grade=$(summary_value "$verify_summary" CONFIDENCE_GRADE); verify_confidence_grade="${verify_confidence_grade:-unknown}"
-    verify_confidence_reasons=$(summary_value "$verify_summary" CONFIDENCE_REASONS); verify_confidence_reasons="${verify_confidence_reasons:-unavailable}"
-    if (( ${WIZARD_FAILOVERS:-0} > 0 )) && is_uint "$verify_confidence_score"; then
-        verify_confidence_score=$((verify_confidence_score - 10)); (( verify_confidence_score < 0 )) && verify_confidence_score=0
-        if (( verify_confidence_score >= 90 )); then verify_confidence_grade=high
-        elif (( verify_confidence_score >= 65 )); then verify_confidence_grade=medium
-        else verify_confidence_grade=low
+    if auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss"; then
+        verify_summary="$MEASURE_RUN_DIR/summary.tsv"
+        verify_path_fingerprint=$(summary_value "$verify_summary" PATH_ROUTE_FINGERPRINT)
+        [[ "$verify_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+            die "最终复验缺少合法网络路径指纹；不会持久化"
+            return 1
+        }
+        verify_endpoint_fingerprint=$(summary_value "$verify_summary" PATH_ENDPOINT_FINGERPRINT)
+        [[ "$verify_endpoint_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+            die "最终复验缺少合法测速端点指纹；不会持久化"
+            return 1
+        }
+        [[ "$verify_endpoint_fingerprint" == "$sweep_endpoint_fingerprint" ]] || {
+            die "扫描与最终复验使用了不同测速端点；拒绝把跨端点结果持久化"
+            return 2
+        }
+        [[ "$verify_path_fingerprint" == "$sweep_path_fingerprint" ]] || {
+            die "扫描与最终复验经过不同网络路径；拒绝把跨路径结果持久化"
+            return 2
+        }
+        verify_confidence_score=$(summary_value "$verify_summary" CONFIDENCE_SCORE); verify_confidence_score="${verify_confidence_score:-0}"
+        verify_confidence_grade=$(summary_value "$verify_summary" CONFIDENCE_GRADE); verify_confidence_grade="${verify_confidence_grade:-unknown}"
+        verify_confidence_reasons=$(summary_value "$verify_summary" CONFIDENCE_REASONS); verify_confidence_reasons="${verify_confidence_reasons:-unavailable}"
+        if (( ${WIZARD_FAILOVERS:-0} > 0 )) && is_uint "$verify_confidence_score"; then
+            verify_confidence_score=$((verify_confidence_score - 10)); (( verify_confidence_score < 0 )) && verify_confidence_score=0
+            if (( verify_confidence_score >= 90 )); then verify_confidence_grade=high
+            elif (( verify_confidence_score >= 65 )); then verify_confidence_grade=medium
+            else verify_confidence_grade=low
+            fi
+            if [[ "$verify_confidence_reasons" == clean ]]; then verify_confidence_reasons="peer-failover"
+            else verify_confidence_reasons="${verify_confidence_reasons},peer-failover"
+            fi
         fi
-        if [[ "$verify_confidence_reasons" == clean ]]; then verify_confidence_reasons="peer-failover"
-        else verify_confidence_reasons="${verify_confidence_reasons},peer-failover"
+    else
+        verify_rc=$?
+        if (( verify_rc == IPERF_UNAVAILABLE_RC && expected_rate == 0 && TC_ENABLED == 0 && TC_RATE_MBIT == 0 )) &&
+           [[ -z "$recommend" && "$baseline_quality" == good && "$scan_decision" == no-knee-clean && "$no_knee" == 1 ]]; then
+            log WARN "原测速端点在最终复验阶段不可用"
+            log WARN "本轮未启用 HTB，不存在需要跨测速端点验证的整形速率"
+            log INFO "改用本地运行时、冻结路径指纹与网络连通性最终验证"
+            local_verify_state=$(auto_verify_local_fq_fallback "$iface" "$sweep_path_fingerprint" "$sweep_endpoint_fingerprint") || return $?
+            IFS=$'\t' read -r verify_path_fingerprint verify_endpoint_fingerprint <<< "$local_verify_state"
+            final_verify_mode="local-fallback"; final_verify_degraded=1; final_verify_reason="peer-unavailable"
+            verify_confidence_score=0; verify_confidence_grade=degraded; verify_confidence_reasons="peer-unavailable-local-runtime-fallback"
+            log OK "BBR + FQ 最终验证通过"
+        else
+            return "$verify_rc"
         fi
     fi
-    printf 'FINAL_VERIFY_PEER\t%s\nFINAL_VERIFY_PORT\t%s\nTOTAL_PUBLIC_PEER_FAILOVERS\t%s\nFINAL_VERIFY_CONFIDENCE_SCORE\t%s\nFINAL_VERIFY_CONFIDENCE_GRADE\t%s\nFINAL_VERIFY_CONFIDENCE_REASONS\t%s\nFINAL_VERIFY_PATH_FINGERPRINT\t%s\nFINAL_VERIFY_ENDPOINT_FINGERPRINT\t%s\n' \
-        "$WIZARD_PEER" "$WIZARD_PORT" "${WIZARD_FAILOVERS:-0}" "$verify_confidence_score" "$verify_confidence_grade" "$verify_confidence_reasons" "$verify_path_fingerprint" "$verify_endpoint_fingerprint" >> "$summary" || return 1
+    printf 'FINAL_VERIFY_MODE\t%s\nFINAL_VERIFY_DEGRADED\t%s\nFINAL_VERIFY_REASON\t%s\nFINAL_VERIFY_PEER\t%s\nFINAL_VERIFY_PORT\t%s\nTOTAL_PUBLIC_PEER_FAILOVERS\t%s\nFINAL_VERIFY_CONFIDENCE_SCORE\t%s\nFINAL_VERIFY_CONFIDENCE_GRADE\t%s\nFINAL_VERIFY_CONFIDENCE_REASONS\t%s\nFINAL_VERIFY_PATH_FINGERPRINT\t%s\nFINAL_VERIFY_ENDPOINT_FINGERPRINT\t%s\n' \
+        "$final_verify_mode" "$final_verify_degraded" "$final_verify_reason" "$WIZARD_PEER" "$WIZARD_PORT" "${WIZARD_FAILOVERS:-0}" "$verify_confidence_score" "$verify_confidence_grade" "$verify_confidence_reasons" "$verify_path_fingerprint" "$verify_endpoint_fingerprint" >> "$summary" || return 1
     if (( ${WIZARD_ROUTE_GUARD_ACTIVE:-0} )); then
         auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-$WIZARD_PEER}" || return 1
     fi
     persist_current_tuning || return 1
     printf '\n'
-    log OK "自动调优、复验和持久化提交完成"
+    if (( final_verify_degraded )); then log OK "自动调优完成（degraded peer verification）"
+    else log OK "自动调优、复验和持久化提交完成"
+    fi
     log INFO "最终复验置信度: ${verify_confidence_grade} (${verify_confidence_score}/100, ${verify_confidence_reasons})"
     show_status
     log INFO "扫描记录: $summary"
@@ -11397,7 +11680,7 @@ auto_tune_wizard() {
     WIZARD_PEER=""; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PUBLIC_INDEX=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0; WIZARD_ROUTE_GUARD_ACTIVE=0
     WIZARD_PEER_ADDRESS=""; WIZARD_PEER_FAMILY=""; WIZARD_PEER_SOURCE=""; WIZARD_PEER_IFACE=""
     nic_auto_policy_reset
-    WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SWEEP_ADDRESS=""; WIZARD_SWEEP_SOURCE=""; WIZARD_SWEEP_IFACE=""
+    WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SWEEP_ADDRESS=""; WIZARD_SWEEP_FAMILY=""; WIZARD_SWEEP_SOURCE=""; WIZARD_SWEEP_IFACE=""
     WIZARD_SCAN_CAP=5000; WIZARD_SAMPLE_DURATION=5
     printf '\n%s v%s 自动调优\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
     printf '首次修改前会保存不可覆盖的基线：%s\n' "$BASELINE_DIR"

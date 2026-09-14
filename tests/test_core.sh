@@ -1257,9 +1257,9 @@ test_self_update_rolls_back_split_install() {
         local update_root="$TEST_ROOT/self-update" installed_path candidate valid_candidate output_path="" url="" update_output="" fail_persist=1
         mkdir -p "$update_root"
         installed_path="$update_root/bbr"; candidate="$update_root/new.sh"; valid_candidate="$update_root/new.valid.sh"; PERSIST_SCRIPT="$update_root/persist.sh"
-        sed 's/^SCRIPT_VERSION="8.0.3"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
+        sed 's/^SCRIPT_VERSION="8.0.4"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
         cp "$installed_path" "$PERSIST_SCRIPT"; chmod 0755 "$installed_path" "$PERSIST_SCRIPT"
-        sed 's/^SCRIPT_VERSION="8.0.3"$/SCRIPT_VERSION="8.0.4"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
+        sed 's/^SCRIPT_VERSION="8.0.4"$/SCRIPT_VERSION="8.0.5"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
         cp "$candidate" "$valid_candidate"
         require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
         current_script_path() { printf '%s\n' "$installed_path"; }
@@ -1274,7 +1274,7 @@ test_self_update_rolls_back_split_install() {
                 esac
             done
             case "$url" in
-                */releases/latest) printf '{"tag_name":"v8.0.4"}\n' ;;
+                */releases/latest) printf '{"tag_name":"v8.0.5"}\n' ;;
                 */net-tcp-tune.sh) cp "$candidate" "$output_path" ;;
                 */SHA256SUMS)
                     printf '%s  net-tcp-tune.sh\n' "$(sha256sum "$candidate" | awk '{print $1}')" > "$output_path"
@@ -1287,7 +1287,7 @@ test_self_update_rolls_back_split_install() {
             [[ "$target" != "$PERSIST_SCRIPT" || "$fail_persist" == 0 ]] || return 9
             cp "$source" "$target"; chmod 0755 "$target"
         }
-        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.4"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
+        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.5"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
         if self_update >/dev/null 2>&1; then fail "checksum-matching false-marker update was accepted"; fi
         grep -Fq 'SCRIPT_VERSION="8.0.1"' "$installed_path" || fail "rejected false-marker update changed current command"
         cp "$valid_candidate" "$candidate"
@@ -1298,8 +1298,8 @@ test_self_update_rolls_back_split_install() {
 
         fail_persist=0
         self_update >/dev/null
-        grep -Fq 'SCRIPT_VERSION="8.0.4"' "$installed_path" || fail "successful update did not replace current command"
-        grep -Fq 'SCRIPT_VERSION="8.0.4"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
+        grep -Fq 'SCRIPT_VERSION="8.0.5"' "$installed_path" || fail "successful update did not replace current command"
+        grep -Fq 'SCRIPT_VERSION="8.0.5"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
     )
 }
 
@@ -2774,13 +2774,13 @@ test_auto_tune_commits_only_after_final_verify() {
         events+=" sweep"; MEASURE_RUN_DIR="$summary_dir"
         if (( candidate_rejected )); then
             printf '%s\n' \
-                $'RECOMMEND\t' $'BROKE_AT\t105' $'UNSHAPED_MBIT\t110' $'NO_KNEE\t0' \
+                $'RECOMMEND\t' $'BROKE_AT\t105' $'UNSHAPED_MBIT\t110' $'NO_KNEE\t0' $'BASELINE_QUALITY\tgood' $'SCAN_DECISION\tinconclusive-confirmation' \
                 $'CONFIRMED\t0' $'REJECT_REASON\tconfirmation-failed' $'MIN_EFFICIENCY_RATIO\t0.94' \
                 $'CLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t0' $'PATH_ROUTE_FINGERPRINT\t'"$path_fp" $'PATH_ENDPOINT_FINGERPRINT\t'"$endpoint_fp" \
                 $'PATH_RTT_P95_MS\t1' $'CONFIDENCE_SCORE\t100' $'CONFIDENCE_GRADE\thigh' $'CONFIDENCE_REASONS\tclean' > "$summary_dir/summary.tsv"
         else
             printf '%s\n' \
-                $'RECOMMEND\t100' $'BROKE_AT\t105' $'UNSHAPED_MBIT\t110' $'NO_KNEE\t0' \
+                $'RECOMMEND\t100' $'BROKE_AT\t105' $'UNSHAPED_MBIT\t110' $'NO_KNEE\t0' $'BASELINE_QUALITY\tgood' $'SCAN_DECISION\trecommend' \
                 $'CONFIRMED\t1' $'REJECT_REASON\t' $'MIN_EFFICIENCY_RATIO\t0.94' \
                 $'CLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t0' $'PATH_ROUTE_FINGERPRINT\t'"$path_fp" $'PATH_ENDPOINT_FINGERPRINT\t'"$endpoint_fp" \
                 $'PATH_RTT_P95_MS\t1' $'CONFIDENCE_SCORE\t100' $'CONFIDENCE_GRADE\thigh' $'CONFIDENCE_REASONS\tclean' > "$summary_dir/summary.tsv"

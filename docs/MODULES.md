@@ -77,7 +77,7 @@ DNS 和 IPv6 使用各自的状态子目录和策略引擎，不由 TCP `auto/in
 13. 首次基线必须覆盖持久化脚本及 systemd unit 的启用/运行状态，旧基线缺少新字段时仍可恢复。
 14. 当前命令与 systemd 持久化副本不得在自更新失败后处于不同版本。
 15. 安装器不得覆盖或删除缺少本项目标记的同名 `bbr` 文件。
-16. 公共 peer 的临时不可用可以触发候选切换，但本地 TC/sysctl 错误不得被自动换节点掩盖。
+16. 公共 peer 的临时不可用或 baseline 质量不合格可以触发候选切换，但必须在新 endpoint 上重做完整 sweep；本地 TC/sysctl 错误不得被自动换节点掩盖。
 17. 跨主机故障转移必须重新执行完整 sweep；最终复验只允许使用 sweep 主机的备用端口，不能拿不同路径验收旧基线。
 18. iperf3 的 JSON/本地执行错误不得归类为公共 peer 临时不可用。
 19. 后台流量或 CPU steal 持续污染的样本不得参与拐点和最终验收；不稳定基准/确认样本必须补样或失败。
@@ -117,6 +117,8 @@ DNS 和 IPv6 使用各自的状态子目录和策略引擎，不由 TCP `auto/in
 53. 自动调优必须把目标网卡模型与全局候选聚合模型分开保存；临时运行时不得忽略其他策略，持久化时也不得把聚合角色/BDP 误写入目标策略。
 54. 逐网卡原始 qdisc 基线必须验证目录所有权/权限、精确文件集合、快照格式和接口 MAC；接口名复用不能成为向新设备重放旧 qdisc 的依据。
 55. 兼容 `tc` 命令只能修改逐网卡 qdisc。尚无策略的网卡不得从另一接口主导的全局聚合模型继承虚假的带宽、RTT 或业务角色。
+56. 单路径 nexthop object 必须解析 leaf 并与 route 的接口、gateway 和地址族交叉核对；group、blackhole、异常/缺失 object 与 inline ECMP 必须 fail closed。
+57. baseline 质量失败不得编码为可信 `NO_KNEE`；只有 clean NO_KNEE 且无 HTB 时，最终 endpoint unavailable 才能使用严格本地 runtime、冻结路径和连通性降级复验。
 
 ## 测试
 
@@ -134,6 +136,7 @@ DNS 和 IPv6 使用各自的状态子目录和策略引擎，不由 TCP `auto/in
 - `tests/integration_multi_nic.sh`：真实双 veth 上同时应用不同策略，并故意让第二张网卡失败以验证第一张和第二张都回到操作前 qdisc。
 - `tests/integration_measure.sh`：一次性特权 Linux 容器中的真实 iperf3 JSON、负载 RTT、CPU/接口指标、硬件自适应多流复验和历史列集成测试。
 - `tests/integration_path.sh`：隔离 veth/网络命名空间中的真实 RTT、PMTU/MSS、CLI 参数传播与 route-MTU 指纹漂移拒绝。
+- `tests/integration_nhid.sh`：真实 Linux/iproute2 单 leaf IPv4/IPv6 nexthop object、IPv6 默认路由、group、blackhole、缺失 ID、route/object mismatch 与 inline ECMP。
 - `tests/integration_ipv6_policy.sh`：真实网络命名空间中的临时/持久 IPv6 策略、逐接口运行时验证、`all/lo` 不变量和 native 恢复。
 - `scripts/validate.sh`：重建发布物、语法、架构标记、全部 `test_*.sh` 和 ShellCheck。
 - `tests/integration_dns_systemd.sh`：以 systemd 为 PID 1 的真实 systemd-resolved plain/DoT、查询、回滚与 unit 生命周期测试。

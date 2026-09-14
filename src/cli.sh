@@ -448,7 +448,8 @@ auto_measure_with_peer_failover() {
                 :
             else
                 rc=$?
-                if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == 2) )); then
+                if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == MEASURE_BASELINE_QUALITY_RC || rc == 2) )); then
+                    (( rc != MEASURE_BASELINE_QUALITY_RC )) || log WARN "当前公共对端 baseline 质量不足；将丢弃本次结果并在下一个候选上重新执行完整 sweep"
                     (( index + 1 < count )) && continue
                     break
                 fi
@@ -460,19 +461,21 @@ auto_measure_with_peer_failover() {
             WIZARD_SWEEP_PEER="$WIZARD_PEER"
             WIZARD_SWEEP_PORT="$WIZARD_PORT"
             WIZARD_SWEEP_ADDRESS="${WIZARD_PEER_ADDRESS:-}"
+            WIZARD_SWEEP_FAMILY="${WIZARD_PEER_FAMILY:-}"
             WIZARD_SWEEP_SOURCE="${WIZARD_PEER_SOURCE:-}"
             WIZARD_SWEEP_IFACE="${WIZARD_PEER_IFACE:-$iface}"
             return 0
         else
             rc=$?
         fi
-        if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == 2) )); then
+        if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == MEASURE_BASELINE_QUALITY_RC || rc == 2) )); then
+            (( rc != MEASURE_BASELINE_QUALITY_RC )) || log WARN "当前公共对端 baseline 质量不足；将丢弃本次结果并在下一个候选上重新执行完整 sweep"
             (( index + 1 < count )) && continue
             break
         fi
         return "$rc"
     done
-    die "所有已预检的公共 iperf3 对端都不可用或不适合当前路径；请稍后重试或使用自有服务器"
+    die "所有公共 iperf3 对端均不可用或当前路径质量不足，无法可靠完成自动扫描；请稍后重试或使用自有 iperf3 服务器"
     return 1
 }
 
@@ -513,9 +516,49 @@ auto_verify_with_peer_failover() {
     return "$IPERF_UNAVAILABLE_RC"
 }
 
+auto_verify_local_fq_fallback() {
+    local iface="$1" expected_path_fingerprint="$2" expected_endpoint_fingerprint="$3"
+    local family="${WIZARD_SWEEP_FAMILY:-${WIZARD_PEER_FAMILY:-}}"
+    local address="${WIZARD_SWEEP_ADDRESS:-}" source="${WIZARD_SWEEP_SOURCE:-}"
+    local sweep_iface="${WIZARD_SWEEP_IFACE:-$iface}" state route_fp endpoint_fp
+    [[ "$family" == 4 || "$family" == 6 ]] || { die "本地降级复验缺少合法地址族"; return 1; }
+    measure_source_address_is_valid "$family" "$address" || { die "本地降级复验缺少合法测速地址"; return 1; }
+    measure_source_address_is_valid "$family" "$source" || { die "本地降级复验缺少合法来源地址"; return 1; }
+    [[ "$sweep_iface" == "$iface" ]] || { die "本地降级复验网卡与 sweep 网卡不一致"; return 1; }
+    [[ "$expected_path_fingerprint" =~ ^[0-9a-f]{64}$ && "$expected_endpoint_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+        die "本地降级复验缺少可信 sweep 路径指纹"
+        return 1
+    }
+
+    verify_runtime_tuning "$iface" || return 1
+    auto_tune_route_guard "$iface" "$address" || return 1
+    state=$(path_capture_route_identity "$family" "$address" "$source" "$iface") || {
+        die "本地降级复验无法重新建立网络路径指纹"
+        return 1
+    }
+    IFS=$'\t' read -r route_fp endpoint_fp _ <<< "$state"
+    [[ "$route_fp" == "$expected_path_fingerprint" && "$endpoint_fp" == "$expected_endpoint_fingerprint" ]] || {
+        die "本地降级复验检测到 route/path fingerprint 改变；拒绝提交"
+        return 1
+    }
+    if ! ping "-$family" -I "$iface" -I "$source" -n -W 2 -c 3 -- "$address" >/dev/null 2>&1; then
+        die "本地降级复验未能确认冻结路径的网络连通性；拒绝提交"
+        return 1
+    fi
+    state=$(path_capture_route_identity "$family" "$address" "$source" "$iface") || return 1
+    IFS=$'\t' read -r route_fp endpoint_fp _ <<< "$state"
+    [[ "$route_fp" == "$expected_path_fingerprint" && "$endpoint_fp" == "$expected_endpoint_fingerprint" ]] || {
+        die "连通性检查后 route/path fingerprint 改变；拒绝提交"
+        return 1
+    }
+    verify_runtime_tuning "$iface" || return 1
+    printf '%s\t%s\n' "$route_fp" "$endpoint_fp"
+}
+
 auto_tune_execute() {
     local iface="$1" profile="$2" role="$3" nominal="$4" tuning_rtt="$5" peer_rtt="${6:-0}"
     local summary recommend knee measured no_knee confirmed reject_reason min_efficiency baseline_loss expected_rate=0
+    local baseline_quality scan_decision verify_rc local_verify_state final_verify_mode=iperf final_verify_degraded=0 final_verify_reason=none
     local role_floor rtt_source verify_summary verify_confidence_score verify_confidence_grade verify_confidence_reasons
     local sweep_path_fingerprint verify_path_fingerprint sweep_endpoint_fingerprint verify_endpoint_fingerprint path_rtt
     prepare_auto_tuning_runtime "$iface" "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" || return 1
@@ -550,6 +593,8 @@ auto_tune_execute() {
     knee=$(summary_value "$summary" BROKE_AT); knee="${knee:-0}"
     measured=$(summary_value "$summary" UNSHAPED_MBIT)
     no_knee=$(summary_value "$summary" NO_KNEE)
+    baseline_quality=$(summary_value "$summary" BASELINE_QUALITY)
+    scan_decision=$(summary_value "$summary" SCAN_DECISION)
     confirmed=$(summary_value "$summary" CONFIRMED)
     reject_reason=$(summary_value "$summary" REJECT_REASON)
     min_efficiency=$(summary_value "$summary" MIN_EFFICIENCY_RATIO); min_efficiency="${min_efficiency:-0.90}"
@@ -562,6 +607,21 @@ auto_tune_execute() {
     if [[ -n "$reject_reason" || ( -n "$knee" && "$knee" != 0 && "$confirmed" != 1 ) ]]; then
         die "扫描候选值未通过确认测试（${reject_reason:-unconfirmed}），不会应用或持久化"
         return 2
+    fi
+    [[ "$baseline_quality" == good ]] || {
+        die "扫描 baseline 质量不是 good（${baseline_quality:-missing}）；不会应用或持久化 measurement-derived 参数"
+        return "$MEASURE_BASELINE_QUALITY_RC"
+    }
+    if [[ -n "$recommend" ]]; then
+        [[ "$scan_decision" == recommend && "$confirmed" == 1 ]] || {
+            die "扫描推荐值缺少一致的决策状态；不会应用或持久化"
+            return 2
+        }
+    else
+        [[ "$scan_decision" == no-knee-clean && "$no_knee" == 1 ]] || {
+            die "无整形推荐的扫描结果不是可信 NO_KNEE；不会应用或持久化"
+            return 2
+        }
     fi
     if [[ -n "$measured" && "$tuning_rtt" -gt 0 ]]; then
         nic_stage_candidate_global_model "$iface" adaptive "$role" "$(awk -v g="$measured" 'BEGIN {printf "%d", g+0.5}')" "$tuning_rtt" || return 1
@@ -577,47 +637,65 @@ auto_tune_execute() {
         log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
     fi
     verify_runtime_tuning "$iface" || return 1
-    auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss" || return $?
-    verify_summary="$MEASURE_RUN_DIR/summary.tsv"
-    verify_path_fingerprint=$(summary_value "$verify_summary" PATH_ROUTE_FINGERPRINT)
-    [[ "$verify_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
-        die "最终复验缺少合法网络路径指纹；不会持久化"
-        return 1
-    }
-    verify_endpoint_fingerprint=$(summary_value "$verify_summary" PATH_ENDPOINT_FINGERPRINT)
-    [[ "$verify_endpoint_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
-        die "最终复验缺少合法测速端点指纹；不会持久化"
-        return 1
-    }
-    [[ "$verify_endpoint_fingerprint" == "$sweep_endpoint_fingerprint" ]] || {
-        die "扫描与最终复验使用了不同测速端点；拒绝把跨端点结果持久化"
-        return 2
-    }
-    [[ "$verify_path_fingerprint" == "$sweep_path_fingerprint" ]] || {
-        die "扫描与最终复验经过不同网络路径；拒绝把跨路径结果持久化"
-        return 2
-    }
-    verify_confidence_score=$(summary_value "$verify_summary" CONFIDENCE_SCORE); verify_confidence_score="${verify_confidence_score:-0}"
-    verify_confidence_grade=$(summary_value "$verify_summary" CONFIDENCE_GRADE); verify_confidence_grade="${verify_confidence_grade:-unknown}"
-    verify_confidence_reasons=$(summary_value "$verify_summary" CONFIDENCE_REASONS); verify_confidence_reasons="${verify_confidence_reasons:-unavailable}"
-    if (( ${WIZARD_FAILOVERS:-0} > 0 )) && is_uint "$verify_confidence_score"; then
-        verify_confidence_score=$((verify_confidence_score - 10)); (( verify_confidence_score < 0 )) && verify_confidence_score=0
-        if (( verify_confidence_score >= 90 )); then verify_confidence_grade=high
-        elif (( verify_confidence_score >= 65 )); then verify_confidence_grade=medium
-        else verify_confidence_grade=low
+    if auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$baseline_loss"; then
+        verify_summary="$MEASURE_RUN_DIR/summary.tsv"
+        verify_path_fingerprint=$(summary_value "$verify_summary" PATH_ROUTE_FINGERPRINT)
+        [[ "$verify_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+            die "最终复验缺少合法网络路径指纹；不会持久化"
+            return 1
+        }
+        verify_endpoint_fingerprint=$(summary_value "$verify_summary" PATH_ENDPOINT_FINGERPRINT)
+        [[ "$verify_endpoint_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+            die "最终复验缺少合法测速端点指纹；不会持久化"
+            return 1
+        }
+        [[ "$verify_endpoint_fingerprint" == "$sweep_endpoint_fingerprint" ]] || {
+            die "扫描与最终复验使用了不同测速端点；拒绝把跨端点结果持久化"
+            return 2
+        }
+        [[ "$verify_path_fingerprint" == "$sweep_path_fingerprint" ]] || {
+            die "扫描与最终复验经过不同网络路径；拒绝把跨路径结果持久化"
+            return 2
+        }
+        verify_confidence_score=$(summary_value "$verify_summary" CONFIDENCE_SCORE); verify_confidence_score="${verify_confidence_score:-0}"
+        verify_confidence_grade=$(summary_value "$verify_summary" CONFIDENCE_GRADE); verify_confidence_grade="${verify_confidence_grade:-unknown}"
+        verify_confidence_reasons=$(summary_value "$verify_summary" CONFIDENCE_REASONS); verify_confidence_reasons="${verify_confidence_reasons:-unavailable}"
+        if (( ${WIZARD_FAILOVERS:-0} > 0 )) && is_uint "$verify_confidence_score"; then
+            verify_confidence_score=$((verify_confidence_score - 10)); (( verify_confidence_score < 0 )) && verify_confidence_score=0
+            if (( verify_confidence_score >= 90 )); then verify_confidence_grade=high
+            elif (( verify_confidence_score >= 65 )); then verify_confidence_grade=medium
+            else verify_confidence_grade=low
+            fi
+            if [[ "$verify_confidence_reasons" == clean ]]; then verify_confidence_reasons="peer-failover"
+            else verify_confidence_reasons="${verify_confidence_reasons},peer-failover"
+            fi
         fi
-        if [[ "$verify_confidence_reasons" == clean ]]; then verify_confidence_reasons="peer-failover"
-        else verify_confidence_reasons="${verify_confidence_reasons},peer-failover"
+    else
+        verify_rc=$?
+        if (( verify_rc == IPERF_UNAVAILABLE_RC && expected_rate == 0 && TC_ENABLED == 0 && TC_RATE_MBIT == 0 )) &&
+           [[ -z "$recommend" && "$baseline_quality" == good && "$scan_decision" == no-knee-clean && "$no_knee" == 1 ]]; then
+            log WARN "原测速端点在最终复验阶段不可用"
+            log WARN "本轮未启用 HTB，不存在需要跨测速端点验证的整形速率"
+            log INFO "改用本地运行时、冻结路径指纹与网络连通性最终验证"
+            local_verify_state=$(auto_verify_local_fq_fallback "$iface" "$sweep_path_fingerprint" "$sweep_endpoint_fingerprint") || return $?
+            IFS=$'\t' read -r verify_path_fingerprint verify_endpoint_fingerprint <<< "$local_verify_state"
+            final_verify_mode="local-fallback"; final_verify_degraded=1; final_verify_reason="peer-unavailable"
+            verify_confidence_score=0; verify_confidence_grade=degraded; verify_confidence_reasons="peer-unavailable-local-runtime-fallback"
+            log OK "BBR + FQ 最终验证通过"
+        else
+            return "$verify_rc"
         fi
     fi
-    printf 'FINAL_VERIFY_PEER\t%s\nFINAL_VERIFY_PORT\t%s\nTOTAL_PUBLIC_PEER_FAILOVERS\t%s\nFINAL_VERIFY_CONFIDENCE_SCORE\t%s\nFINAL_VERIFY_CONFIDENCE_GRADE\t%s\nFINAL_VERIFY_CONFIDENCE_REASONS\t%s\nFINAL_VERIFY_PATH_FINGERPRINT\t%s\nFINAL_VERIFY_ENDPOINT_FINGERPRINT\t%s\n' \
-        "$WIZARD_PEER" "$WIZARD_PORT" "${WIZARD_FAILOVERS:-0}" "$verify_confidence_score" "$verify_confidence_grade" "$verify_confidence_reasons" "$verify_path_fingerprint" "$verify_endpoint_fingerprint" >> "$summary" || return 1
+    printf 'FINAL_VERIFY_MODE\t%s\nFINAL_VERIFY_DEGRADED\t%s\nFINAL_VERIFY_REASON\t%s\nFINAL_VERIFY_PEER\t%s\nFINAL_VERIFY_PORT\t%s\nTOTAL_PUBLIC_PEER_FAILOVERS\t%s\nFINAL_VERIFY_CONFIDENCE_SCORE\t%s\nFINAL_VERIFY_CONFIDENCE_GRADE\t%s\nFINAL_VERIFY_CONFIDENCE_REASONS\t%s\nFINAL_VERIFY_PATH_FINGERPRINT\t%s\nFINAL_VERIFY_ENDPOINT_FINGERPRINT\t%s\n' \
+        "$final_verify_mode" "$final_verify_degraded" "$final_verify_reason" "$WIZARD_PEER" "$WIZARD_PORT" "${WIZARD_FAILOVERS:-0}" "$verify_confidence_score" "$verify_confidence_grade" "$verify_confidence_reasons" "$verify_path_fingerprint" "$verify_endpoint_fingerprint" >> "$summary" || return 1
     if (( ${WIZARD_ROUTE_GUARD_ACTIVE:-0} )); then
         auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-$WIZARD_PEER}" || return 1
     fi
     persist_current_tuning || return 1
     printf '\n'
-    log OK "自动调优、复验和持久化提交完成"
+    if (( final_verify_degraded )); then log OK "自动调优完成（degraded peer verification）"
+    else log OK "自动调优、复验和持久化提交完成"
+    fi
     log INFO "最终复验置信度: ${verify_confidence_grade} (${verify_confidence_score}/100, ${verify_confidence_reasons})"
     show_status
     log INFO "扫描记录: $summary"
@@ -649,7 +727,7 @@ auto_tune_wizard() {
     WIZARD_PEER=""; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PUBLIC_INDEX=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0; WIZARD_ROUTE_GUARD_ACTIVE=0
     WIZARD_PEER_ADDRESS=""; WIZARD_PEER_FAMILY=""; WIZARD_PEER_SOURCE=""; WIZARD_PEER_IFACE=""
     nic_auto_policy_reset
-    WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SWEEP_ADDRESS=""; WIZARD_SWEEP_SOURCE=""; WIZARD_SWEEP_IFACE=""
+    WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SWEEP_ADDRESS=""; WIZARD_SWEEP_FAMILY=""; WIZARD_SWEEP_SOURCE=""; WIZARD_SWEEP_IFACE=""
     WIZARD_SCAN_CAP=5000; WIZARD_SAMPLE_DURATION=5
     printf '\n%s v%s 自动调优\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
     printf '首次修改前会保存不可覆盖的基线：%s\n' "$BASELINE_DIR"

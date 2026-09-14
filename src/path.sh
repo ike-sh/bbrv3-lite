@@ -92,7 +92,7 @@ path_hash_payload() {
 path_capture_route_identity() {
     local family="$1" address="$2" source="$3" iface="$4"
     local route fib route_norm fib_norm gateway table iface_mtu route_mtu route_payload
-    local route_fp endpoint_fp route_iface fib_iface
+    local route_fp endpoint_fp route_state fib_state route_iface fib_iface
     [[ "$family" == 4 || "$family" == 6 ]] || return 1
     measure_source_address_is_valid "$family" "$source" || return 1
     validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
@@ -100,8 +100,10 @@ path_capture_route_identity() {
     route=$(ip "-$family" route get "$address" from "$source" 2>/dev/null) || return 1
     fib=$(ip "-$family" route get fibmatch "$address" from "$source" 2>/dev/null) || return 1
     [[ -n "$route" && -n "$fib" ]] || return 1
-    route_iface=$(measure_unique_route_iface "$route" "路径指纹 route-get") || return 1
-    fib_iface=$(measure_unique_route_iface "$fib" "路径指纹 fibmatch") || return 1
+    route_state=$(route_unique_path_record "$route" "路径指纹 route-get" "$family") || return 1
+    fib_state=$(route_unique_path_record "$fib" "路径指纹 fibmatch" "$family") || return 1
+    route_iface=$(cut -f1 <<< "$route_state")
+    fib_iface=$(cut -f1 <<< "$fib_state")
     [[ "$route_iface" == "$iface" && "$fib_iface" == "$iface" ]] || {
         die "路径指纹出口与冻结网卡不一致（route=$route_iface, fib=$fib_iface, expected=$iface）"
         return 1
@@ -116,8 +118,8 @@ path_capture_route_identity() {
     route_mtu=$(path_token_after mtu <<< "$route")
     if ! is_uint "${route_mtu:-}"; then route_mtu="$iface_mtu"; fi
 
-    route_payload=$(printf 'family=%s\nsource=%s\ninterface=%s\ngateway=%s\ntable=%s\ninterface_mtu=%s\nroute_mtu=%s\nroute=%s\nfib=%s\n' \
-        "$family" "$source" "$iface" "$gateway" "$table" "$iface_mtu" "$route_mtu" "$route_norm" "$fib_norm") || return 1
+    route_payload=$(printf 'family=%s\nsource=%s\ninterface=%s\ngateway=%s\ntable=%s\ninterface_mtu=%s\nroute_mtu=%s\nroute_state=%s\nfib_state=%s\nroute=%s\nfib=%s\n' \
+        "$family" "$source" "$iface" "$gateway" "$table" "$iface_mtu" "$route_mtu" "$route_state" "$fib_state" "$route_norm" "$fib_norm") || return 1
     route_fp=$(path_hash_payload <<< "$route_payload") || return 1
     endpoint_fp=$(printf '%saddress=%s\n' "$route_payload" "$address" | path_hash_payload) || return 1
     [[ "$route_fp" =~ ^[0-9a-f]{64}$ && "$endpoint_fp" =~ ^[0-9a-f]{64}$ ]] || return 1

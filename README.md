@@ -2,7 +2,7 @@
 
 BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-当前版本：v8.0.3
+当前版本：v8.0.4
 
 项目不追求“sysctl 越多越好”。默认配置保持克制。命令行 `measure` 只给出结果；交互式 `auto` 会在一次总确认后完成测量、决策、应用和复验，未发现可信拐点时保持纯 FQ。
 
@@ -17,13 +17,14 @@ BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原
 - 三问式自动向导：带宽、测速对端、业务用途；执行前集中展示耗时、流量和落盘位置。
 - 公共 iperf3 节点先按 RTT 筛选，再逐个核验 IPv4/IPv6 地址、来源地址、出口和低流量真实会话；主机名默认优先 IPv4、不可用时回退 IPv6，正式样本短暂失败会自动重试。
 - 交互式子菜单会停留在当前模块，结果确认后再清屏重绘；只有选择 `0` 才返回主菜单。
-- 目标感知的多网卡出口保护：自动调优和所有正式测量会对候选端点逐一执行 `route get`、底层 `fibmatch`、来源地址绑定和 iperf3 可用性核验；选定后冻结地址族、IP、来源地址、网卡与端口。未选中的坏 AAAA/A 或另一地址族出口不会误阻断已证明安全的端点；选中路径存在 ECMP、不可解析 nexthop object、来源或指纹漂移时仍会在修改前停止。
+- 目标感知的多网卡出口保护：自动调优和所有正式测量会对候选端点逐一执行 `route get`、底层 `fibmatch`、来源地址绑定和 iperf3 可用性核验；选定后冻结地址族、IP、来源地址、网卡与端口。现代 Linux 单路径 `nhid` 会查询并交叉核对 nexthop object；group、blackhole、无法解析、route/object 不一致、ECMP、来源或指纹漂移仍会在修改前停止。
 - v7.3.0 网络路径画像：为冻结端点生成端点/出口双 SHA-256 指纹，记录网关、路由表、接口/路由 MTU、PMTU/MSS、RTT min/median/p95/max、尾部抖动、ICMP 丢包和网关 RTT；路径风险参与测量置信度及自动持久化门槛。
 - v7.4.0 DNS/IPv6 独立策略引擎：统一提供 `plan/apply/verify/status`，先只读识别当前状态和阻断原因，再调用各自的事务执行器；旧 DNS/IPv6 命令保留兼容映射，但不会绕过新策略门禁。
 - v8.0.0 真正多网卡管理：每张受管网卡拥有独立、严格解析且绑定 MAC 身份的 FQ/HTB-FQ 策略；一个 systemd 服务原子应用全部策略，允许多张网卡同时使用不同速率、不同模式和不同 BDP 元数据。
 - v8.0.1 实机兼容性修复：兼容真实 Linux 将 `tcp_rmem/tcp_wmem` 输出为 TAB 分隔三元组的行为；同时修复双栈域名在预检后重新解析到不可用 IPv6、导致必须关闭 IPv6 才能运行 iperf3 的回归。测速不会修改 IPv6 开关。
 - v8.0.2 qdisc 与路由事务精确恢复：基线和事务同时校验 root/leaf handle、可重放参数、MQ qdisc/class 对应关系和 TX queue 数；内核自动创建的 `0:` qdisc 会在事务内按需临时切换 `default_qdisc`、删除显式 root 完成重建，再恢复原全局默认值并复验两者。任何受管树上的外部 tc filter、扩展 HTB 拓扑或错误 default class 都会在写入前拒绝；IPv6 RA 路由不断递减的 `expires` 与查询 `uid` 不再被误判为换路，但 metric/proto/pref/gateway/device 等真实路由身份仍严格校验。
 - v8.0.3 发布前修复：真实 Debian/systemd 首次安装可安全处理尚不存在的 service；schema-3 TCP 基线显式绑定 sysctl schema/key 集并兼容真实 v8.0.2 基线；事务诊断与失败证据保留更清晰，永久禁用 IPv6 时会提示对未来新接口的影响。
+- v8.0.4 nexthop 与公共测速可靠性修复：支持解析普通单路径 nexthop object；高重传 baseline 改为 inconclusive 并切换候选，不再冒充 clean NO_KNEE；纯 BBR+FQ 的 clean NO_KNEE 在最终 peer 仅 unavailable 时可经过严格本地 runtime、路径指纹和连通性降级复验提交，有 HTB 推荐时仍严格失败并回滚。
 - 全局 TCP sysctl 与逐网卡 qdisc 明确分层：Linux TCP 缓冲区是全局资源，脚本按全部策略聚合出一个安全上界；qdisc、速率、原始队列基线和恢复则逐网卡独立处理，不再把“多网卡检测”误称为“多网卡管理”。
 - 全局 `flock`，防止两个进程同时修改 sysctl、qdisc 或配置。
 - 严格 `KEY=VALUE` 白名单解析，配置文件从不被 shell `source`。
@@ -665,6 +666,15 @@ tag 推送会触发 Release 工作流，验证 tag 与脚本版本一致，并�
 - **Transaction safety**：transaction 持久记录 `readonly/mutated` 状态与创建时间，遗留 transaction 的只读诊断更清晰；rollback 失败会保留证据，并阻止 EXIT cleanup 在无人监督时重复 rollback。
 - **UX**：永久禁用 IPv6 时明确提示 `net.ipv6.conf.default.disable_ipv6=1` 会影响未来创建的新接口。
 - **Tests**：增加真实 Debian 12 PID1 systemd missing-unit/absent-restore integration、真实 v8.0.2 native baseline fixture 和 sysctl schema provider partial-output failure regression；Debian 12/13、Ubuntu 22.04/24.04 privileged matrix 继续作为发布门禁。
+
+## v8.0.4 nexthop object 与自动扫描可靠性修复
+
+- **Modern `nhid`**：默认路由、目标 `route get`、`fibmatch`、来源绑定复验和路径指纹统一解析 nexthop object；优先精确 `ip nexthop get id ID`，并兼容从 dump 中只选取唯一精确 ID。普通单 leaf object 会解析出接口与 gateway 并和 route 内联字段交叉核对，不再把 Debian 13 的 RA IPv6 单路径默认路由误判为 ECMP。
+- **Fail closed**：nexthop group（包括成员都在同一网卡的情况）、blackhole、缺失或异常 object、非法 ID、封装/不可用状态、地址族或 route/object 接口/gateway 不一致继续拒绝；inline multipath 防护保持不变。
+- **Baseline quality**：不限速 baseline 重传过高现在记录 `BASELINE_QUALITY=bad` 与 `SCAN_DECISION=inconclusive-bad-baseline`，返回独立质量错误，不设置 `NO_KNEE`，也不生成推荐值或自适应持久化参数。公共对端出现该状态时丢弃整轮结果，在下一个同出口候选上重新执行完整 baseline+sweep。
+- **Confidence semantics**：summary 分离 sample telemetry confidence 与 policer decision confidence。即使遥测样本完整，高重传 baseline 的决策置信度也固定为 low，日志不会再显示矛盾的 `high / clean` 扫描结论。
+- **Final verification**：clean NO_KNEE、无推荐值、`TC_ENABLED=0` 且 BBR/FQ runtime 已通过时，最终 iperf 仅返回 endpoint unavailable 可改用本地 runtime、原 endpoint/route 双指纹与绑定路径连通性复验，并记录 `FINAL_VERIFY_MODE=local-fallback`。性能不达标、路径漂移、运行时验证失败或任何 HTB 推荐仍失败并由外层事务完整回滚；HTB 不允许跨 host 验收。
+- **Tests**：新增普通 IPv6 `nhid`、fibmatch、group/blackhole/unresolved/mismatch/inline ECMP，以及公共 baseline failover、置信度、纯 FQ 降级验证和 HTB/性能/路径失败边界回归。
 
 ## v8 与旧版的差异
 

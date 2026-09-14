@@ -18,6 +18,7 @@ MEASURE_PEER_PORT=""
 IPERF_DATA_RC=65
 IPERF_CONTAMINATED_RC=66
 IPERF_UNSTABLE_RC=67
+MEASURE_BASELINE_QUALITY_RC=68
 IPERF_UNAVAILABLE_RC=75
 PUBLIC_PEER_CANDIDATES=()
 
@@ -296,23 +297,7 @@ measure_source_address_is_valid() {
 }
 
 measure_unique_route_iface() {
-    local output="$1" context="$2" iface count
-    if route_output_has_unresolved_nhid "$output"; then
-        die "$context 包含未解析的 nexthop object (nhid)；测速路径不再唯一"
-        return 1
-    fi
-    if route_output_has_multipath "$output"; then
-        die "$context 包含 ECMP/nexthop；测速路径不再唯一"
-        return 1
-    fi
-    count=$(route_output_interfaces <<< "$output" | awk 'END {print NR+0}')
-    if ! is_uint "${count:-}" || (( count != 1 )); then
-        die "$context 无法确定唯一出口网卡"
-        return 1
-    fi
-    iface=$(route_output_interfaces <<< "$output" | sed -n '1p')
-    validate_interface_name "$iface" || { die "$context 返回非法出口网卡: $iface"; return 1; }
-    printf '%s\n' "$iface"
+    route_unique_path_iface "$1" "$2" "${3:-}"
 }
 
 # Revalidate one already-resolved literal through the platform's strict
@@ -338,7 +323,7 @@ measure_capture_route_state() {
         die "测速地址 $address 无法取得 route-get 来源地址"
         return 1
     fi
-    iface=$(measure_unique_route_iface "$output" "测速地址 $address 的 route-get") || return 1
+    iface=$(measure_unique_route_iface "$output" "测速地址 $address 的 route-get" "$family") || return 1
     [[ "$iface" == "$expected_iface" ]] || {
         die "测速地址 $address 的出口已从 $expected_iface 漂移到 $iface"
         return 1
@@ -363,7 +348,7 @@ measure_capture_route_state() {
         die "测速地址 $address 无法用冻结来源地址 $source 完成 route-get"
         return 1
     fi
-    bound_iface=$(measure_unique_route_iface "$bound_output" "测速地址 $address 的来源绑定 route-get") || return 1
+    bound_iface=$(measure_unique_route_iface "$bound_output" "测速地址 $address 的来源绑定 route-get" "$family") || return 1
     [[ "$bound_iface" == "$expected_iface" ]] || {
         die "绑定来源地址 $source 后，测速出口从 $expected_iface 变为 $bound_iface"
         return 1
@@ -372,7 +357,7 @@ measure_capture_route_state() {
         die "无法用 fibmatch 核验测速地址 $address 的来源绑定路径"
         return 1
     fi
-    bound_fib_iface=$(measure_unique_route_iface "$bound_fibmatch" "测速地址 $address 的来源绑定 fibmatch") || return 1
+    bound_fib_iface=$(measure_unique_route_iface "$bound_fibmatch" "测速地址 $address 的来源绑定 fibmatch" "$family") || return 1
     [[ "$bound_fib_iface" == "$expected_iface" ]] || {
         die "绑定来源地址 $source 后，测速 fibmatch 出口从 $expected_iface 变为 $bound_fib_iface"
         return 1
@@ -1025,6 +1010,12 @@ loss_spike() {
     }'
 }
 
+baseline_retrans_too_high() {
+    local value="$1" threshold="$2"
+    is_decimal "$value" && is_decimal "$threshold" || return 0
+    awk -v v="$value" -v t="$threshold" 'BEGIN {limit=t*10; if(limit<1)limit=1; exit !(v>limit)}'
+}
+
 minimum_efficiency_ratio() {
     local goodput="$1" rate="$2"
     awk -v g="$goodput" -v r="$rate" 'BEGIN {
@@ -1148,7 +1139,10 @@ measure_sweep() {
     local last_ok="" last_ok_gp="" broke_at="" fine_start fine_step recommend="" candidate="" confirm_row confirm_gp="" confirm_loss=""
     local min_efficiency="0.90" confirmed=0 reject_reason="" estimated tests rc=0 no_knee=0 above_cap=0 baseline_duration
     local auto_cap=0 nominal_was_auto=0 observed_cap
+    local baseline_quality=unknown scan_decision=inconclusive no_knee_reason=""
     local confidence_row confidence confidence_score confidence_grade confidence_reasons
+    local sample_confidence_score sample_confidence_grade sample_confidence_reasons
+    local decision_confidence_score decision_confidence_grade decision_confidence_reasons
     validate_peer "$peer" "$port" || return 1
     [[ "$result_mode" == manual || "$result_mode" == auto ]] || { die "扫描结果模式只支持 manual/auto"; return 1; }
     for value in "$nominal" "$low" "$high" "$step" "$duration" "$parallel" "$margin" "$force_scan" "$cap"; do is_uint "$value" || { die "扫描参数必须为非负整数"; return 1; }; done
@@ -1178,7 +1172,21 @@ measure_sweep() {
         rc=1
     elif baseline_row=$(sample_repeated "$peer" "$port" "$baseline_duration" 1 2 unshaped 3 6); then
         baseline_gp=$(cut -f1 <<< "$baseline_row"); baseline_loss=$(cut -f4 <<< "$baseline_row")
-        if (( auto_cap )); then
+        if baseline_retrans_too_high "$baseline_loss" "$threshold"; then
+            if (( force_scan )); then
+                baseline_quality=forced-bad
+                log WARN "不限速路径重传估算 ${baseline_loss}% 过高；已按 --force-scan 继续，结论置信度将强制降级"
+            else
+                baseline_quality=bad
+                scan_decision=inconclusive-bad-baseline
+                reject_reason="baseline-retrans-too-high"
+                log WARN "不限速路径重传估算 ${baseline_loss}% 过高，无法可靠定位 policer；本次 peer/path 结论为 inconclusive"
+                rc="$MEASURE_BASELINE_QUALITY_RC"
+            fi
+        else
+            baseline_quality=good
+        fi
+        if (( rc == 0 && auto_cap )); then
             if observed_cap=$(expanded_scan_cap "$cap" "$baseline_gp"); then
                 if (( observed_cap > cap )); then
                     log INFO "根据不限速基准将扫描上限从 ${cap} 调整为 ${observed_cap} Mbit/s"
@@ -1190,7 +1198,8 @@ measure_sweep() {
         fi
         if (( rc == 0 )); then
             if awk -v g="$baseline_gp" -v c="$cap" 'BEGIN {exit !(g>c)}'; then
-                above_cap=1; no_knee=1
+                above_cap=1; no_knee=1; no_knee_reason=above-scan-cap
+                if [[ "$baseline_quality" == good ]]; then scan_decision=no-knee-clean; else scan_decision=no-knee-forced; fi
                 log WARN "不限速单流达到 ${baseline_gp} Mbit/s，超过扫描上限 ${cap} Mbit/s；跳过整形扫描"
             fi
             (( nominal > 0 )) || nominal=$(awk -v g="$baseline_gp" 'BEGIN {printf "%d", g+0.5}')
@@ -1232,9 +1241,6 @@ measure_sweep() {
 
         if (( above_cap )); then
             :
-        elif (( ! force_scan )) && awk -v v="$baseline_loss" -v t="$threshold" 'BEGIN {limit=t*10; if(limit<1)limit=1; exit !(v>limit)}'; then
-            no_knee=1
-            log WARN "不限速路径重传估算 ${baseline_loss}% 过高，无法可靠定位 policer；更换对端或使用 --force-scan"
         else
             apply_shaping "$iface" "$low" || rc=$?
             if (( rc == 0 )); then
@@ -1300,28 +1306,44 @@ measure_sweep() {
                 fi
             elif (( rc == 0 )); then
                 no_knee=1
+                no_knee_reason=scan-complete-no-knee
+                if [[ "$baseline_quality" == good ]]; then scan_decision=no-knee-clean; else scan_decision=no-knee-forced; fi
                 log WARN "扫描到上界仍未发现拐点，不建议基于本次结果启用整形"
             fi
         fi
     fi
 
-    if (( rc == 0 )); then
-        printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nHARDWARE_CLASS\t%s\nLINK_MBIT\t%s\nRX_QUEUES\t%s\nTX_QUEUES\t%s\nSCAN_CAP_MBIT\t%s\nSAMPLE_DURATION_SECONDS\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nCLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nMIN_EFFICIENCY_RATIO\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nCANDIDATE\t%s\nCONFIRM_MBIT\t%s\nCONFIRM_RETRANS_RATIO_EST_PERCENT\t%s\nCONFIRMED\t%s\nREJECT_REASON\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nABOVE_CAP\t%s\n' \
+    if (( rc == 0 )) && [[ -n "${recommend:-}" ]]; then scan_decision=recommend; fi
+    if (( rc == 0 )) && [[ "$reject_reason" == confirmation-failed ]]; then scan_decision=inconclusive-confirmation; fi
+
+    if (( rc == 0 || rc == MEASURE_BASELINE_QUALITY_RC )); then
+        printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nHARDWARE_CLASS\t%s\nLINK_MBIT\t%s\nRX_QUEUES\t%s\nTX_QUEUES\t%s\nSCAN_CAP_MBIT\t%s\nSAMPLE_DURATION_SECONDS\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nCLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t%s\nBASELINE_QUALITY\t%s\nSCAN_DECISION\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nMIN_EFFICIENCY_RATIO\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nCANDIDATE\t%s\nCONFIRM_MBIT\t%s\nCONFIRM_RETRANS_RATIO_EST_PERCENT\t%s\nCONFIRMED\t%s\nREJECT_REASON\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nNO_KNEE_REASON\t%s\nABOVE_CAP\t%s\n' \
             "$peer" "$port" "$iface" "$HARDWARE_CLASS" "$HARDWARE_LINK_MBIT" "$HARDWARE_RX_QUEUES" "$HARDWARE_TX_QUEUES" "$cap" "$duration" \
-            "${baseline_gp:-}" "${baseline_loss:-}" "${base_loss:-0}" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$above_cap" > "$dir/summary.tsv"
+            "${baseline_gp:-}" "${baseline_loss:-}" "${base_loss:-0}" "$baseline_quality" "$scan_decision" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$no_knee_reason" "$above_cap" > "$dir/summary.tsv"
         confidence_row="${confirm_row:-${baseline_row:-}}"
         if [[ -n "$confidence_row" ]]; then
             confidence=$(measurement_confidence "$(cut -f13 <<< "$confidence_row")" "$(cut -f12 <<< "$confidence_row")" "$(cut -f7 <<< "$confidence_row")" "$(cut -f11 <<< "$confidence_row")" 0 "$PATH_PROFILE_SCORE")
-            IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
+            IFS=$'\t' read -r sample_confidence_score sample_confidence_grade sample_confidence_reasons <<< "$confidence"
         else
-            confidence_score=0; confidence_grade=low; confidence_reasons=no-usable-sample
+            sample_confidence_score=0; sample_confidence_grade=low; sample_confidence_reasons=no-usable-sample
         fi
-        printf 'IDLE_RTT_MS\t%s\nUNSHAPED_RETRANS_PER_GIB\t%s\nUNSHAPED_LOADED_RTT_P95_MS\t%s\nUNSHAPED_BUFFERBLOAT_P95_MS\t%s\nUNSHAPED_BACKGROUND_TX_PERCENT_MAX\t%s\nUNSHAPED_CPU_BUSY_PERCENT_MAX\t%s\nUNSHAPED_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_RETRANS_PER_GIB\t%s\nCONFIRM_LOADED_RTT_P95_MS\t%s\nCONFIRM_BUFFERBLOAT_P95_MS\t%s\nCONFIRM_BACKGROUND_TX_PERCENT_MAX\t%s\nCONFIRM_CPU_BUSY_PERCENT_MAX\t%s\nCONFIRM_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_GOODPUT_SPREAD_PERCENT\t%s\nCONFIRM_SAMPLE_COUNT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
+        if [[ "$scan_decision" == inconclusive-* || "$baseline_quality" == forced-bad ]]; then
+            decision_confidence_score=0; decision_confidence_grade=low
+            decision_confidence_reasons="${reject_reason:-baseline-retrans-too-high}"
+            confidence_score="$decision_confidence_score"; confidence_grade="$decision_confidence_grade"; confidence_reasons="$decision_confidence_reasons"
+        else
+            decision_confidence_score="$sample_confidence_score"; decision_confidence_grade="$sample_confidence_grade"
+            decision_confidence_reasons="$sample_confidence_reasons"
+            confidence_score="$sample_confidence_score"; confidence_grade="$sample_confidence_grade"; confidence_reasons="$sample_confidence_reasons"
+        fi
+        printf 'IDLE_RTT_MS\t%s\nUNSHAPED_RETRANS_PER_GIB\t%s\nUNSHAPED_LOADED_RTT_P95_MS\t%s\nUNSHAPED_BUFFERBLOAT_P95_MS\t%s\nUNSHAPED_BACKGROUND_TX_PERCENT_MAX\t%s\nUNSHAPED_CPU_BUSY_PERCENT_MAX\t%s\nUNSHAPED_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_RETRANS_PER_GIB\t%s\nCONFIRM_LOADED_RTT_P95_MS\t%s\nCONFIRM_BUFFERBLOAT_P95_MS\t%s\nCONFIRM_BACKGROUND_TX_PERCENT_MAX\t%s\nCONFIRM_CPU_BUSY_PERCENT_MAX\t%s\nCONFIRM_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_GOODPUT_SPREAD_PERCENT\t%s\nCONFIRM_SAMPLE_COUNT\t%s\nSAMPLE_CONFIDENCE_SCORE\t%s\nSAMPLE_CONFIDENCE_GRADE\t%s\nSAMPLE_CONFIDENCE_REASONS\t%s\nDECISION_CONFIDENCE_SCORE\t%s\nDECISION_CONFIDENCE_GRADE\t%s\nDECISION_CONFIDENCE_REASONS\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
             "$MEASURE_IDLE_RTT_MS" "$(cut -f5 <<< "${baseline_row:-}")" "$(cut -f7 <<< "${baseline_row:-}")" "$(cut -f14 <<< "${baseline_row:-}")" \
             "$(cut -f8 <<< "${baseline_row:-}")" "$(cut -f9 <<< "${baseline_row:-}")" "$(cut -f10 <<< "${baseline_row:-}")" \
             "$(cut -f5 <<< "${confirm_row:-}")" "$(cut -f7 <<< "${confirm_row:-}")" "$(cut -f14 <<< "${confirm_row:-}")" \
             "$(cut -f8 <<< "${confirm_row:-}")" "$(cut -f9 <<< "${confirm_row:-}")" "$(cut -f10 <<< "${confirm_row:-}")" \
             "$(cut -f12 <<< "${confirm_row:-}")" "$(cut -f13 <<< "${confirm_row:-}")" \
+            "$sample_confidence_score" "$sample_confidence_grade" "$sample_confidence_reasons" \
+            "$decision_confidence_score" "$decision_confidence_grade" "$decision_confidence_reasons" \
             "$confidence_score" "$confidence_grade" "$confidence_reasons" >> "$dir/summary.tsv"
         measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         if [[ -n "${recommend:-}" ]]; then
@@ -1332,7 +1354,11 @@ measure_sweep() {
                 log INFO "确认业务表现后执行: ${0##*/} tc enable ${recommend} --knee ${broke_at:-0} --margin ${margin} --interface ${requested}"
             fi
         fi
-        log INFO "扫描置信度: ${confidence_grade} (${confidence_score}/100, ${confidence_reasons})"
+        if [[ "$scan_decision" == inconclusive-* ]]; then
+            log WARN "扫描结论: inconclusive（${decision_confidence_reasons}）；不会生成或持久化 measurement-derived 参数"
+        else
+            log INFO "扫描结论: ${scan_decision}；决策置信度 ${decision_confidence_grade} (${decision_confidence_score}/100, ${decision_confidence_reasons})"
+        fi
         log INFO "完整结果: $dir"
     fi
     traffic_report "$iface"

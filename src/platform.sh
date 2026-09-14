@@ -45,9 +45,11 @@ default_route_output() {
 }
 
 default_route_interface_for_family() {
-    local family="$1" output
+    local family="$1" output route
     output=$(default_route_output "$family") || return 1
-    route_output_interfaces <<< "$output" | sed -n '1p'
+    route=$(awk '$1=="default" {print; exit}' <<< "$output")
+    [[ -n "$route" ]] || return 0
+    route_unique_path_iface "$route" "IPv${family#-} 默认路由" "${family#-}"
 }
 
 default_route_interface() {
@@ -65,7 +67,7 @@ default_route_count() {
 
 route_output_has_multipath() {
     local output="$1"
-    [[ "$output" == *"nexthop"* ]] && return 0
+    [[ "$output" =~ (^|[[:space:]])nexthop([[:space:]]|$) ]] && return 0
     awk '
         {
             devs=0
@@ -76,9 +78,211 @@ route_output_has_multipath() {
     ' <<< "$output"
 }
 
-route_output_has_unresolved_nhid() {
-    local output="$1"
-    [[ "$output" =~ (^|[[:space:]])nhid([[:space:]]|$) ]]
+route_output_token_values() {
+    local token="$1"
+    awk -v token="$token" '{for (i=1; i<NF; i++) if ($i==token) print $(i+1)}'
+}
+
+route_output_token_count() {
+    local output="$1" token="$2"
+    awk -v token="$token" '{for (i=1; i<=NF; i++) if ($i==token) count++} END {print count+0}' <<< "$output"
+}
+
+route_output_nhids() {
+    route_output_token_values nhid | awk '/^[0-9]+$/ && $0 != "0" && !seen[$0]++'
+}
+
+route_output_via_records() {
+    awk '
+        function family_of(value) {return index(value, ":") ? 6 : 4}
+        {
+            for (i=1; i<NF; i++) {
+                if ($i != "via") continue
+                family=""; value=$(i+1)
+                if (value=="inet" || value=="inet6") {
+                    family=(value=="inet" ? 4 : 6)
+                    if (i+2>NF) continue
+                    value=$(i+2)
+                } else {
+                    family=family_of(value)
+                }
+                print family "\t" value
+            }
+        }
+    ' | awk -F'\t' '!seen[$0]++'
+}
+
+nexthop_object_output() {
+    local id="$1" family="${2:-}" output
+    # iproute2 6.15 can return "Unknown attribute type" for RTM_GETNEXTHOP
+    # against kernels that still provide a usable RTM_GETNEXTHOP dump.  Prefer
+    # the exact lookup, then conservatively select the exact ID from a dump;
+    # the caller still requires exactly one structurally valid record.
+    output=$(ip nexthop get id "$id" 2>/dev/null) || output=""
+    if [[ -z "$output" && ( "$family" == 4 || "$family" == 6 ) ]]; then
+        output=$(ip "-$family" nexthop get id "$id" 2>/dev/null) || output=""
+    fi
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output"
+        return 0
+    fi
+    ip nexthop show 2>/dev/null | awk -v id="$id" '$1=="id" && ($2 "")== (id "") {print}'
+}
+
+# Resolve a route-referenced nexthop object into one ordinary leaf.  Groups are
+# deliberately rejected as a class: even members on the same interface can
+# represent different gateways/hash paths, and accepting a singleton-looking
+# group would require proving concurrent group membership did not change.
+# Output: interface, gateway-or-none, gateway-family-or-none, nhid.
+nexthop_object_leaf_record() {
+    local id="$1" context="$2" expected_family="${3:-}" output line_count object_id
+    local interfaces iface interface_count gateways gateway_count gateway_family gateway
+    is_uint "$id" && (( id > 0 && id <= 4294967295 )) || {
+        die "$context 引用了非法 nexthop object ID: ${id:-missing}"
+        return 1
+    }
+    if ! output=$(nexthop_object_output "$id" "$expected_family") || [[ -z "$output" ]]; then
+        die "$context 引用 nhid $id，但无法解析该 nexthop object；为避免错误选择出口，已停止"
+        return 1
+    fi
+    line_count=$(awk 'NF {count++} END {print count+0}' <<< "$output")
+    if ! is_uint "$line_count" || (( line_count != 1 )); then
+        die "$context 引用 nhid $id，但查询返回了异常的 nexthop object 记录数；已停止"
+        return 1
+    fi
+    object_id=$(awk '$1=="id" {print $2; exit}' <<< "$output")
+    if [[ "$object_id" != "$id" ]] || (( $(route_output_token_count "$output" id) != 1 )); then
+        die "$context 引用 nhid $id，但 nexthop object 身份不一致或结构异常；已停止"
+        return 1
+    fi
+    if [[ "$output" =~ (^|[[:space:]])group([[:space:]]|$) ]]; then
+        die "$context 引用的 nhid $id 是 nexthop group；无法证明唯一 leaf 路径，已停止"
+        return 1
+    fi
+    if [[ "$output" =~ (^|[[:space:]])blackhole([[:space:]]|$) ]]; then
+        die "$context 引用的 nhid $id 是 blackhole；拒绝将其作为网络出口"
+        return 1
+    fi
+    if [[ "$output" =~ (^|[[:space:]])(unresolved|dead|linkdown|trap)([[:space:]]|$) ]] ||
+       [[ "$output" =~ (^|[[:space:]])encap([[:space:]]|$) ]]; then
+        die "$context 引用的 nhid $id 带有无法安全自动处理的状态或封装；已停止"
+        return 1
+    fi
+    interfaces=$(route_output_interfaces <<< "$output")
+    interface_count=$(awk 'NF {count++} END {print count+0}' <<< "$interfaces")
+    if ! is_uint "$interface_count" || (( interface_count != 1 )); then
+        die "$context 引用的 nhid $id 无法解析为唯一出口网卡"
+        return 1
+    fi
+    iface=$(sed -n '1p' <<< "$interfaces")
+    validate_interface_name "$iface" && [[ "$iface" != auto ]] || {
+        die "$context 引用的 nhid $id 返回非法出口网卡: ${iface:-missing}"
+        return 1
+    }
+    gateways=$(route_output_via_records <<< "$output")
+    gateway_count=$(awk 'NF {count++} END {print count+0}' <<< "$gateways")
+    if ! is_uint "$gateway_count" || (( gateway_count > 1 )); then
+        die "$context 引用的 nhid $id 返回多个或异常 gateway；已停止"
+        return 1
+    fi
+    gateway=none; gateway_family=none
+    if (( gateway_count == 1 )); then
+        IFS=$'\t' read -r gateway_family gateway <<< "$gateways"
+        [[ -n "$gateway" && "$gateway" != -* && "$gateway" != *[[:space:]]* ]] || {
+            die "$context 引用的 nhid $id 返回非法 gateway；已停止"
+            return 1
+        }
+        if [[ -n "$expected_family" && "$gateway_family" != "$expected_family" ]]; then
+            die "$context 引用的 nhid $id gateway 地址族为 IPv$gateway_family，与路由 IPv$expected_family 不一致；已停止"
+            return 1
+        fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$iface" "$gateway" "$gateway_family" "$id"
+}
+
+# Validate either a traditional route or a route backed by one nexthop object.
+# This is the single route-uniqueness gate used by default-route selection,
+# route-get/fibmatch, source-bound measurement and path fingerprints.
+# Output: interface, gateway-or-none, gateway-family-or-none, nhid-or-none.
+route_unique_path_record() {
+    local output="$1" context="$2" expected_family="${3:-}" nhid_tokens nhids nhid_count nhid
+    local route_interfaces route_iface_count route_iface route_gateways route_gateway_count
+    local route_gateway_family=none route_gateway=none leaf leaf_iface leaf_gateway leaf_family leaf_id
+    [[ "$expected_family" == "" || "$expected_family" == 4 || "$expected_family" == 6 ]] || return 1
+    [[ -n "$output" ]] || { die "$context 没有返回路由记录"; return 1; }
+    if route_output_has_multipath "$output"; then
+        die "$context 包含 inline ECMP/nexthop；无法证明出口唯一，已停止"
+        return 1
+    fi
+
+    nhid_tokens=$(route_output_token_count "$output" nhid)
+    nhids=$(route_output_nhids <<< "$output")
+    nhid_count=$(awk 'NF {count++} END {print count+0}' <<< "$nhids")
+    if ! is_uint "$nhid_tokens" || ! is_uint "$nhid_count" || (( nhid_tokens != nhid_count || nhid_count > 1 )); then
+        die "$context 包含缺失、重复或非法的 nhid；无法证明出口唯一，已停止"
+        return 1
+    fi
+
+    route_interfaces=$(route_output_interfaces <<< "$output")
+    route_iface_count=$(awk 'NF {count++} END {print count+0}' <<< "$route_interfaces")
+    if ! is_uint "$route_iface_count" || (( route_iface_count > 1 )); then
+        die "$context 无法确定唯一出口网卡"
+        return 1
+    fi
+    [[ "$route_iface_count" == 0 ]] || route_iface=$(sed -n '1p' <<< "$route_interfaces")
+    if [[ -n "${route_iface:-}" ]]; then
+        validate_interface_name "$route_iface" && [[ "$route_iface" != auto ]] || {
+            die "$context 返回非法出口网卡: $route_iface"
+            return 1
+        }
+    fi
+
+    route_gateways=$(route_output_via_records <<< "$output")
+    route_gateway_count=$(awk 'NF {count++} END {print count+0}' <<< "$route_gateways")
+    if ! is_uint "$route_gateway_count" || (( route_gateway_count > 1 )); then
+        die "$context 返回多个或异常 gateway；无法证明路径唯一"
+        return 1
+    fi
+    if (( route_gateway_count == 1 )); then
+        IFS=$'\t' read -r route_gateway_family route_gateway <<< "$route_gateways"
+        if [[ -n "$expected_family" && "$route_gateway_family" != "$expected_family" ]]; then
+            die "$context gateway 地址族为 IPv$route_gateway_family，与路由 IPv$expected_family 不一致；已停止"
+            return 1
+        fi
+    fi
+
+    if (( nhid_count == 0 )); then
+        (( route_iface_count == 1 )) || { die "$context 无法确定唯一出口网卡"; return 1; }
+        printf '%s\t%s\t%s\tnone\n' "$route_iface" "$route_gateway" "$route_gateway_family"
+        return 0
+    fi
+
+    nhid=$(sed -n '1p' <<< "$nhids")
+    leaf=$(nexthop_object_leaf_record "$nhid" "$context" "$expected_family") || return 1
+    IFS=$'\t' read -r leaf_iface leaf_gateway leaf_family leaf_id <<< "$leaf"
+    if [[ -n "${route_iface:-}" && "$route_iface" != "$leaf_iface" ]]; then
+        die "$context 的 route dev $route_iface 与 nhid $nhid leaf dev $leaf_iface 不一致；已停止"
+        return 1
+    fi
+    if [[ "$route_gateway" != none && "$leaf_gateway" == none ]]; then
+        die "$context 显示 gateway $route_gateway，但 nhid $nhid leaf 没有 gateway；已停止"
+        return 1
+    fi
+    if [[ "$route_gateway" != none && "$route_gateway" != "$leaf_gateway" ]]; then
+        die "$context 的 route gateway $route_gateway 与 nhid $nhid leaf gateway $leaf_gateway 不一致；已停止"
+        return 1
+    fi
+    if [[ "$route_gateway_family" != none && "$leaf_family" != none && "$route_gateway_family" != "$leaf_family" ]]; then
+        die "$context 的 route/nhid gateway 地址族不一致；已停止"
+        return 1
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$leaf_iface" "$leaf_gateway" "$leaf_family" "$leaf_id"
+}
+
+route_unique_path_iface() {
+    local record
+    record=$(route_unique_path_record "$@") || return 1
+    cut -f1 <<< "$record"
 }
 
 default_route_has_multipath() {
@@ -107,7 +311,7 @@ resolve_route_target_addresses() {
 }
 
 target_route_records() {
-    local target="$1" family address output fibmatch iface fib_iface dev_count fib_dev_count addresses
+    local target="$1" family address output fibmatch iface fib_iface addresses
     local resolved_count=0 verified_count=0
     addresses=$(resolve_route_target_addresses "$target") || return 1
     [[ -n "$addresses" ]] || { die "无法解析测速目标 $target 的任何路由候选地址"; return 1; }
@@ -118,21 +322,7 @@ target_route_records() {
             die "测速目标 $address 无法完成 route-get；所有解析候选都必须可核验，已停止"
             return 1
         fi
-        if route_output_has_unresolved_nhid "$output"; then
-            die "测速目标 $address 的 route-get 包含未解析的 nexthop object (nhid)；无法证明出口唯一，已停止"
-            return 1
-        fi
-        if route_output_has_multipath "$output"; then
-            die "测速目标 $address 的 route-get 返回 ECMP/nexthop；v${SCRIPT_VERSION} 不会在多路径上自动调优"
-            return 1
-        fi
-        dev_count=$(route_output_interfaces <<< "$output" | wc -l | awk '{print $1}')
-        if ! is_uint "${dev_count:-}" || (( dev_count != 1 )); then
-            die "测速目标 $address 的 route-get 无法确定唯一出口"
-            return 1
-        fi
-        iface=$(route_output_interfaces <<< "$output" | sed -n '1p')
-        validate_interface_name "$iface" || { die "测速目标 $address 返回非法出口网卡: $iface"; return 1; }
+        iface=$(route_unique_path_iface "$output" "测速目标 $address 的 route-get" "$family") || return 1
 
         # `route get` can hash an ECMP route and expose only one selected dev.
         # fibmatch returns the underlying FIB entry (including its nexthops).
@@ -140,21 +330,7 @@ target_route_records() {
             die "当前 iproute2 无法用 fibmatch 核验测速目标 $address；不完整的 route-show fallback 不能证明策略路由出口，已停止"
             return 1
         fi
-        if route_output_has_unresolved_nhid "$fibmatch"; then
-            die "测速目标 $address 的 FIB 匹配包含未解析的 nexthop object (nhid)；无法证明出口唯一，已停止"
-            return 1
-        fi
-        if route_output_has_multipath "$fibmatch"; then
-            die "测速目标 $address 的 FIB 匹配包含 ECMP/nexthop；v${SCRIPT_VERSION} 不会自动选择其中一条路径"
-            return 1
-        fi
-        fib_dev_count=$(route_output_interfaces <<< "$fibmatch" | wc -l | awk '{print $1}')
-        if ! is_uint "${fib_dev_count:-}" || (( fib_dev_count != 1 )); then
-            die "测速目标 $address 的 fibmatch 无法确定唯一出口"
-            return 1
-        fi
-        fib_iface=$(route_output_interfaces <<< "$fibmatch" | sed -n '1p')
-        validate_interface_name "$fib_iface" || { die "测速目标 $address 的 fibmatch 返回非法出口网卡: $fib_iface"; return 1; }
+        fib_iface=$(route_unique_path_iface "$fibmatch" "测速目标 $address 的 fibmatch" "$family") || return 1
         [[ "$fib_iface" == "$iface" ]] || {
             die "测速目标 $address 的 route-get/fibmatch 出口不一致（$iface/$fib_iface）；无法证明路径稳定，已停止"
             return 1
@@ -173,7 +349,7 @@ target_route_records() {
 # measurement freezes one literal/source/interface tuple. Ambiguous paths fail
 # closed and no route is altered.
 auto_tune_route_guard() {
-    local expected_iface="$1" target="${2:-}" family output count v4_iface v6_iface records
+    local expected_iface="$1" target="${2:-}" family output count v4_iface v6_iface records route route_iface
     local route_family address iface first_iface=""
     validate_interface_name "$expected_iface" || { die "自动调优选中了非法网卡: $expected_iface"; return 1; }
 
@@ -199,14 +375,15 @@ auto_tune_route_guard() {
     for family in -4 -6; do
         output=$(default_route_output "$family") || return 1
         count=$(awk '$1=="default" {count++} END {print count+0}' <<< "$output")
-        if route_output_has_unresolved_nhid "$output"; then
-            die "IPv${family#-} 默认路由包含未解析的 nexthop object (nhid)；无法证明出口唯一，已停止"
-            return 1
-        fi
-        if [[ "$output" == *"nexthop"* ]] || default_route_has_multipath "$family"; then
+        if default_route_has_multipath "$family"; then
             die "IPv${family#-} 默认路由包含 ECMP/nexthop；v${SCRIPT_VERSION} 不会自动选择其中一条路径"
             return 1
         fi
+        while IFS= read -r route; do
+            [[ -n "$route" && "$route" =~ (^|[[:space:]])nhid([[:space:]]|$) ]] || continue
+            route_iface=$(route_unique_path_iface "$route" "IPv${family#-} 默认路由" "${family#-}") || return 1
+            [[ -n "$route_iface" ]] || return 1
+        done <<< "$output"
         if (( count > 1 )); then
             log WARN "检测到 ${count} 条 IPv${family#-} 默认路由；将以具体测速目标的 route-get 结果决定是否可安全继续"
         fi

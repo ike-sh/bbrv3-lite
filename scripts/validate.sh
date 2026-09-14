@@ -12,7 +12,7 @@ for file in src/*.sh scripts/*.sh tests/*.sh install-alias.sh; do bash -n "$file
 bash -n net-tcp-tune.sh
 
 echo "==> Generated artifact markers"
-grep -Fq 'SCRIPT_VERSION="8.0.3"' net-tcp-tune.sh
+grep -Fq 'SCRIPT_VERSION="8.0.4"' net-tcp-tune.sh
 grep -Fq 'Configuration is data and is never sourced' net-tcp-tune.sh
 grep -Fq 'MEASURE_PEER_PORT=""' net-tcp-tune.sh
 grep -Fq 'LOCKED_PORT' net-tcp-tune.sh
@@ -36,6 +36,9 @@ grep -Fq 'hardware_profile_values' net-tcp-tune.sh
 grep -Fq 'recommended_scan_cap' net-tcp-tune.sh
 grep -Fq 'MULTI_FLOWS' net-tcp-tune.sh
 grep -Fq 'auto_tune_route_guard' net-tcp-tune.sh
+grep -Fq 'nexthop_object_leaf_record' net-tcp-tune.sh
+grep -Fq 'SCAN_DECISION' net-tcp-tune.sh
+grep -Fq 'FINAL_VERIFY_MODE' net-tcp-tune.sh
 grep -Fq 'path_capture_route_identity' net-tcp-tune.sh
 grep -Fq 'PATH_ROUTE_FINGERPRINT' net-tcp-tune.sh
 grep -Fq 'PATH_ENDPOINT_FINGERPRINT' net-tcp-tune.sh
