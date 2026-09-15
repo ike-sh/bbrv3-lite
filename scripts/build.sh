@@ -12,6 +12,7 @@ MODULES=(
     config.sh
     platform.sh
     path.sh
+    peer-health.sh
     state.sh
     sysctl.sh
     tc.sh
@@ -24,6 +25,7 @@ MODULES=(
     ipv6.sh
     ipv6-policy.sh
     update.sh
+    diagnostics.sh
     cli.sh
 )
 

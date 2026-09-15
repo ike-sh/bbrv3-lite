@@ -3,8 +3,8 @@
 # -----------------------------------------------------------------------------
 
 self_update() {
-    require_root || return 1; acquire_lock || return 1; require_commands curl awk sha256sum sort install grep || return 1
-    local latest latest_version current target tmp base expected actual backup newest persist_distinct=0
+    require_root || return 1; acquire_lock || return 1; require_commands bash cmp cp curl awk sha256sum sort install grep readlink || return 1
+    local latest latest_version current target tmp base expected actual backup newest persist_distinct=0 postcheck_rc=0
     current=$(current_script_path 2>/dev/null || true)
     if [[ -z "$current" ]]; then
         current=$(command -v bbr 2>/dev/null || true)
@@ -41,6 +41,7 @@ self_update() {
     atomic_install "$tmp/current.before" "$backup" 0755 || { rm -rf "$tmp"; die "无法写入上一版本备份: $backup"; return 1; }
     if [[ -e "$PERSIST_SCRIPT" && "$(readlink -f "$PERSIST_SCRIPT")" != "$(readlink -f "$target")" ]]; then
         persist_distinct=1
+        cp -a -- "$PERSIST_SCRIPT" "$tmp/persist.before" || { rm -rf "$tmp"; die "无法备份 systemd 持久化副本"; return 1; }
     fi
     if ! atomic_install "$tmp/net-tcp-tune.sh" "$target" 0755; then
         rm -rf "$tmp"
@@ -57,6 +58,31 @@ self_update() {
         die "持久化副本更新失败；当前 bbr 命令已回滚到更新前版本"
         return 1
     fi
+    # Verify the installed bytes, parser and both version markers after the
+    # atomic replacements.  This is intentionally file-only: update never
+    # reapplies networking or changes the current runtime configuration.
+    bash -n "$target" || postcheck_rc=1
+    [[ "$(sha256sum "$target" | awk '{print $1}')" == "$expected" ]] || postcheck_rc=1
+    grep -Fxc "SCRIPT_VERSION=\"${latest#v}\"" "$target" >/dev/null || postcheck_rc=1
+    if (( persist_distinct )); then
+        bash -n "$PERSIST_SCRIPT" || postcheck_rc=1
+        cmp -s "$target" "$PERSIST_SCRIPT" || postcheck_rc=1
+        grep -Fxc "SCRIPT_VERSION=\"${latest#v}\"" "$PERSIST_SCRIPT" >/dev/null || postcheck_rc=1
+    fi
+    if (( postcheck_rc != 0 )); then
+        atomic_install "$tmp/current.before" "$target" 0755 || {
+            rm -rf "$tmp"; die "更新后自检失败，且当前命令回滚失败；上一版本仍保存在 $backup"; return 1;
+        }
+        if (( persist_distinct )); then
+            atomic_install "$tmp/persist.before" "$PERSIST_SCRIPT" 0755 || {
+                rm -rf "$tmp"; die "更新后自检失败；当前命令已恢复，但持久化副本回滚失败"; return 1;
+            }
+        fi
+        rm -rf "$tmp"
+        die "更新后 bash/version/checksum/persistence 自检失败；程序文件已回滚，网络运行时未改变"
+        return 1
+    fi
     rm -rf "$tmp"
-    log OK "已更新到 $latest；上一版本保存在 $backup"
+    log OK "已更新到 $latest；bash/version/checksum/persistence 自检通过；上一版本保存在 $backup"
+    log INFO "更新仅替换程序文件，未自动重新应用网络配置；可运行 bbr verify 检查当前 runtime"
 }

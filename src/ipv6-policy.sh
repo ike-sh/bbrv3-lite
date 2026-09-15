@@ -278,7 +278,7 @@ ipv6_policy_collect() {
     case "$target:$IPV6_POLICY_CURRENT" in
         disabled-temporary:disabled-temporary|disabled-persistent:disabled-persistent)
             IPV6_POLICY_DECISION=noop
-            IPV6_POLICY_ACTION=verify-current
+            IPV6_POLICY_ACTION="verify-current"
             IPV6_POLICY_REASON="当前策略已匹配；只执行独立一致性验证"
             ;;
         disabled-temporary:*)

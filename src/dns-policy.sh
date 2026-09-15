@@ -157,7 +157,7 @@ dns_policy_collect() {
 
     DNS_POLICY_DECISION=ready
     if [[ "$DNS_POLICY_CURRENT" == "$target" ]]; then
-        DNS_POLICY_ACTION=verify-and-repair
+        DNS_POLICY_ACTION="verify-and-repair"
         DNS_POLICY_REASON="策略文件已匹配；仍将事务性重载并执行真实查询验证"
     elif [[ "$target" == strict-dot ]]; then
         DNS_POLICY_ACTION=install-strict-dot

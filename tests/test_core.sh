@@ -23,6 +23,9 @@ export BBRV3_IPV6_SYSCTL_FILE="$TEST_ROOT/etc/99-bbrv3-lite-ipv6.conf"
 export BBRV3_NIC_POLICY_DIR="$TEST_ROOT/etc/interfaces.d"
 export BBRV3_NIC_STATE_DIR="$TEST_ROOT/state/interfaces"
 export BBRV3_MEASUREMENT_COOLDOWN=0
+# Legacy core-state-machine fixtures mock their own route/interface telemetry.
+# v8.0.6 preflight behavior has dedicated deterministic coverage in test_v806.sh.
+export BBRV3_SKIP_MEASUREMENT_PREFLIGHT=1
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 # shellcheck source=../net-tcp-tune.sh
@@ -945,7 +948,8 @@ test_measure_compare_is_temporary_and_auditable() {
         # integration coverage in test_measure_v721.sh.
         measure_lock_peer() {
             MEASURE_PEER_HOST="$1"; MEASURE_PEER_ADDRESS=203.0.113.10
-            MEASURE_PEER_SOURCE=192.0.2.10; MEASURE_PEER_FAMILY=4; MEASURE_PEER_IFACE="$2"
+            MEASURE_PEER_SOURCE=192.0.2.10; MEASURE_PEER_FAMILY=4
+            if [[ "$2" == auto ]]; then MEASURE_PEER_IFACE=eth0; else MEASURE_PEER_IFACE="$2"; fi
             path_state_reset
             PATH_PROFILE_SCORE=100; PATH_PROFILE_GRADE=high; PATH_DECISION=trusted; PATH_RISK_FLAGS=clean
         }
@@ -1258,9 +1262,9 @@ test_self_update_rolls_back_split_install() {
         local update_root="$TEST_ROOT/self-update" installed_path candidate valid_candidate output_path="" url="" update_output="" fail_persist=1
         mkdir -p "$update_root"
         installed_path="$update_root/bbr"; candidate="$update_root/new.sh"; valid_candidate="$update_root/new.valid.sh"; PERSIST_SCRIPT="$update_root/persist.sh"
-        sed 's/^SCRIPT_VERSION="8.0.5"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
+        sed 's/^SCRIPT_VERSION="8.0.6"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
         cp "$installed_path" "$PERSIST_SCRIPT"; chmod 0755 "$installed_path" "$PERSIST_SCRIPT"
-        sed 's/^SCRIPT_VERSION="8.0.5"$/SCRIPT_VERSION="8.0.6"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
+        sed 's/^SCRIPT_VERSION="8.0.6"$/SCRIPT_VERSION="8.0.7"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
         cp "$candidate" "$valid_candidate"
         require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
         current_script_path() { printf '%s\n' "$installed_path"; }
@@ -1275,7 +1279,7 @@ test_self_update_rolls_back_split_install() {
                 esac
             done
             case "$url" in
-                */releases/latest) printf '{"tag_name":"v8.0.6"}\n' ;;
+                */releases/latest) printf '{"tag_name":"v8.0.7"}\n' ;;
                 */net-tcp-tune.sh) cp "$candidate" "$output_path" ;;
                 */SHA256SUMS)
                     printf '%s  net-tcp-tune.sh\n' "$(sha256sum "$candidate" | awk '{print $1}')" > "$output_path"
@@ -1288,7 +1292,7 @@ test_self_update_rolls_back_split_install() {
             [[ "$target" != "$PERSIST_SCRIPT" || "$fail_persist" == 0 ]] || return 9
             cp "$source" "$target"; chmod 0755 "$target"
         }
-        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.6"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
+        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.7"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
         if self_update >/dev/null 2>&1; then fail "checksum-matching false-marker update was accepted"; fi
         grep -Fq 'SCRIPT_VERSION="8.0.1"' "$installed_path" || fail "rejected false-marker update changed current command"
         cp "$valid_candidate" "$candidate"
@@ -1299,8 +1303,8 @@ test_self_update_rolls_back_split_install() {
 
         fail_persist=0
         self_update >/dev/null
-        grep -Fq 'SCRIPT_VERSION="8.0.6"' "$installed_path" || fail "successful update did not replace current command"
-        grep -Fq 'SCRIPT_VERSION="8.0.6"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
+        grep -Fq 'SCRIPT_VERSION="8.0.7"' "$installed_path" || fail "successful update did not replace current command"
+        grep -Fq 'SCRIPT_VERSION="8.0.7"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
     )
 }
 

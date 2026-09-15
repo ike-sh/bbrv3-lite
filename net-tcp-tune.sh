@@ -3,11 +3,42 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="8.0.5"
+SCRIPT_VERSION="8.0.6"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
 STATE_SCHEMA="1"
+
+# Authoritative non-generic process return-code registry.  Keep this block
+# unique: callers use these values to distinguish retry/failover decisions from
+# hard safety failures.  Generic validation and I/O failures continue to use 1;
+# an evidence-only inconclusive measurement continues to use 2.
+IPERF_DATA_RC=65                 # malformed/incomplete iperf protocol data (fatal)
+IPERF_CONTAMINATED_RC=66         # locally contaminated sample (peer failover allowed)
+IPERF_UNSTABLE_RC=67             # unstable repeated samples (peer failover allowed)
+MEASURE_PATH_QUALITY_RC=68       # dirty PATH_CONTROL (peer failover allowed)
+MEASURE_ROUTE_MISMATCH_RC=69     # frozen route/path changed (peer failover allowed)
+MEASURE_BUDGET_RC=70             # top-level operation traffic/time budget exhausted
+MEASUREMENT_PREFLIGHT_RC=71      # local environment rejected high-volume measurement
+DIAGNOSTIC_EXPORT_RC=72          # diagnostic bundle could not be produced safely
+ROLLBACK_FAILURE_RC=73           # restoration failed; highest-priority user failure
+IPERF_UNAVAILABLE_RC=75          # endpoint busy/reset/timeout/unavailable; retryable
+
+operation_rc_class() {
+    case "$1" in
+        0) printf 'success\n' ;;
+        2|"$IPERF_CONTAMINATED_RC"|"$IPERF_UNSTABLE_RC"|"$MEASURE_PATH_QUALITY_RC"|\
+        "$MEASURE_ROUTE_MISMATCH_RC"|"$IPERF_UNAVAILABLE_RC") printf 'peer-failover\n' ;;
+        "$MEASURE_BUDGET_RC") printf 'budget\n' ;;
+        "$MEASUREMENT_PREFLIGHT_RC") printf 'preflight\n' ;;
+        "$ROLLBACK_FAILURE_RC") printf 'rollback\n' ;;
+        *) printf 'fatal\n' ;;
+    esac
+}
+
+operation_rc_is_retryable() {
+    [[ "$1" == "$IPERF_UNAVAILABLE_RC" ]]
+}
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     set -Eeuo pipefail
@@ -22,6 +53,7 @@ STATE_DIR="${BBRV3_STATE_DIR:-/var/lib/bbrv3-lite}"
 BASELINE_DIR="${BBRV3_BASELINE_DIR:-${STATE_DIR}/baseline}"
 LEGACY_BACKUP_DIR="${BBRV3_LEGACY_BACKUP_DIR:-${STATE_DIR}/original}"
 HISTORY_DIR="${BBRV3_HISTORY_DIR:-${STATE_DIR}/history}"
+PEER_HEALTH_DIR="${BBRV3_PEER_HEALTH_DIR:-${STATE_DIR}/peer-health}"
 PERSIST_DIR="${BBRV3_PERSIST_DIR:-/usr/local/lib/bbrv3-lite}"
 PERSIST_SCRIPT="${BBRV3_PERSIST_SCRIPT:-${PERSIST_DIR}/net-tcp-tune.sh}"
 SERVICE_NAME="bbrv3-lite.service"
@@ -35,6 +67,8 @@ IPV6_BACKUP_DIR="${BBRV3_IPV6_BACKUP_DIR:-${STATE_DIR}/ipv6}"
 STANDARD_NIC_POLICY_DIR="/etc/bbrv3-lite/interfaces.d"
 NIC_POLICY_DIR="${BBRV3_NIC_POLICY_DIR:-$STANDARD_NIC_POLICY_DIR}"
 NIC_STATE_DIR="${BBRV3_NIC_STATE_DIR:-${STATE_DIR}/interfaces}"
+DIAGNOSTIC_TEMP_DIR=""
+DIAGNOSTIC_TEMP_ARCHIVE=""
 
 COLOR_ENABLED=0
 if [[ -t 1 && "${NO_COLOR:-}" == "" ]]; then COLOR_ENABLED=1; fi
@@ -185,6 +219,16 @@ cleanup_core() {
     if [[ -n "${ACTION_TRANSACTION_DIR:-}" ]] && declare -F action_transaction_rollback >/dev/null; then
         log WARN "进程退出时仍有未提交事务，正在恢复操作前状态"
         action_transaction_rollback || cleanup_rc=1
+    fi
+    if [[ -n "${DIAGNOSTIC_TEMP_DIR:-}" && -d "$DIAGNOSTIC_TEMP_DIR" ]] &&
+       [[ "$DIAGNOSTIC_TEMP_DIR" == /tmp/.bbrv3-lite-diagnostic.* ]]; then
+        rm -rf -- "$DIAGNOSTIC_TEMP_DIR" || cleanup_rc=1
+        DIAGNOSTIC_TEMP_DIR=""
+    fi
+    if [[ -n "${DIAGNOSTIC_TEMP_ARCHIVE:-}" ]] &&
+       [[ "$DIAGNOSTIC_TEMP_ARCHIVE" == /tmp/.bbrv3-lite-diagnostic-archive.* ]]; then
+        rm -f -- "$DIAGNOSTIC_TEMP_ARCHIVE" || cleanup_rc=1
+        DIAGNOSTIC_TEMP_ARCHIVE=""
     fi
     release_lock || cleanup_rc=1
     (( rc != 0 )) && return "$rc"
@@ -1089,7 +1133,10 @@ path_route_normalize() {
                 # Route MTU is captured separately so a real PMTU change still
                 # changes the fingerprint.
                 if ($i=="cache") break
-                if ($i=="uid" || $i=="expires") {i++; continue}
+                # A nexthop object numeric ID is allocation metadata.  Its
+                # resolved leaf is validated separately and is the topology
+                # identity, so RA-driven ID churn must not look like drift.
+                if ($i=="uid" || $i=="expires" || $i=="nhid" || $i=="metric" || $i=="proto") {i++; continue}
                 value=$i
                 if (value==address) value="<target>"
                 out=(out=="" ? value : out " " value)
@@ -1117,8 +1164,9 @@ path_hash_payload() {
 # not look like an egress change. The endpoint fingerprint retains the literal.
 path_capture_route_identity() {
     local family="$1" address="$2" source="$3" iface="$4"
-    local route fib route_norm fib_norm gateway table iface_mtu route_mtu route_payload
+    local route fib gateway table iface_mtu route_mtu route_payload
     local route_fp endpoint_fp route_state fib_state route_iface fib_iface
+    local route_gateway route_gateway_family fib_gateway fib_gateway_family
     [[ "$family" == 4 || "$family" == 6 ]] || return 1
     measure_source_address_is_valid "$family" "$source" || return 1
     validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
@@ -1135,17 +1183,28 @@ path_capture_route_identity() {
         return 1
     }
 
-    route_norm=$(path_route_normalize "$address" <<< "$route") || return 1
-    fib_norm=$(path_route_normalize "$address" <<< "$fib") || return 1
-    [[ -n "$route_norm" && -n "$fib_norm" ]] || return 1
-    gateway=$(path_token_after via <<< "$route"); gateway="${gateway:-none}"
-    table=$(path_token_after table <<< "$fib"); table="${table:-main}"
+    IFS=$'\t' read -r route_iface route_gateway route_gateway_family _ <<< "$route_state"
+    IFS=$'\t' read -r fib_iface fib_gateway fib_gateway_family _ <<< "$fib_state"
+    gateway="$route_gateway"; [[ "$gateway" != none ]] || gateway="$fib_gateway"
+    # route-get reports the table actually selected after policy lookup.  Some
+    # iproute2/kernel combinations intermittently omit the table token from
+    # fibmatch once a destination exception/cache entry exists, so use the
+    # selected route first and fibmatch only as a fallback.  Both records are
+    # still resolved and fail-closed above.
+    table=$(path_token_after table <<< "$route")
+    [[ -n "$table" ]] || table=$(path_token_after table <<< "$fib")
+    table="${table:-main}"
     iface_mtu=$(detect_mtu "$iface"); is_uint "$iface_mtu" || iface_mtu=unknown
     route_mtu=$(path_token_after mtu <<< "$route")
     if ! is_uint "${route_mtu:-}"; then route_mtu="$iface_mtu"; fi
 
-    route_payload=$(printf 'family=%s\nsource=%s\ninterface=%s\ngateway=%s\ntable=%s\ninterface_mtu=%s\nroute_mtu=%s\nroute_state=%s\nfib_state=%s\nroute=%s\nfib=%s\n' \
-        "$family" "$source" "$iface" "$gateway" "$table" "$iface_mtu" "$route_mtu" "$route_state" "$fib_state" "$route_norm" "$fib_norm") || return 1
+    # Only forwarding semantics are fingerprinted.  In particular, nhid,
+    # expires/cache, protocol and metric presentation are intentionally absent.
+    # route_unique_path_record above still resolves every nhid and rejects
+    # groups/ECMP/invalid leaves on every capture.
+    route_payload=$(printf 'family=%s\nsource=%s\ninterface=%s\ngateway=%s\ngateway_family=%s\ntable=%s\ninterface_mtu=%s\nroute_mtu=%s\nroute_leaf=%s|%s|%s\nfib_leaf=%s|%s|%s\n' \
+        "$family" "$source" "$iface" "$gateway" "$route_gateway_family" "$table" "$iface_mtu" "$route_mtu" \
+        "$route_iface" "$route_gateway" "$route_gateway_family" "$fib_iface" "$fib_gateway" "$fib_gateway_family") || return 1
     route_fp=$(path_hash_payload <<< "$route_payload") || return 1
     endpoint_fp=$(printf '%saddress=%s\n' "$route_payload" "$address" | path_hash_payload) || return 1
     [[ "$route_fp" =~ ^[0-9a-f]{64}$ && "$endpoint_fp" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -1415,6 +1474,354 @@ latest_path_brief() {
     score=$(path_summary_value "$file" PATH_PROFILE_SCORE)
     printf '%s / %s / IPv%s / %s / %s / PMTU %s / %s/100\n' \
         "${peer:-unknown}" "${iface:-unknown}" "${family:-?}" "${latency:-unknown}" "${stability:-unknown}" "${pmtu:-unknown}" "${score:-0}"
+}
+
+# -----------------------------------------------------------------------------
+# Public iperf peer health: bounded, local-only and strictly parsed state.
+# Health affects candidate ordering only; every endpoint is still prechecked.
+# -----------------------------------------------------------------------------
+
+PEER_HEALTH_SCHEMA="1"
+PEER_HEALTH_WINDOW_SIZE=12
+
+peer_health_reset_values() {
+    PH_HOST=""; PH_FAMILY=""; PH_ADDRESS=""; PH_PORT=""
+    PH_LAST_SUCCESS=0; PH_LAST_FAILURE=0
+    PH_SUCCESS_COUNT=0; PH_FAILURE_COUNT=0; PH_BUSY_COUNT=0; PH_RESET_COUNT=0
+    PH_TIMEOUT_COUNT=0; PH_PATH_DIRTY_COUNT=0; PH_SLOW_PEER_COUNT=0; PH_UNSTABLE_COUNT=0
+    PH_LAST_RTT_MS=na; PH_LAST_RECEIVER_MBIT=na; PH_LAST_PATH_CONTROL_QUALITY=unknown
+    PH_LAST_FAILURE_REASON=none; PH_TEMPORARY_PENALTY_UNTIL=0; PH_RECENT_WINDOW=""
+    PH_LAST_RESULT=unknown; PH_UPDATED_AT=0
+}
+
+peer_health_is_public_host() {
+    local wanted="$1" host _
+    while IFS='|' read -r host _; do
+        [[ -n "$host" ]] || continue
+        [[ "$host" == "$wanted" ]] && return 0
+    done <<< "$PUBLIC_PEER_POOL"
+    return 1
+}
+
+peer_health_key() {
+    local host="$1" family="$2" address="$3" port="$4" digest
+    if command_exists sha256sum; then
+        digest=$(printf '%s\n' "$host|$family|$address|$port" | sha256sum | awk '{print $1}')
+    elif command_exists openssl; then
+        digest=$(printf '%s\n' "$host|$family|$address|$port" | openssl dgst -sha256 | awk '{print $NF}')
+    else
+        return 1
+    fi
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf 'endpoint-%s.tsv\n' "$digest"
+}
+
+peer_health_file() {
+    local key
+    key=$(peer_health_key "$@") || return 1
+    printf '%s/%s\n' "$PEER_HEALTH_DIR" "$key"
+}
+
+peer_health_counter_valid() {
+    is_uint "$1" && (( 10#$1 <= 1000000000 ))
+}
+
+peer_health_timestamp_valid() {
+    is_uint "$1" && (( 10#$1 <= 4294967295 ))
+}
+
+peer_health_load() {
+    local file="$1" line key value lineno=0 schema=""
+    local required
+    local -A seen=()
+    peer_health_reset_values
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((lineno+=1)); line="${line%$'\r'}"
+        [[ "$line" == *$'\t'* ]] || return 1
+        key="${line%%$'\t'*}"; value="${line#*$'\t'}"
+        [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ && "$value" != *$'\t'* && "$value" != *$'\n'* ]] || return 1
+        [[ -z "${seen[$key]+x}" ]] || return 1
+        seen[$key]=1
+        case "$key" in
+            SCHEMA) schema="$value" ;;
+            HOST) PH_HOST="$value" ;;
+            FAMILY) PH_FAMILY="$value" ;;
+            ADDRESS) PH_ADDRESS="$value" ;;
+            PORT) PH_PORT="$value" ;;
+            LAST_SUCCESS) PH_LAST_SUCCESS="$value" ;;
+            LAST_FAILURE) PH_LAST_FAILURE="$value" ;;
+            SUCCESS_COUNT) PH_SUCCESS_COUNT="$value" ;;
+            FAILURE_COUNT) PH_FAILURE_COUNT="$value" ;;
+            BUSY_COUNT) PH_BUSY_COUNT="$value" ;;
+            RESET_COUNT) PH_RESET_COUNT="$value" ;;
+            TIMEOUT_COUNT) PH_TIMEOUT_COUNT="$value" ;;
+            PATH_DIRTY_COUNT) PH_PATH_DIRTY_COUNT="$value" ;;
+            SLOW_PEER_COUNT) PH_SLOW_PEER_COUNT="$value" ;;
+            UNSTABLE_COUNT) PH_UNSTABLE_COUNT="$value" ;;
+            LAST_RTT_MS) PH_LAST_RTT_MS="$value" ;;
+            LAST_RECEIVER_MBIT) PH_LAST_RECEIVER_MBIT="$value" ;;
+            LAST_PATH_CONTROL_QUALITY) PH_LAST_PATH_CONTROL_QUALITY="$value" ;;
+            LAST_FAILURE_REASON) PH_LAST_FAILURE_REASON="$value" ;;
+            TEMPORARY_PENALTY_UNTIL) PH_TEMPORARY_PENALTY_UNTIL="$value" ;;
+            RECENT_WINDOW) PH_RECENT_WINDOW="$value" ;;
+            LAST_RESULT) PH_LAST_RESULT="$value" ;;
+            UPDATED_AT) PH_UPDATED_AT="$value" ;;
+            *) return 1 ;;
+        esac
+    done < "$file"
+    for required in SCHEMA HOST FAMILY ADDRESS PORT LAST_SUCCESS LAST_FAILURE SUCCESS_COUNT FAILURE_COUNT \
+        BUSY_COUNT RESET_COUNT TIMEOUT_COUNT PATH_DIRTY_COUNT SLOW_PEER_COUNT UNSTABLE_COUNT LAST_RTT_MS \
+        LAST_RECEIVER_MBIT LAST_PATH_CONTROL_QUALITY LAST_FAILURE_REASON TEMPORARY_PENALTY_UNTIL \
+        RECENT_WINDOW LAST_RESULT UPDATED_AT; do
+        [[ -n "${seen[$required]+x}" ]] || return 1
+    done
+    is_uint "$schema" || return 1
+    (( 10#$schema <= PEER_HEALTH_SCHEMA )) || return 2
+    [[ "$schema" == "$PEER_HEALTH_SCHEMA" ]] || return 1
+    validate_peer "$PH_HOST" "$PH_PORT" 2>/dev/null || return 1
+    [[ "$PH_FAMILY" == 4 || "$PH_FAMILY" == 6 ]] || return 1
+    measure_source_address_is_valid "$PH_FAMILY" "$PH_ADDRESS" || return 1
+    for value in "$PH_SUCCESS_COUNT" "$PH_FAILURE_COUNT" "$PH_BUSY_COUNT" "$PH_RESET_COUNT" \
+        "$PH_TIMEOUT_COUNT" "$PH_PATH_DIRTY_COUNT" "$PH_SLOW_PEER_COUNT" "$PH_UNSTABLE_COUNT"; do
+        peer_health_counter_valid "$value" || return 1
+    done
+    for value in "$PH_LAST_SUCCESS" "$PH_LAST_FAILURE" "$PH_TEMPORARY_PENALTY_UNTIL" "$PH_UPDATED_AT"; do
+        peer_health_timestamp_valid "$value" || return 1
+    done
+    [[ "$PH_LAST_RTT_MS" == na ]] || is_decimal "$PH_LAST_RTT_MS" || return 1
+    [[ "$PH_LAST_RECEIVER_MBIT" == na ]] || is_decimal "$PH_LAST_RECEIVER_MBIT" || return 1
+    [[ "$PH_LAST_PATH_CONTROL_QUALITY" =~ ^(unknown|clean|good|dirty|slow-peer)$ ]] || return 1
+    [[ "$PH_LAST_FAILURE_REASON" =~ ^[a-z0-9-]{1,64}$ ]] || return 1
+    [[ "$PH_RECENT_WINDOW" =~ ^[SBRDTLUFIK]{0,12}$ ]] || return 1
+    [[ "$PH_LAST_RESULT" =~ ^[a-z0-9-]{1,64}$ ]] || return 1
+}
+
+peer_health_write() {
+    local file="$1" temp
+    ensure_state_layout || return 1
+    [[ ! -L "$PEER_HEALTH_DIR" ]] || { die "peer health 目录不能是符号链接"; return 1; }
+    mkdir -p -- "$PEER_HEALTH_DIR" || return 1
+    chmod 0700 "$PEER_HEALTH_DIR" 2>/dev/null || true
+    temp=$(mktemp "${PEER_HEALTH_DIR}/.endpoint.XXXXXX") || return 1
+    if ! printf 'SCHEMA\t%s\nHOST\t%s\nFAMILY\t%s\nADDRESS\t%s\nPORT\t%s\nLAST_SUCCESS\t%s\nLAST_FAILURE\t%s\nSUCCESS_COUNT\t%s\nFAILURE_COUNT\t%s\nBUSY_COUNT\t%s\nRESET_COUNT\t%s\nTIMEOUT_COUNT\t%s\nPATH_DIRTY_COUNT\t%s\nSLOW_PEER_COUNT\t%s\nUNSTABLE_COUNT\t%s\nLAST_RTT_MS\t%s\nLAST_RECEIVER_MBIT\t%s\nLAST_PATH_CONTROL_QUALITY\t%s\nLAST_FAILURE_REASON\t%s\nTEMPORARY_PENALTY_UNTIL\t%s\nRECENT_WINDOW\t%s\nLAST_RESULT\t%s\nUPDATED_AT\t%s\n' \
+        "$PEER_HEALTH_SCHEMA" "$PH_HOST" "$PH_FAMILY" "$PH_ADDRESS" "$PH_PORT" \
+        "$PH_LAST_SUCCESS" "$PH_LAST_FAILURE" "$PH_SUCCESS_COUNT" "$PH_FAILURE_COUNT" \
+        "$PH_BUSY_COUNT" "$PH_RESET_COUNT" "$PH_TIMEOUT_COUNT" "$PH_PATH_DIRTY_COUNT" \
+        "$PH_SLOW_PEER_COUNT" "$PH_UNSTABLE_COUNT" "$PH_LAST_RTT_MS" "$PH_LAST_RECEIVER_MBIT" \
+        "$PH_LAST_PATH_CONTROL_QUALITY" "$PH_LAST_FAILURE_REASON" "$PH_TEMPORARY_PENALTY_UNTIL" \
+        "$PH_RECENT_WINDOW" "$PH_LAST_RESULT" "$PH_UPDATED_AT" > "$temp"; then
+        rm -f -- "$temp"; return 1
+    fi
+    chmod 0600 "$temp" || { rm -f -- "$temp"; return 1; }
+    mv -f -- "$temp" "$file"
+}
+
+peer_health_penalty_seconds() {
+    case "$1" in
+        peer-busy) printf '300\n' ;;
+        peer-reset) printf '900\n' ;;
+        peer-timeout|peer-unavailable) printf '600\n' ;;
+        path-dirty) printf '180\n' ;;
+        peer-too-slow|measurement-unstable) printf '600\n' ;;
+        protocol-failure) printf '1800\n' ;;
+        *) printf '300\n' ;;
+    esac
+}
+
+peer_health_window_code() {
+    case "$1" in
+        success) printf 'S' ;;
+        peer-busy) printf 'B' ;;
+        peer-reset) printf 'R' ;;
+        peer-timeout|peer-unavailable) printf 'T' ;;
+        path-dirty) printf 'D' ;;
+        peer-too-slow) printf 'L' ;;
+        measurement-unstable|sample-contaminated) printf 'U' ;;
+        measurement-inconclusive) printf 'I' ;;
+        knee-not-located) printf 'K' ;;
+        *) printf 'F' ;;
+    esac
+}
+
+peer_health_record() {
+    local host="$1" family="$2" address="$3" port="$4" outcome="$5" reason="${6:-none}"
+    local rtt="${7:-na}" receiver="${8:-na}" quality="${9:-unknown}" file rc now penalty code
+    peer_health_is_public_host "$host" || return 0
+    validate_peer "$host" "$port" || return 1
+    [[ "$family" == 4 || "$family" == 6 ]] && measure_source_address_is_valid "$family" "$address" || return 1
+    file=$(peer_health_file "$host" "$family" "$address" "$port") || return 1
+    now=$(date +%s); is_uint "$now" || return 1
+    if [[ -e "$file" || -L "$file" ]]; then
+        peer_health_load "$file" || rc=$?
+        if (( ${rc:-0} == 2 )); then
+            log WARN "peer health 使用更新 schema，当前版本不会覆盖: $file"
+            return 1
+        elif (( ${rc:-0} != 0 )); then
+            log WARN "忽略损坏的 peer health 记录并原子重建: $file"
+            peer_health_reset_values
+        fi
+    else
+        peer_health_reset_values
+    fi
+    PH_HOST="$host"; PH_FAMILY="$family"; PH_ADDRESS="$address"; PH_PORT="$port"; PH_UPDATED_AT="$now"
+    [[ "$rtt" == na ]] || is_decimal "$rtt" || rtt=na
+    [[ "$receiver" == na ]] || is_decimal "$receiver" || receiver=na
+    [[ "$quality" =~ ^(unknown|clean|good|dirty|slow-peer)$ ]] || quality=unknown
+    PH_LAST_RTT_MS="$rtt"; PH_LAST_RECEIVER_MBIT="$receiver"; PH_LAST_PATH_CONTROL_QUALITY="$quality"
+    if [[ "$outcome" == success ]]; then
+        ((PH_SUCCESS_COUNT+=1)); PH_LAST_SUCCESS="$now"; PH_LAST_RESULT=clean
+        PH_TEMPORARY_PENALTY_UNTIL=0
+    elif [[ "$outcome" == inconclusive ]]; then
+        [[ "$reason" == measurement-inconclusive || "$reason" == knee-not-located ]] || reason=measurement-inconclusive
+        PH_LAST_RESULT="$reason"
+        # A clean path that did not locate a knee is evidence, not a peer or
+        # path failure.  Preserve its relative delivered-capacity hint without
+        # incrementing failure/path-dirty counters or creating a blacklist.
+        PH_TEMPORARY_PENALTY_UNTIL=0
+    else
+        [[ "$reason" =~ ^[a-z0-9-]{1,64}$ ]] || reason=protocol-failure
+        ((PH_FAILURE_COUNT+=1)); PH_LAST_FAILURE="$now"; PH_LAST_FAILURE_REASON="$reason"; PH_LAST_RESULT="$reason"
+        case "$reason" in
+            peer-busy) ((PH_BUSY_COUNT+=1)) ;;
+            peer-reset) ((PH_RESET_COUNT+=1)) ;;
+            peer-timeout|peer-unavailable) ((PH_TIMEOUT_COUNT+=1)) ;;
+            path-dirty) ((PH_PATH_DIRTY_COUNT+=1)) ;;
+            peer-too-slow) ((PH_SLOW_PEER_COUNT+=1)) ;;
+            measurement-unstable|sample-contaminated) ((PH_UNSTABLE_COUNT+=1)) ;;
+        esac
+        penalty=$(peer_health_penalty_seconds "$reason")
+        PH_TEMPORARY_PENALTY_UNTIL=$((now + penalty))
+    fi
+    code=$(peer_health_window_code "$([[ "$outcome" == success ]] && printf success || printf '%s' "$reason")")
+    PH_RECENT_WINDOW="${PH_RECENT_WINDOW}${code}"
+    if (( ${#PH_RECENT_WINDOW} > PEER_HEALTH_WINDOW_SIZE )); then
+        PH_RECENT_WINDOW="${PH_RECENT_WINDOW:$((${#PH_RECENT_WINDOW}-PEER_HEALTH_WINDOW_SIZE))}"
+    fi
+    peer_health_write "$file"
+}
+
+peer_health_reason_from_text() {
+    local reason="${1,,}"
+    case "$reason" in
+        *busy*|*running*a*test*) printf 'peer-busy\n' ;;
+        *reset*|*broken*pipe*|*control*socket*closed*) printf 'peer-reset\n' ;;
+        *timed*out*|*timeout*) printf 'peer-timeout\n' ;;
+        *refused*|*unreachable*|*no*route*|*unable*to*connect*) printf 'peer-unavailable\n' ;;
+        *) printf 'protocol-failure\n' ;;
+    esac
+}
+
+peer_health_host_reset_count() {
+    local host="$1" family="$2" address="$3" file count=0 now
+    [[ -d "$PEER_HEALTH_DIR" && ! -L "$PEER_HEALTH_DIR" ]] || { printf '0\n'; return 0; }
+    now=$(date +%s); is_uint "$now" || { printf '0\n'; return 0; }
+    for file in "$PEER_HEALTH_DIR"/endpoint-*.tsv; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        if peer_health_load "$file" 2>/dev/null && [[ "$PH_HOST" == "$host" && "$PH_FAMILY" == "$family" && "$PH_ADDRESS" == "$address" ]] &&
+           (( PH_TEMPORARY_PENALTY_UNTIL > now )) && [[ "$PH_LAST_FAILURE_REASON" == peer-reset ]]; then
+            ((count+=PH_RESET_COUNT))
+        fi
+    done
+    printf '%s\n' "$count"
+}
+
+peer_health_score() {
+    local host="$1" family="$2" address="$3" port="$4" rtt="${5:-9999}" file score=35 rtt_score=0 success_score=10
+    local now total host_resets=0 reason="no-history" age=0 history_weight=100 delta=0 recent_success recent_failure
+    if is_decimal "$rtt"; then
+        if awk -v v="$rtt" 'BEGIN {exit !(v<=30)}'; then rtt_score=25
+        elif awk -v v="$rtt" 'BEGIN {exit !(v<=60)}'; then rtt_score=20
+        elif awk -v v="$rtt" 'BEGIN {exit !(v<=100)}'; then rtt_score=14
+        elif awk -v v="$rtt" 'BEGIN {exit !(v<=150)}'; then rtt_score=7
+        fi
+    fi
+    score=$((score + rtt_score))
+    file=$(peer_health_file "$host" "$family" "$address" "$port" 2>/dev/null || true)
+    if [[ -n "$file" && -f "$file" ]] && peer_health_load "$file" 2>/dev/null; then
+        now=$(date +%s)
+        if is_uint "$now" && (( now >= PH_UPDATED_AT )); then age=$((now-PH_UPDATED_AT)); fi
+        if (( age >= 604800 )); then
+            # A week without observations returns the endpoint to the same
+            # neutral prior as a never-tested peer.  Live precheck remains the
+            # final authority whenever it is selected again.
+            score=$((score + success_score)); reason="history-expired"
+            printf '%s\t%s\n' "$score" "$reason"
+            return
+        fi
+        (( age < 86400 )) || history_weight=50
+        recent_success=$(tr -cd 'S' <<< "$PH_RECENT_WINDOW" | wc -c)
+        recent_failure=$(tr -cd 'BRDTLUF' <<< "$PH_RECENT_WINDOW" | wc -c)
+        total=$((recent_success + recent_failure)); reason="history"
+        if (( total > 0 )); then success_score=$((recent_success * 20 / total)); fi
+        delta=$success_score
+        [[ "$PH_LAST_PATH_CONTROL_QUALITY" != clean && "$PH_LAST_PATH_CONTROL_QUALITY" != good ]] || delta=$((delta+10))
+        [[ "$PH_RECENT_WINDOW" != *B* ]] || delta=$((delta-5))
+        [[ "$PH_RECENT_WINDOW" != *R* ]] || delta=$((delta-10))
+        [[ "$PH_RECENT_WINDOW" != *D* ]] || delta=$((delta-8))
+        [[ "$PH_RECENT_WINDOW" != *L* ]] || delta=$((delta-8))
+        [[ "$PH_RECENT_WINDOW" != *U* ]] || delta=$((delta-8))
+        score=$((score + delta * history_weight / 100))
+        if is_uint "$now" && (( PH_TEMPORARY_PENALTY_UNTIL > now )); then score=$((score - 25)); reason="${reason}+temporary-penalty"; fi
+    else
+        score=$((score + success_score))
+    fi
+    host_resets=$(peer_health_host_reset_count "$host" "$family" "$address")
+    if is_uint "$host_resets" && (( host_resets >= 2 )); then score=$((score - 10)); reason="${reason}+host-reset"; fi
+    (( score < 0 )) && score=0; (( score > 100 )) && score=100
+    printf '%s\t%s\n' "$score" "$reason"
+}
+
+peer_health_rank_candidates() {
+    local candidate host address family source iface port rtt region provider score reason receiver=0 file
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" ]] || continue
+        IFS='|' read -r host address family source iface port rtt region provider <<< "$candidate"
+        IFS=$'\t' read -r score reason <<< "$(peer_health_score "$host" "$family" "$address" "$port" "$rtt")"
+        receiver=0; file=$(peer_health_file "$host" "$family" "$address" "$port" 2>/dev/null || true)
+        if [[ -n "$file" && -f "$file" ]] && peer_health_load "$file" 2>/dev/null && is_decimal "$PH_LAST_RECEIVER_MBIT"; then
+            receiver=$(awk -v v="$PH_LAST_RECEIVER_MBIT" 'BEGIN {printf "%012.3f",v}')
+        fi
+        # Delivered capacity is deliberately a relative tie-breaker within the
+        # current candidate set; there is no global "slow below X Mbit" cutoff.
+        printf '%03d\t%s\t%09d\t%s\n' "$score" "$receiver" "${rtt%.*}" "$candidate"
+    done | sort -t$'\t' -k1,1nr -k2,2nr -k3,3n | cut -f4-
+}
+
+peers_show() {
+    local file score reason success total now penalty
+    printf 'Public iperf peer health\n\n'
+    printf '%-43s %-5s %-7s %-9s %-6s %-6s %s\n' 'Endpoint' 'RTT' 'Score' 'Success' 'Busy' 'Reset' 'Last result'
+    if [[ ! -d "$PEER_HEALTH_DIR" || -L "$PEER_HEALTH_DIR" ]]; then
+        printf '%s\n' '(no local peer health history)'
+        return 0
+    fi
+    for file in "$PEER_HEALTH_DIR"/endpoint-*.tsv; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        if ! peer_health_load "$file" 2>/dev/null; then
+            printf '%-43s %s\n' "${file##*/}" 'invalid/newer schema (ignored)'
+            continue
+        fi
+        IFS=$'\t' read -r score reason <<< "$(peer_health_score "$PH_HOST" "$PH_FAMILY" "$PH_ADDRESS" "$PH_PORT" "$PH_LAST_RTT_MS")"
+        total=$((PH_SUCCESS_COUNT + PH_FAILURE_COUNT)); success="${PH_SUCCESS_COUNT}/${total}"
+        now=$(date +%s); penalty=""
+        if (( PH_TEMPORARY_PENALTY_UNTIL > now )); then penalty=" (penalty $((PH_TEMPORARY_PENALTY_UNTIL-now))s)"; fi
+        printf '%-43s %-5s %-7s %-9s %-6s %-6s %s%s\n' \
+            "${PH_HOST}:${PH_PORT}/IPv${PH_FAMILY}" "${PH_LAST_RTT_MS}ms" "$score" "$success" \
+            "$PH_BUSY_COUNT" "$PH_RESET_COUNT" "$PH_LAST_RESULT" "$penalty"
+    done
+    printf '\nHealth is a local ordering hint; every formal test still performs live precheck and route/path validation.\n'
+}
+
+peers_reset() {
+    require_root || return 1; acquire_lock || return 1
+    if [[ ! -e "$PEER_HEALTH_DIR" && ! -L "$PEER_HEALTH_DIR" ]]; then
+        log OK "peer health cache 已为空"
+        return 0
+    fi
+    [[ -d "$PEER_HEALTH_DIR" && ! -L "$PEER_HEALTH_DIR" ]] || { die "peer health 路径类型不安全"; return 1; }
+    remove_tree_within "$PEER_HEALTH_DIR" "$STATE_DIR" || return 1
+    log OK "仅 peer health cache 已删除；baseline、history、config 和网络状态均未改变"
 }
 
 # -----------------------------------------------------------------------------
@@ -2945,8 +3352,14 @@ qdisc_filter_guard() {
     qdisc_tree_filters_absent "$iface" || rc=$?
     case "$rc" in
         0) return 0 ;;
-        1) die "拒绝覆盖带外部 tc filter 的 root qdisc 树（$iface）；请先自行移除 filter" ;;
-        *) die "无法完整审计 $iface 的 root qdisc filter；拒绝修改" ;;
+        1)
+            declare -F failure_set >/dev/null && failure_set TC_OWNERSHIP tc-ownership-conflict "external root/class/leaf filter on $iface" || true
+            die "拒绝覆盖带外部 tc filter 的 root qdisc 树（$iface）；请先自行移除 filter"
+            ;;
+        *)
+            declare -F failure_set >/dev/null && failure_set TC_OWNERSHIP tc-ownership-conflict "filter audit unavailable on $iface" || true
+            die "无法完整审计 $iface 的 root qdisc filter；拒绝修改"
+            ;;
     esac
 }
 
@@ -3252,6 +3665,24 @@ managed_htb_diagnostic() {
     printf 'root-1=%s class-1:10=%s fq-10=%s rate=%sMbit' "$root" "$class" "$leaf" "$rate"
 }
 
+tc_ownership_conflict_report() {
+    local iface="$1" section output qdisc_text class_text selectors selector
+    for section in qdisc class; do
+        output=$(tc "$section" show dev "$iface" 2>&1 || printf '[unavailable]')
+        log ERR "$iface $section state:"
+        printf '%s\n' "$output" >&2
+    done
+    qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null || true)
+    class_text=$(tc class show dev "$iface" 2>/dev/null || true)
+    selectors=$(printf '%s\n%s\n' "$qdisc_text" "$class_text" | qdisc_tree_selectors_from_stream 2>/dev/null || true)
+    log ERR "$iface root-tree filter state:"
+    while IFS= read -r selector; do
+        [[ -n "$selector" && "$selector" != !* ]] || continue
+        output=$(tc filter show dev "$iface" parent "$selector" 2>&1 || printf '[unavailable]')
+        printf 'parent %s:\n%s\n' "$selector" "${output:-[none]}" >&2
+    done <<< "$selectors"
+}
+
 qdisc_guard() {
     local iface="$1" kind detail unsupported qdisc_text class_text rows class_rows expected_count class_count handle
     kind=$(root_qdisc_kind "$iface") || { die "无法读取 $iface 的 root qdisc"; return 1; }
@@ -3286,10 +3717,16 @@ qdisc_guard() {
             ;;
         htb)
             detail=$(managed_htb_diagnostic "$iface")
+            declare -F failure_set >/dev/null && failure_set TC_OWNERSHIP tc-ownership-conflict "root htb; $detail" || true
+            tc_ownership_conflict_report "$iface"
             die "拒绝覆盖未管理的 root qdisc 'htb'（$iface；$detail）"
             return 1
             ;;
         *)
+            qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null || true)
+            class_text=$(tc class show dev "$iface" 2>/dev/null || true)
+            declare -F failure_set >/dev/null && failure_set TC_OWNERSHIP tc-ownership-conflict "root=$kind; qdisc=${qdisc_text//$'\n'/ }; classes=${class_text//$'\n'/ }" || true
+            tc_ownership_conflict_report "$iface"
             die "拒绝覆盖未管理的 root qdisc '$kind'（$iface）；请先自行恢复或删除"
             return 1
             ;;
@@ -4758,19 +5195,272 @@ MEASURE_PEER_SOURCE=""
 MEASURE_PEER_FAMILY=""
 MEASURE_PEER_IFACE=""
 MEASURE_PEER_PORT=""
-IPERF_DATA_RC=65
-IPERF_CONTAMINATED_RC=66
-IPERF_UNSTABLE_RC=67
-MEASURE_PATH_QUALITY_RC=68
 # Compatibility alias for callers written before the v8.0.5 experiment split.
 # shellcheck disable=SC2034 # Public compatibility alias for sourced callers.
 MEASURE_BASELINE_QUALITY_RC="$MEASURE_PATH_QUALITY_RC"
-MEASURE_ROUTE_MISMATCH_RC=69
-IPERF_UNAVAILABLE_RC=75
 PUBLIC_PEER_CANDIDATES=()
 MEASURE_LEVEL_ROW=""
 MEASURE_LEVEL_SPIKE_HITS=0
 MEASURE_LEVEL_SPIKE_CONFIRMED=0
+MEASUREMENT_PROFILE="standard"
+MEASURE_MAX_TX_BYTES=6442450944
+MEASURE_MAX_DURATION_SECONDS=900
+MEASURE_BUDGET_CONFIGURED=0
+MEASURE_BUDGET_IFACE=""
+MEASURE_BUDGET_TX_START=0
+MEASURE_BUDGET_RX_START=0
+MEASURE_BUDGET_STARTED_EPOCH=0
+MEASURE_BUDGET_STAGE=""
+MEASURE_BUDGET_INITIALIZATION_COUNT=0
+MEASURE_BUDGET_PREBIND_TX_BYTES=0
+MEASURE_BUDGET_PREBIND_RX_BYTES=0
+TEST_TX_BYTES_USED=0
+TEST_RX_BYTES_USED=0
+TEST_DURATION_USED=0
+MEASURE_IPERF_TIMEOUT_GUARD_SECONDS=20
+MEASURE_CONTROL_SAMPLES=3
+MEASURE_SATURATION_SAMPLES=2
+MEASURE_CANDIDATE_SAMPLES=2
+MEASURE_VERIFY_SAMPLES=2
+MEASURE_CONTROL_MAX_SAMPLES=3
+MEASURE_SATURATION_MAX_SAMPLES=3
+MEASURE_CANDIDATE_MAX_SAMPLES=3
+MEASURE_VERIFY_MAX_SAMPLES=3
+MEASURE_COOLDOWN_PERCENT=100
+MEASURE_ACTIVE_STAGE="MEASUREMENT"
+IPERF_LAST_FAILURE_REASON="none"
+
+measurement_profile_configure() {
+    local profile="${1:-standard}"
+    case "$profile" in
+        quick)
+            MEASURE_CONTROL_SAMPLES=2; MEASURE_SATURATION_SAMPLES=2
+            MEASURE_CANDIDATE_SAMPLES=2; MEASURE_VERIFY_SAMPLES=2; MEASURE_COOLDOWN_PERCENT=60
+            MEASURE_CONTROL_MAX_SAMPLES=2; MEASURE_SATURATION_MAX_SAMPLES=2
+            MEASURE_CANDIDATE_MAX_SAMPLES=2; MEASURE_VERIFY_MAX_SAMPLES=2
+            ;;
+        standard)
+            MEASURE_CONTROL_SAMPLES=3; MEASURE_SATURATION_SAMPLES=2
+            MEASURE_CANDIDATE_SAMPLES=2; MEASURE_VERIFY_SAMPLES=2; MEASURE_COOLDOWN_PERCENT=100
+            MEASURE_CONTROL_MAX_SAMPLES=3; MEASURE_SATURATION_MAX_SAMPLES=3
+            MEASURE_CANDIDATE_MAX_SAMPLES=3; MEASURE_VERIFY_MAX_SAMPLES=3
+            ;;
+        strict)
+            MEASURE_CONTROL_SAMPLES=4; MEASURE_SATURATION_SAMPLES=3
+            MEASURE_CANDIDATE_SAMPLES=3; MEASURE_VERIFY_SAMPLES=3; MEASURE_COOLDOWN_PERCENT=150
+            MEASURE_CONTROL_MAX_SAMPLES=5; MEASURE_SATURATION_MAX_SAMPLES=4
+            MEASURE_CANDIDATE_MAX_SAMPLES=4; MEASURE_VERIFY_MAX_SAMPLES=4
+            ;;
+        *) die "measurement profile 必须是 quick、standard 或 strict"; return 1 ;;
+    esac
+    MEASUREMENT_PROFILE="$profile"
+}
+
+measurement_profile_stage_durations() {
+    local base="$1" control saturation coarse confirm
+    is_uint "$base" && (( base >= 3 && base <= 120 )) || return 1
+    case "$MEASUREMENT_PROFILE" in
+        quick)
+            control="$base"; ((control < 4)) && control=4; ((control > 5)) && control=5
+            saturation="$base"; ((saturation > 4)) && saturation=4
+            coarse="$base"; ((coarse > 3)) && coarse=3
+            confirm=$((base+1)); ((confirm < 5)) && confirm=5; ((confirm > 6)) && confirm=6
+            ;;
+        strict)
+            control=$((base+2)); ((control < 7)) && control=7; ((control > 10)) && control=10
+            saturation=$((base+2)); ((saturation > 10)) && saturation=10
+            coarse=$((base+1)); ((coarse > 7)) && coarse=7
+            confirm=$((base+3)); ((confirm < 8)) && confirm=8; ((confirm > 12)) && confirm=12
+            ;;
+        *)
+            control="$base"; ((control < 5)) && control=5; ((control > 8)) && control=8
+            saturation="$base"; ((saturation > 6)) && saturation=6
+            coarse="$base"; ((coarse > 5)) && coarse=5
+            confirm=$((base+2)); ((confirm < 6)) && confirm=6; ((confirm > 10)) && confirm=10
+            ;;
+    esac
+    printf '%s\t%s\t%s\t%s\n' "$control" "$saturation" "$coarse" "$confirm"
+}
+
+measurement_profile_verify_duration() {
+    local base="$1"
+    case "$MEASUREMENT_PROFILE" in quick) (( base > 4 )) && base=4 ;; strict) (( base < 8 )) && base=8 ;; esac
+    printf '%s\n' "$base"
+}
+
+measurement_budget_configure() {
+    local max_bytes="${1:-6442450944}" max_seconds="${2:-900}"
+    is_uint "$max_bytes" && (( max_bytes >= 1048576 && max_bytes <= 1099511627776 )) || {
+        die "measurement TX budget 必须在 1 MiB 到 1 TiB 之间"; return 1;
+    }
+    is_uint "$max_seconds" && (( max_seconds >= 30 && max_seconds <= 86400 )) || {
+        die "measurement duration budget 必须在 30–86400 秒之间"; return 1;
+    }
+    MEASURE_MAX_TX_BYTES="$max_bytes"; MEASURE_MAX_DURATION_SECONDS="$max_seconds"
+    MEASURE_BUDGET_CONFIGURED=1; MEASURE_BUDGET_IFACE=""; MEASURE_BUDGET_TX_START=0; MEASURE_BUDGET_RX_START=0
+    MEASURE_BUDGET_STARTED_EPOCH=$(date +%s); MEASURE_BUDGET_STAGE=""
+    TEST_TX_BYTES_USED=0; TEST_RX_BYTES_USED=0; TEST_DURATION_USED=0
+    MEASURE_BUDGET_PREBIND_TX_BYTES=0; MEASURE_BUDGET_PREBIND_RX_BYTES=0
+    ((MEASURE_BUDGET_INITIALIZATION_COUNT+=1))
+}
+
+measurement_budget_ensure() {
+    local iface="$1"
+    (( MEASURE_BUDGET_CONFIGURED == 1 )) || measurement_budget_configure || return 1
+    if [[ -z "$MEASURE_BUDGET_IFACE" ]]; then
+        MEASURE_BUDGET_IFACE="$iface"
+        MEASURE_BUDGET_TX_START=$(interface_counter "$iface" tx_bytes)
+        MEASURE_BUDGET_RX_START=$(interface_counter "$iface" rx_bytes)
+    elif [[ "$MEASURE_BUDGET_IFACE" != "$iface" ]]; then
+        failure_set MEASUREMENT route-ambiguous "budget accounting interface changed from $MEASURE_BUDGET_IFACE to $iface" 2>/dev/null || true
+        die "测量预算已绑定 $MEASURE_BUDGET_IFACE，不能切换到 $iface"
+        return "$MEASURE_ROUTE_MISMATCH_RC"
+    fi
+}
+
+measurement_usage_update() {
+    local tx_now rx_now now
+    (( MEASURE_BUDGET_CONFIGURED == 1 )) || return 0
+    now=$(date +%s)
+    TEST_TX_BYTES_USED="$MEASURE_BUDGET_PREBIND_TX_BYTES"; TEST_RX_BYTES_USED="$MEASURE_BUDGET_PREBIND_RX_BYTES"
+    if [[ -n "$MEASURE_BUDGET_IFACE" ]]; then
+        tx_now=$(interface_counter "$MEASURE_BUDGET_IFACE" tx_bytes); rx_now=$(interface_counter "$MEASURE_BUDGET_IFACE" rx_bytes)
+        is_uint "$tx_now" && is_uint "$MEASURE_BUDGET_TX_START" && (( tx_now >= MEASURE_BUDGET_TX_START )) && TEST_TX_BYTES_USED=$((MEASURE_BUDGET_PREBIND_TX_BYTES+tx_now-MEASURE_BUDGET_TX_START))
+        is_uint "$rx_now" && is_uint "$MEASURE_BUDGET_RX_START" && (( rx_now >= MEASURE_BUDGET_RX_START )) && TEST_RX_BYTES_USED=$((MEASURE_BUDGET_PREBIND_RX_BYTES+rx_now-MEASURE_BUDGET_RX_START))
+    fi
+    is_uint "$now" && is_uint "$MEASURE_BUDGET_STARTED_EPOCH" && (( now >= MEASURE_BUDGET_STARTED_EPOCH )) && TEST_DURATION_USED=$((now-MEASURE_BUDGET_STARTED_EPOCH))
+}
+
+measurement_budget_check() {
+    local stage="${1:-MEASUREMENT}" reserved_bytes="${2:-0}" reserved_seconds="${3:-0}"
+    local projected projected_duration remaining
+    (( MEASURE_BUDGET_CONFIGURED == 1 )) || return 0
+    is_uint "$reserved_bytes" || reserved_bytes=0
+    is_uint "$reserved_seconds" || reserved_seconds=0
+    measurement_usage_update
+    projected=$((TEST_TX_BYTES_USED + reserved_bytes))
+    projected_duration=$((TEST_DURATION_USED + reserved_seconds))
+    if (( TEST_TX_BYTES_USED >= MEASURE_MAX_TX_BYTES || projected >= MEASURE_MAX_TX_BYTES ||
+          TEST_DURATION_USED >= MEASURE_MAX_DURATION_SECONDS || projected_duration >= MEASURE_MAX_DURATION_SECONDS )); then
+        MEASURE_BUDGET_STAGE="$stage"
+        if declare -F failure_set >/dev/null; then
+            failure_set "$stage" budget-exceeded "TX=${TEST_TX_BYTES_USED}/${MEASURE_MAX_TX_BYTES} bytes; reserved-next=${reserved_bytes}; duration=${TEST_DURATION_USED}/${MEASURE_MAX_DURATION_SECONDS}s; reserved-time-next=${reserved_seconds}s" "" "$MEASURE_BUDGET_RC"
+        fi
+        if (( reserved_bytes > 0 && TEST_TX_BYTES_USED < MEASURE_MAX_TX_BYTES )); then
+            remaining=$((MEASURE_MAX_TX_BYTES-TEST_TX_BYTES_USED))
+            log INFO "剩余 TX 预算 $(human_bytes "$remaining")；下一 ${stage} 样本预计至少需要 $(human_bytes "$reserved_bytes")"
+        fi
+        log ERR "测速硬预算不足：TX $(human_bytes "$TEST_TX_BYTES_USED") / $(human_bytes "$MEASURE_MAX_TX_BYTES")，时间 ${TEST_DURATION_USED}s / ${MEASURE_MAX_DURATION_SECONDS}s；为避免突破硬预算，不启动下一次 iperf"
+        return "$MEASURE_BUDGET_RC"
+    fi
+}
+
+measurement_sample_projected_tx() {
+    local rate_mbit="$1" duration="$2" flows="$3" recent_sender="${4:-0}" recent_retrans="${5:-0}" recent_background="${6:-0}"
+    local semantics="${7:-aggregate}"
+    is_decimal "$rate_mbit" && awk -v r="$rate_mbit" 'BEGIN {exit !(r>0)}' || return 1
+    is_uint "$duration" && (( duration > 0 )) || return 1
+    is_uint "$flows" && (( flows > 0 )) || return 1
+    is_decimal "$recent_sender" || recent_sender=0
+    is_decimal "$recent_retrans" || recent_retrans=0
+    is_decimal "$recent_background" || recent_background=0
+    [[ "$semantics" == shaped || "$semantics" == unshaped || "$semantics" == aggregate ]] || return 1
+    awk -v rate="$rate_mbit" -v duration="$duration" -v sender="$recent_sender" \
+        -v retrans="$recent_retrans" -v background="$recent_background" -v semantics="$semantics" 'BEGIN {
+        # Every caller supplies an aggregate rate. Parallel iperf streams share
+        # that aggregate qdisc/link ceiling, so flows must never multiply bytes.
+        if (semantics=="unshaped" && sender>rate) rate=sender
+        if (retrans<0) retrans=0; if (retrans>50) retrans=50
+        if (background<0) background=0; if (background>25) background=25
+        factor=1.12+retrans/100+background/100
+        nominal=rate*1000000/8*duration
+        # Fixed headroom covers control packets, counter sampling skew and low
+        # background traffic without replacing actual interface accounting.
+        printf "%.0f\n", nominal*factor+1048576
+    }'
+}
+
+measurement_first_sample_plan() {
+    local mode="$1" nominal="$2" cap="$3" base_duration="$4"
+    local control_duration saturation_duration coarse_duration confirm_duration
+    local stage rate duration flows semantics reserved_bytes reserved_seconds
+    [[ "$mode" == none || "$mode" == known || "$mode" == auto ]] || return 1
+    is_uint "$nominal" && is_uint "$cap" && is_uint "$base_duration" || return 1
+    IFS=$'\t' read -r control_duration saturation_duration coarse_duration confirm_duration <<< \
+        "$(measurement_profile_stage_durations "$base_duration")" || return 1
+    case "$mode" in
+        none)
+            printf 'NONE\t0\t0\t0\tnone\t0\t0\n'
+            return 0
+            ;;
+        known)
+            (( nominal > 0 )) || return 1
+            stage=PATH_CONTROL; rate=$((nominal * 40 / 100)); (( rate < 1 )) && rate=1
+            duration="$control_duration"; flows=1; semantics=shaped
+            ;;
+        auto)
+            (( cap > 0 )) || return 1
+            stage=SATURATION; rate="$cap"; duration="$saturation_duration"; flows=1; semantics=unshaped
+            ;;
+    esac
+    reserved_bytes=$(measurement_sample_projected_tx "$rate" "$duration" "$flows" 0 0 0 "$semantics") || return 1
+    reserved_seconds=$((duration + MEASURE_IPERF_TIMEOUT_GUARD_SECONDS))
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$stage" "$rate" "$duration" "$flows" "$semantics" "$reserved_bytes" "$reserved_seconds"
+}
+
+measurement_first_sample_budget_check() {
+    local max_bytes="$1" max_seconds="$2" mode="$3" nominal="$4" cap="$5" base_duration="$6"
+    local plan stage rate duration flows semantics reserved_bytes reserved_seconds
+    is_uint "$max_bytes" && is_uint "$max_seconds" || return 1
+    plan=$(measurement_first_sample_plan "$mode" "$nominal" "$cap" "$base_duration") || return 1
+    IFS=$'\t' read -r stage rate duration flows semantics reserved_bytes reserved_seconds <<< "$plan"
+    [[ "$stage" == NONE ]] && return 0
+    (( reserved_bytes < max_bytes && reserved_seconds < max_seconds )) || return "$MEASURE_BUDGET_RC"
+}
+
+measurement_budget_reserve_sample() {
+    local stage="$1" rate_mbit="$2" duration="$3" flows="$4" recent_sender="${5:-0}"
+    local recent_retrans="${6:-0}" recent_background="${7:-0}" semantics="${8:-aggregate}"
+    local reserved_bytes reserved_seconds
+    (( MEASURE_BUDGET_CONFIGURED == 1 )) || return 0
+    if ! reserved_bytes=$(measurement_sample_projected_tx "$rate_mbit" "$duration" "$flows" \
+        "$recent_sender" "$recent_retrans" "$recent_background" "$semantics"); then
+        # A throughput session without a defensible aggregate rate cannot be
+        # proven safe under a hard cap. Fail closed before spawning iperf.
+        reserved_bytes="$MEASURE_MAX_TX_BYTES"
+    fi
+    if is_uint "$duration"; then reserved_seconds=$((duration + MEASURE_IPERF_TIMEOUT_GUARD_SECONDS))
+    else reserved_seconds="$MEASURE_MAX_DURATION_SECONDS"
+    fi
+    measurement_budget_check "$stage" "$reserved_bytes" "$reserved_seconds"
+}
+
+measurement_peer_health_finalize() {
+    local peer="$1" family="$2" address="$3" port="$4" rc="$5"
+    local rtt="${6:-na}" receiver="${7:-na}" quality="${8:-unknown}" semantic="${9:-}" reason="${FAILURE_REASON:-measurement-unstable}"
+    declare -F peer_health_record >/dev/null || return 0
+    if (( rc == 0 )); then
+        peer_health_record "$peer" "$family" "$address" "$port" success none "$rtt" "$receiver" "$quality"
+        return
+    fi
+    if [[ "$semantic" == measurement-inconclusive || "$semantic" == knee-not-located ]]; then
+        peer_health_record "$peer" "$family" "$address" "$port" inconclusive "$semantic" "$rtt" "$receiver" "$quality"
+        return
+    fi
+    # Unavailable/busy/reset/timeout attempts are recorded at the exact
+    # iperf failure site. Do not double-count the final failed attempt here.
+    # Local budget, route, TC and rollback failures are not peer-health facts.
+    case "$reason" in
+        peer-unavailable|peer-busy|peer-reset|peer-timeout|budget-exceeded|path-changed|endpoint-changed|\
+        route-ambiguous|nexthop-unresolved|tc-ownership-conflict|runtime-verify-failed|rollback-failed|\
+        cpu-busy|high-steal|background-traffic|disk-space-low|memory-low) return 0 ;;
+        path-dirty|peer-too-slow|measurement-unstable|sample-contaminated|protocol-failure)
+            peer_health_record "$peer" "$family" "$address" "$port" failure "$reason" "$rtt" "$receiver" "$quality"
+            ;;
+        *) return 0 ;;
+    esac
+}
 
 # Public endpoints are opt-in and used only by the interactive auto-tune wizard.
 # Providers and test traffic are disclosed before execution; a private iperf3 peer is preferred.
@@ -4886,6 +5576,12 @@ auto_pick_peer() {
     done < <(cat "$temp"/* 2>/dev/null | sort -n)
     rm -rf -- "$temp"
     if ((${#primary_candidates[@]} > 0)); then
+        if declare -F peer_health_rank_candidates >/dev/null; then
+            mapfile -t primary_candidates < <(printf '%s\n' "${primary_candidates[@]}" | peer_health_rank_candidates)
+            if ((${#extra_candidates[@]} > 0)); then
+                mapfile -t extra_candidates < <(printf '%s\n' "${extra_candidates[@]}" | peer_health_rank_candidates)
+            fi
+        fi
         primary_host="${primary_candidates[0]%%|*}"
         for candidate in "${extra_candidates[@]}"; do
             if [[ "${candidate%%|*}" == "$primary_host" ]]; then preferred_extra="$candidate"; break; fi
@@ -4905,10 +5601,12 @@ auto_pick_peer() {
         [[ -n "$candidate" ]] || continue
         PUBLIC_PEER_CANDIDATES+=("$candidate")
         IFS='|' read -r host address family source iface port rtt region provider <<< "$candidate"
+        local health_score=na health_reason=no-history
+        if declare -F peer_health_score >/dev/null; then IFS=$'\t' read -r health_score health_reason <<< "$(peer_health_score "$host" "$family" "$address" "$port" "$rtt")"; fi
         if (( ${#PUBLIC_PEER_CANDIDATES[@]} == 1 )); then
-            log OK "公共对端已通过 IPv${family} iperf3 预检: $host:$port -> $address ($region/$provider, RTT ${rtt}ms)"
+            log OK "公共对端已通过 IPv${family} iperf3 预检: $host:$port -> $address ($region/$provider, RTT ${rtt}ms, health ${health_score}/100 ${health_reason})"
         else
-            log INFO "已保留备用公共对端: $host:$port -> $address (IPv${family}, $region/$provider, RTT ${rtt}ms)"
+            log INFO "已保留备用公共对端: $host:$port -> $address (IPv${family}, $region/$provider, RTT ${rtt}ms, health ${health_score}/100 ${health_reason})"
         fi
         (( ${#PUBLIC_PEER_CANDIDATES[@]} < limit )) || break
     done
@@ -4964,6 +5662,19 @@ measure_begin() {
     MEASURE_SNAPSHOT="$snapshot"
     MEASURE_TX_START=$(interface_counter "$iface" tx_bytes)
     MEASURE_RX_START=$(interface_counter "$iface" rx_bytes)
+    local budget_rc=0
+    if measurement_budget_ensure "$iface"; then :; else
+        budget_rc=$?
+        rm -f -- "$snapshot"
+        MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+        return "$budget_rc"
+    fi
+    if measurement_budget_check PREFLIGHT; then :; else
+        budget_rc=$?
+        rm -f -- "$snapshot"
+        MEASURE_IFACE=""; MEASURE_SNAPSHOT=""
+        return "$budget_rc"
+    fi
     trap 'measure_abort 130' INT TERM HUP
 }
 
@@ -5003,7 +5714,9 @@ traffic_report() {
     tx_now=$(interface_counter "$1" tx_bytes); rx_now=$(interface_counter "$1" rx_bytes)
     tx=$((tx_now - MEASURE_TX_START)); rx=$((rx_now - MEASURE_RX_START))
     (( tx < 0 )) && tx=0; (( rx < 0 )) && rx=0
+    measurement_usage_update
     log INFO "本轮接口流量: TX $(human_bytes "$tx"), RX $(human_bytes "$rx")"
+    log INFO "测量预算累计: TX $(human_bytes "$TEST_TX_BYTES_USED") / $(human_bytes "$MEASURE_MAX_TX_BYTES"), 时间 ${TEST_DURATION_USED}s / ${MEASURE_MAX_DURATION_SECONDS}s"
 }
 
 validate_peer() {
@@ -5124,6 +5837,7 @@ measure_lock_peer() {
     local peer="$1" requested_iface="$2" port="${3:-}" preferred_address="${4:-}" preferred_source="${5:-}" quiet="${6:-0}"
     local addresses ordered family address state iface source record record_family record_address record_iface
     local is_literal=0 exact_candidate=0 resolved_count=0 route_candidates=0 service_candidates=0
+    local pre_account=0 pre_tx_before=0 pre_tx_after=0 pre_rx_before=0 pre_rx_after=0
 
     # A failed re-lock must never leave a previous endpoint looking current.
     measure_clear_peer_lock
@@ -5230,13 +5944,27 @@ measure_lock_peer() {
         ((route_candidates+=1))
 
         if [[ -n "$port" ]]; then
+            pre_account=0
+            if [[ "${MEASURE_BUDGET_CONFIGURED:-0}" == 1 && -z "${MEASURE_BUDGET_IFACE:-}" ]]; then
+                pre_tx_before=$(interface_counter "$iface" tx_bytes); pre_rx_before=$(interface_counter "$iface" rx_bytes); pre_account=1
+            fi
             if ! peer_port_open "$address" "$port" || ! iperf_peer_usable "$address" "$port" "$family" "$source"; then
+                if (( pre_account )); then
+                    pre_tx_after=$(interface_counter "$iface" tx_bytes); pre_rx_after=$(interface_counter "$iface" rx_bytes)
+                    is_uint "$pre_tx_before" && is_uint "$pre_tx_after" && (( pre_tx_after >= pre_tx_before )) && MEASURE_BUDGET_PREBIND_TX_BYTES=$((MEASURE_BUDGET_PREBIND_TX_BYTES+pre_tx_after-pre_tx_before))
+                    is_uint "$pre_rx_before" && is_uint "$pre_rx_after" && (( pre_rx_after >= pre_rx_before )) && MEASURE_BUDGET_PREBIND_RX_BYTES=$((MEASURE_BUDGET_PREBIND_RX_BYTES+pre_rx_after-pre_rx_before))
+                fi
                 (( quiet )) || log WARN "跳过 $address:$port（IPv${family}）：TCP/iperf3 预检不可用"
                 if (( is_literal || exact_candidate )); then
                     measure_clear_peer_lock
                     return "$IPERF_UNAVAILABLE_RC"
                 fi
                 continue
+            fi
+            if (( pre_account )); then
+                pre_tx_after=$(interface_counter "$iface" tx_bytes); pre_rx_after=$(interface_counter "$iface" rx_bytes)
+                is_uint "$pre_tx_before" && is_uint "$pre_tx_after" && (( pre_tx_after >= pre_tx_before )) && MEASURE_BUDGET_PREBIND_TX_BYTES=$((MEASURE_BUDGET_PREBIND_TX_BYTES+pre_tx_after-pre_tx_before))
+                is_uint "$pre_rx_before" && is_uint "$pre_rx_after" && (( pre_rx_after >= pre_rx_before )) && MEASURE_BUDGET_PREBIND_RX_BYTES=$((MEASURE_BUDGET_PREBIND_RX_BYTES+pre_rx_after-pre_rx_before))
             fi
             ((service_candidates+=1))
         fi
@@ -5269,14 +5997,27 @@ measure_lock_peer() {
 
 measure_lock_requested_peer() {
     local peer="$1" port="$2" requested="$3" preferred_address="${4:-}" preferred_source="${5:-}"
-    local expected_iface="$requested"
+    local expected_iface="$requested" lock_rc=0
     # The wrapper may fail before measure_lock_peer is reached (for example an
     # invalid explicit interface); stale state must not survive that failure.
     measure_clear_peer_lock
     if [[ "$requested" != auto ]]; then
         expected_iface=$(detect_interface "$requested") || return 1
     fi
-    measure_lock_peer "$peer" "$expected_iface" "$port" "$preferred_address" "$preferred_source"
+    # The auto wizard and explicit-interface measure commands already know the
+    # operation interface.  Bind the ledger before their formal service
+    # precheck; do not prematurely bind direct `--interface auto` discovery,
+    # which must remain able to choose the only usable address family.
+    if [[ "$expected_iface" != auto && "${MEASURE_BUDGET_CONFIGURED:-0}" == 1 ]]; then
+        measurement_budget_ensure "$expected_iface" || return $?
+        measurement_budget_check PEER_PREFLIGHT || return $?
+    fi
+    if measure_lock_peer "$peer" "$expected_iface" "$port" "$preferred_address" "$preferred_source"; then :; else lock_rc=$?; fi
+    if (( lock_rc == 0 )) && [[ "${MEASURE_BUDGET_CONFIGURED:-0}" == 1 ]]; then
+        measurement_budget_ensure "$MEASURE_PEER_IFACE" || return $?
+    fi
+    if [[ "${MEASURE_BUDGET_CONFIGURED:-0}" == 1 ]]; then measurement_budget_check PEER_PREFLIGHT || return $?; fi
+    return "$lock_rc"
 }
 
 measure_peer_route_guard() {
@@ -5493,14 +6234,19 @@ sample_is_contaminated() {
 
 iperf_sample() {
     local peer="$1" port="$2" duration="$3" parallel="$4" json error_file latency_file latency_pid=""
+    local planning_rate="${5:-0}" recent_sender="${6:-0}" recent_retrans="${7:-0}" recent_background="${8:-0}"
+    local rate_semantics="${9:-aggregate}"
     local rc=0 reason="" sender_bps receiver_bps sender_bytes receiver_bytes retrans delivered ratio retrans_per_gib
     local sender_mbit receiver_mbit receiver_fallback=0 loaded_median="na" loaded_p95="na"
     local tx_before=0 tx_after=0 background="na" cpu_before cpu_after cpu_busy="na" cpu_steal="na" contaminated=0
     local core_before core_after core_busy="na" core_steal="na" reason_parse_rc=0 cpu_metrics core_metrics latency_metrics
     local route_guard_rc=0
     local -a family_arg=()
+    IPERF_LAST_FAILURE_REASON=none
     validate_peer "$peer" "$port" || return 1
     measure_require_sample_lock "$peer" "$port" || return $?
+    measurement_budget_reserve_sample "$MEASURE_ACTIVE_STAGE" "$planning_rate" "$duration" "$parallel" \
+        "$recent_sender" "$recent_retrans" "$recent_background" "$rate_semantics" || return $?
     family_arg=("-$MEASURE_PEER_FAMILY")
     json=$(mktemp) || return 1
     error_file=$(mktemp) || { rm -f -- "$json"; return 1; }
@@ -5536,6 +6282,11 @@ iperf_sample() {
         log ERR "iperf3 $peer:$port 完成后检测到路径漂移；本样本无效"
         return "$route_guard_rc"
     fi
+    if measurement_budget_check "$MEASURE_ACTIVE_STAGE"; then :; else
+        rc=$?
+        rm -f -- "$json" "$error_file" "$latency_file"
+        return "$rc"
+    fi
     rm -f -- "$error_file"
     if (( rc != 0 )); then
         reason=${reason//$'\n'/ }
@@ -5543,12 +6294,26 @@ iperf_sample() {
         reason=${reason:0:240}
         log WARN "iperf3 $peer:$port（$MEASURE_PEER_ADDRESS）测试失败: $reason"
         rm -f -- "$json" "$latency_file"
-        if (( rc == 124 )) || iperf_failure_is_unavailable "$reason"; then return "$IPERF_UNAVAILABLE_RC"; fi
+        if (( rc == 124 )) || iperf_failure_is_unavailable "$reason"; then
+            if (( rc == 124 )); then IPERF_LAST_FAILURE_REASON="peer-timeout"
+            elif declare -F peer_health_reason_from_text >/dev/null; then IPERF_LAST_FAILURE_REASON=$(peer_health_reason_from_text "$reason")
+            else IPERF_LAST_FAILURE_REASON="peer-unavailable"
+            fi
+            if declare -F failure_set >/dev/null; then failure_set "$MEASURE_ACTIVE_STAGE" "$IPERF_LAST_FAILURE_REASON" "$reason" "" "$IPERF_UNAVAILABLE_RC"; fi
+            if declare -F peer_health_record >/dev/null; then
+                peer_health_record "$MEASURE_PEER_HOST" "$MEASURE_PEER_FAMILY" "$MEASURE_PEER_ADDRESS" "$port" failure "$IPERF_LAST_FAILURE_REASON" na na unknown || log WARN "peer health 写入失败；网络事务不受影响"
+            fi
+            return "$IPERF_UNAVAILABLE_RC"
+        fi
+        IPERF_LAST_FAILURE_REASON=protocol-failure
+        if declare -F failure_set >/dev/null; then failure_set "$MEASURE_ACTIVE_STAGE" protocol-failure "$reason" "" 1; fi
         return 1
     fi
     if (( reason_parse_rc != 0 )); then
         log WARN "iperf3 $peer:$port 返回的 JSON 无法解析"
         rm -f -- "$json" "$latency_file"
+        IPERF_LAST_FAILURE_REASON=protocol-failure
+        if declare -F failure_set >/dev/null; then failure_set "$MEASURE_ACTIVE_STAGE" protocol-failure "iperf JSON parse failed" "" "$IPERF_DATA_RC"; fi
         return "$IPERF_DATA_RC"
     fi
     if ! sender_bps=$(jq -r '.end.sum_sent.bits_per_second // .end.sum.bits_per_second // 0' "$json") ||
@@ -5565,6 +6330,8 @@ iperf_sample() {
        ! awk -v b="$sender_bps" 'BEGIN {exit !(b>0)}'; then
         log WARN "iperf3 $peer:$port 返回的 JSON 结果不完整"
         rm -f -- "$latency_file"
+        IPERF_LAST_FAILURE_REASON=protocol-failure
+        if declare -F failure_set >/dev/null; then failure_set "$MEASURE_ACTIVE_STAGE" protocol-failure "iperf JSON missing required sender fields" "" "$IPERF_DATA_RC"; fi
         return "$IPERF_DATA_RC"
     fi
     sender_mbit=$(awk -v b="$sender_bps" 'BEGIN {printf "%.2f", b/1000000}')
@@ -5681,6 +6448,8 @@ compare_verdict() {
 sample_repeated() {
     local peer="$1" port="$2" duration="$3" parallel="$4" count="$5" label="$6"
     local max_count="${7:-$count}" stability_threshold="${8:-0}"
+    local planning_rate="${9:-0}" rate_semantics="${10:-aggregate}"
+    local recent_sender="${11:-0}" recent_retrans="${12:-0}" recent_background="${13:-0}"
     local -a delivered_rates=() rows=() backgrounds=() cpu_busies=() cpu_steals=() contaminations=()
     local row i attempt sample_rc=0 attempts="${BBRV3_IPERF_ATTEMPTS:-3}" target_count="$count" contamination_retry
     local contamination_retries="${BBRV3_CONTAMINATION_RETRIES:-1}"
@@ -5691,13 +6460,16 @@ sample_repeated() {
     is_uint "$contamination_retries" && (( contamination_retries <= 3 )) || contamination_retries=1
     is_uint "$max_count" && (( max_count >= count && max_count <= 5 )) || max_count="$count"
     is_decimal "$stability_threshold" || stability_threshold=0
+    MEASURE_ACTIVE_STAGE="${label^^}"
+    MEASURE_ACTIVE_STAGE="${MEASURE_ACTIVE_STAGE//[^A-Z0-9]/_}"
     for ((i=1; i<=target_count; i++)); do
         log INFO "$label: ${duration}s × ${parallel} flow(s), sample ${i}/${target_count}"
         contamination_retry=0
         while true; do
             row=""
             for ((attempt=1; attempt<=attempts; attempt++)); do
-                if row=$(iperf_sample "$peer" "$port" "$duration" "$parallel"); then
+                if row=$(iperf_sample "$peer" "$port" "$duration" "$parallel" "$planning_rate" \
+                    "$recent_sender" "$recent_retrans" "$recent_background" "$rate_semantics"); then
                     sample_rc=0
                     break
                 else
@@ -5724,6 +6496,9 @@ sample_repeated() {
             cpu_busy="${cpu_busy:-na}"; cpu_steal="${cpu_steal:-na}"; contaminated="${contaminated:-0}"
             sender_mbit="${sender_mbit:-$g}"; receiver_mbit="${receiver_mbit:-$g}"
             sender_bytes="${sender_bytes:-$b}"; receiver_bytes="${receiver_bytes:-$b}"; receiver_fallback="${receiver_fallback:-1}"
+            is_decimal "$sender_mbit" && recent_sender="$sender_mbit"
+            is_decimal "$l" && recent_retrans="$l"
+            is_decimal "$background" && recent_background="$background"
             row=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
                 "$g" "$r" "$b" "$l" "$rpg" "$loaded_med" "$loaded_tail" "$background" "$cpu_busy" "$cpu_steal" \
                 "$contaminated" "$sender_mbit" "$receiver_mbit" "$sender_bytes" "$receiver_bytes" "$receiver_fallback")
@@ -5737,6 +6512,16 @@ sample_repeated() {
                 log WARN "样本受到后台流量、CPU 饱和或 steal 污染，2 秒后重采（${contamination_retry}/${contamination_retries}）"
                 sleep 2
                 continue
+            fi
+            # The scan ceiling is the defensible bound before the first
+            # unlimited sample. Once that same peer/path has produced usable,
+            # uncontaminated sender telemetry, subsequent unlimited repeats
+            # can reserve from the fresh observation plus the normal safety
+            # margin instead of treating the initial ceiling as a permanently
+            # reserved balance.
+            if [[ "$contaminated" == 0 && "$rate_semantics" == unshaped ]] &&
+               is_decimal "$sender_mbit" && awk -v r="$sender_mbit" 'BEGIN {exit !(r>0)}'; then
+                planning_rate="$sender_mbit"
             fi
             break
         done
@@ -5792,7 +6577,7 @@ loss_spike() {
 }
 
 measurement_cooldown() {
-    local stage="$1" rate="${2:-0}" duration="${3:-3}" seconds
+    local stage="$1" rate="${2:-0}" duration="${3:-3}" seconds reserved_seconds
     if [[ "${BBRV3_MEASUREMENT_COOLDOWN:-1}" == 0 ]]; then return 0; fi
     is_decimal "$rate" || rate=0; is_uint "$duration" || duration=3
     case "$stage" in
@@ -5802,23 +6587,28 @@ measurement_cooldown() {
         PRE_VERIFY) seconds=$(awk -v r="$rate" -v d="$duration" 'BEGIN {v=int(d*0.8+r/1000+0.99); if(v<3)v=3; if(v>10)v=10; print v}') ;;
         *) die "未知测量冷却阶段: $stage"; return 1 ;;
     esac
+    seconds=$(( (seconds * MEASURE_COOLDOWN_PERCENT + 99) / 100 ))
+    (( seconds < 1 )) && seconds=1
+    reserved_seconds=$((seconds + duration + MEASURE_IPERF_TIMEOUT_GUARD_SECONDS))
+    measurement_budget_check "$stage" 0 "$reserved_seconds" || return $?
     log INFO "$stage 冷却 ${seconds}s（rate=${rate} Mbit/s, sample=${duration}s）"
     sleep "$seconds"
 }
 
 measure_level_with_confirmation() {
     local peer="$1" port="$2" duration="$3" confirm_duration="$4" parallel="$5" label="$6"
-    local threshold="$7" base_loss="$8" row loss rc=0 index hits=0 selected="" selected_loss="" gp
+    local threshold="$7" base_loss="$8" planning_rate="${9:-0}" row loss rc=0 index hits=0 selected="" selected_loss="" gp
     local -a rows=() spike_rows=() clean_rows=()
     MEASURE_LEVEL_ROW=""; MEASURE_LEVEL_SPIKE_HITS=0; MEASURE_LEVEL_SPIKE_CONFIRMED=0
-    row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "$label") || return $?
+    row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "$label" 1 0 "$planning_rate" shaped) || return $?
     rows+=("$row")
     loss=$(cut -f4 <<< "$row")
     if loss_spike "$loss" "$threshold" "$base_loss"; then
         hits=1; spike_rows+=("$row")
         for index in 2 3; do
             measurement_cooldown SPIKE_RECHECK "$(cut -f1 <<< "$row")" "$confirm_duration" || return 1
-            row=$(sample_repeated "$peer" "$port" "$confirm_duration" "$parallel" 1 "${label}-recheck-${index}") || return $?
+            row=$(sample_repeated "$peer" "$port" "$confirm_duration" "$parallel" 1 "${label}-recheck-${index}" 1 0 \
+                "$planning_rate" shaped "$(cut -f15 <<< "$row")" "$(cut -f4 <<< "$row")" "$(cut -f8 <<< "$row")") || return $?
             rows+=("$row"); loss=$(cut -f4 <<< "$row")
             if loss_spike "$loss" "$threshold" "$base_loss"; then
                 ((hits+=1)); spike_rows+=("$row")
@@ -5888,27 +6678,30 @@ estimate_measurement_plan_bytes() {
     local control_rate="$1" control_duration="$2" capacity_rate="$3" saturation_duration="$4"
     local high="$5" coarse_duration="$6" confirm_duration="$7" aggregate="${8:-0}"
     awk -v cr="$control_rate" -v cd="$control_duration" -v cap="$capacity_rate" -v sd="$saturation_duration" \
-        -v hi="$high" -v coarse="$coarse_duration" -v confirm="$confirm_duration" -v aggregate="$aggregate" 'BEGIN {
-        # Three control/saturation samples; at most eight coarse and eight fine
-        # levels, with two longer rechecks at the first spike in each pass;
-        # finally three candidate confirmations. Aggregate capacity discovery
-        # adds at most three saturation-duration samples.
-        mbit_seconds=cr*cd*3 + cap*sd*3 + hi*((8*coarse+2*confirm)*2 + 3*confirm)
-        if(aggregate) mbit_seconds+=cap*sd*3
+        -v hi="$high" -v coarse="$coarse_duration" -v confirm="$confirm_duration" -v aggregate="$aggregate" \
+        -v control_samples="$MEASURE_CONTROL_MAX_SAMPLES" -v saturation_samples="$MEASURE_SATURATION_MAX_SAMPLES" \
+        -v candidate_samples="$MEASURE_CANDIDATE_MAX_SAMPLES" -v verify_samples="$((MEASURE_VERIFY_MAX_SAMPLES*2))" 'BEGIN {
+        # Includes adaptive extra samples, both 2/3 spike rechecks, candidate
+        # confirmation and the single/multi final verify. Peer-failure retries
+        # are excluded from this normal-path estimate but remain hard-budgeted.
+        mbit_seconds=cr*cd*control_samples + cap*sd*saturation_samples + hi*((8*coarse+2*confirm)*2 + candidate_samples*confirm + verify_samples*confirm)
+        if(aggregate) mbit_seconds+=cap*sd*saturation_samples
         printf "%.0f", mbit_seconds*1000000/8*1.08
     }'
 }
 
 estimate_control_saturation_bytes() {
     local control_rate="$1" control_duration="$2" capacity_rate="$3" saturation_duration="$4" aggregate="${5:-0}"
-    awk -v cr="$control_rate" -v cd="$control_duration" -v cap="$capacity_rate" -v sd="$saturation_duration" -v aggregate="$aggregate" 'BEGIN {
-        mbit_seconds=cr*cd*3 + cap*sd*3; if(aggregate) mbit_seconds+=cap*sd*3
+    awk -v cr="$control_rate" -v cd="$control_duration" -v cap="$capacity_rate" -v sd="$saturation_duration" -v aggregate="$aggregate" \
+        -v control_samples="$MEASURE_CONTROL_MAX_SAMPLES" -v saturation_samples="$MEASURE_SATURATION_MAX_SAMPLES" 'BEGIN {
+        mbit_seconds=cr*cd*control_samples + cap*sd*saturation_samples; if(aggregate) mbit_seconds+=cap*sd*saturation_samples
         printf "%.0f", mbit_seconds*1000000/8*1.08
     }'
 }
 
 new_measure_run() {
     local kind="$1" dir base suffix=0
+    if declare -F failure_reset >/dev/null; then failure_reset; fi
     ensure_state_layout || return 1
     base="$HISTORY_DIR/$(history_stamp)-${kind}"
     dir="$base"
@@ -5920,7 +6713,18 @@ new_measure_run() {
     chmod 0700 "$dir"
     MEASURE_RESULT_FILE="$dir/samples.tsv"
     MEASURE_RUN_DIR="$dir"
+    if declare -F history_prune_internal >/dev/null; then history_prune_internal "${MAX_HISTORY_ENTRIES:-20}" || return 1; fi
     printf 'TIME\tLABEL\tSENDER_MBIT\tRECEIVER_MBIT\tRETRANSMITS\tSENDER_BYTES\tRECEIVER_BYTES\tRETRANS_RATIO_EST_PERCENT\tRETRANS_PER_GIB\tRECEIVER_FALLBACK\tIDLE_RTT_MS\tLOADED_RTT_MEDIAN_MS\tLOADED_RTT_P95_MS\tBUFFERBLOAT_P95_MS\tBACKGROUND_TX_PERCENT\tCPU_BUSY_PERCENT\tCPU_STEAL_PERCENT\tCONTAMINATED\tDURATION_SECONDS\tFLOWS\n' > "$MEASURE_RESULT_FILE"
+}
+
+measurement_abort_before_begin() {
+    local kind="$1" peer="$2" port="$3" iface="$4" rc="$5"
+    if declare -F measurement_finalize_run >/dev/null; then
+        measurement_finalize_run "$kind" "$peer" "$port" "$iface" "$rc" not-needed || log WARN "measurement failure history finalization failed"
+        failure_summary_print "$MEASURE_RUN_DIR/summary.tsv" || true
+    fi
+    measure_clear_peer_lock
+    return "$rc"
 }
 
 measure_path_profile() {
@@ -5946,6 +6750,10 @@ measure_path_profile() {
     else
         rc=$?
     fi
+    if declare -F measurement_finalize_run >/dev/null; then
+        measurement_finalize_run path "$peer" none "$iface" "$rc" not-needed || log WARN "path history finalization failed"
+        (( rc == 0 )) || failure_summary_print "$dir/summary.tsv" || true
+    fi
     measure_clear_peer_lock
     return "$rc"
 }
@@ -5954,7 +6762,7 @@ measure_probe() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" duration="$4" parallel="$5" preferred_address="${6:-}" preferred_source="${7:-}"
-    local iface dir row rc=0 speed estimate sender receiver receiver_fallback
+    local iface dir row rc=0 speed estimate planning_rate sender receiver receiver_fallback restore_rc=0 health_family health_address health_rtt
     local confidence confidence_score confidence_grade confidence_reasons
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && is_uint "$parallel" && ((duration>=3 && duration<=120 && parallel>=1 && parallel<=32)) || { die "duration/parallel 超出安全范围"; return 1; }
@@ -5964,14 +6772,23 @@ measure_probe() {
     qdisc_guard "$iface" || return 1
     speed=$(detect_link_speed "$iface")
     if is_uint "$speed"; then
+        planning_rate="$speed"
         estimate=$(estimate_sweep_bytes "$speed" "$duration" 3)
         log INFO "按接口速率估算，probe 最多可能产生约 $(human_bytes "$estimate") 出站流量"
+    else
+        planning_rate=$(recommended_scan_cap "$iface" 0) || return 1
     fi
     new_measure_run probe || return 1
     dir="$MEASURE_RUN_DIR"
-    measure_set_latency_baseline "$peer" || return 1
-    measure_begin "$iface" || return 1
-    if apply_fq "$iface" && row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 unshaped 3 6); then
+    if declare -F measurement_environment_preflight >/dev/null; then
+        if measurement_environment_preflight "$iface" "${speed:-0}"; then :; else
+            rc=$?; measurement_finalize_run probe "$peer" "$port" "$iface" "$rc" not-needed || true
+            failure_summary_print "$dir/summary.tsv" || true; measure_clear_peer_lock; return "$rc"
+        fi
+    fi
+    if measure_set_latency_baseline "$peer"; then :; else rc=$?; measurement_abort_before_begin probe "$peer" "$port" "$iface" "$rc"; return $?; fi
+    if measure_begin "$iface"; then :; else rc=$?; measurement_abort_before_begin probe "$peer" "$port" "$iface" "$rc"; return $?; fi
+    if apply_fq "$iface" && row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 2 unshaped 3 6 "$planning_rate" unshaped); then
         receiver=$(cut -f16 <<< "$row"); receiver="${receiver:-$(cut -f1 <<< "$row")}"; sender=$(cut -f15 <<< "$row"); sender="${sender:-$receiver}"
         receiver_fallback=$(cut -f19 <<< "$row"); receiver_fallback="${receiver_fallback:-1}"
         confidence=$(measurement_confidence "$(cut -f13 <<< "$row")" "$(cut -f12 <<< "$row")" "$(cut -f7 <<< "$row")" "$(cut -f11 <<< "$row")" 0 "$PATH_PROFILE_SCORE" "$receiver_fallback")
@@ -5989,7 +6806,13 @@ measure_probe() {
         log INFO "结果: $dir"
     else rc=$?; fi
     traffic_report "$iface"
-    measure_restore || rc=$?
+    health_family="$MEASURE_PEER_FAMILY"; health_address="$MEASURE_PEER_ADDRESS"; health_rtt="${PATH_RTT_MEDIAN_MS:-na}"
+    if measure_restore; then :; else restore_rc=$?; rc="$ROLLBACK_FAILURE_RC"; declare -F failure_set >/dev/null && failure_set ROLLBACK rollback-failed "temporary qdisc restore failed (restore rc=$restore_rc)" "" "$ROLLBACK_FAILURE_RC"; fi
+    if declare -F measurement_finalize_run >/dev/null; then
+        measurement_finalize_run probe "$peer" "$port" "$iface" "$rc" "$([[ "$restore_rc" == 0 ]] && printf complete || printf failed)" || log WARN "probe history finalization failed"
+        (( rc == 0 )) || failure_summary_print "$dir/summary.tsv" || true
+    fi
+    measurement_peer_health_finalize "$peer" "$health_family" "$health_address" "$port" "$rc" "$health_rtt" "${receiver:-na}" unknown || log WARN "peer health 写入失败"
     return "$rc"
 }
 
@@ -6007,10 +6830,11 @@ measure_sweep() {
     local clean_reference_rate="" clean_reference_receiver="" clean_reference_loss="" first_scan_lossy=0 lower_attempts=0
     local last_ok="" last_ok_gp="" broke_at="" fine_start fine_step recommend="" candidate="" confirm_row confirm_gp="" confirm_loss=""
     local min_efficiency="0.90" confirmed=0 reject_reason="" estimated tests rc=0 no_knee=0 above_cap=0
-    local control_duration saturation_duration coarse_duration confirm_duration target_points scan_width
+    local control_duration saturation_duration coarse_duration confirm_duration target_points scan_width saturation_planning_rate
     local auto_cap=0 nominal_was_auto=0 observed_cap
     local legacy_baseline_quality=unknown scan_decision=inconclusive no_knee_reason=""
-    local confidence_row confidence confidence_score confidence_grade confidence_reasons
+    local confidence_row confidence confidence_score confidence_grade confidence_reasons preflight_capacity=0 restore_rc=0
+    local health_family="" health_address="" health_rtt=na health_semantic=""
     local sample_confidence_score sample_confidence_grade sample_confidence_reasons
     local decision_confidence_score decision_confidence_grade decision_confidence_reasons
     validate_peer "$peer" "$port" || return 1
@@ -6025,22 +6849,28 @@ measure_sweep() {
     iface="$MEASURE_PEER_IFACE"
     measure_require_locked_port "$peer" "$port" || return $?
     if (( cap == 0 )); then cap=$(recommended_scan_cap "$iface" "$nominal") || return 1; fi
+    saturation_planning_rate="$cap"
     qdisc_guard "$iface" || return 1
     hardware_profile_values "$iface" "$nominal" || return 1
     new_measure_run sweep || return 1
     dir="$MEASURE_RUN_DIR"
-    measure_set_latency_baseline "$peer" || return 1
-    path_profile_tuning_gate "$force_scan" || {
-        rc=$?
-        measure_clear_peer_lock
-        return "$rc"
-    }
-    measure_begin "$iface" || return 1
+    if (( nominal > 0 )); then preflight_capacity="$nominal"
+    elif [[ "${HARDWARE_LINK_TRUST:-}" == trusted ]] && is_uint "${HARDWARE_LINK_MBIT:-}"; then preflight_capacity="$HARDWARE_LINK_MBIT"
+    fi
+    if declare -F measurement_environment_preflight >/dev/null; then
+        if measurement_environment_preflight "$iface" "$preflight_capacity"; then :; else
+            rc=$?
+            measurement_finalize_run sweep "$peer" "$port" "$iface" "$rc" not-needed || true
+            failure_summary_print "$dir/summary.tsv" || true
+            measure_clear_peer_lock
+            return "$rc"
+        fi
+    fi
+    if measure_set_latency_baseline "$peer"; then :; else rc=$?; measurement_abort_before_begin sweep "$peer" "$port" "$iface" "$rc"; return $?; fi
+    if path_profile_tuning_gate "$force_scan"; then :; else rc=$?; measurement_abort_before_begin sweep "$peer" "$port" "$iface" "$rc"; return $?; fi
+    if measure_begin "$iface"; then :; else rc=$?; measurement_abort_before_begin sweep "$peer" "$port" "$iface" "$rc"; return $?; fi
 
-    control_duration="$duration"; ((control_duration < 5)) && control_duration=5; ((control_duration > 8)) && control_duration=8
-    saturation_duration="$duration"; ((saturation_duration > 6)) && saturation_duration=6
-    coarse_duration="$duration"; ((coarse_duration > 5)) && coarse_duration=5
-    confirm_duration=$((duration + 2)); ((confirm_duration < 6)) && confirm_duration=6; ((confirm_duration > 10)) && confirm_duration=10
+    IFS=$'\t' read -r control_duration saturation_duration coarse_duration confirm_duration <<< "$(measurement_profile_stage_durations "$duration")"
 
     # Known-rate runs establish path quality before any saturation traffic.
     # Auto-rate runs do the same control after capacity discovery has supplied
@@ -6050,14 +6880,16 @@ measure_sweep() {
         log INFO "PATH_CONTROL: ${path_control_rate} Mbit/s（标称速率的 40%）"
         if ! apply_shaping "$iface" "$path_control_rate"; then
             rc=1
-        elif path_control_row=$(sample_repeated "$peer" "$port" "$control_duration" 1 3 path-control 3 8); then
+        elif path_control_row=$(sample_repeated "$peer" "$port" "$control_duration" 1 "$MEASURE_CONTROL_SAMPLES" path-control "$MEASURE_CONTROL_MAX_SAMPLES" 8 "$path_control_rate" shaped); then
             path_control_receiver=$(cut -f1 <<< "$path_control_row"); path_control_sender=$(cut -f15 <<< "$path_control_row")
             path_control_sender="${path_control_sender:-$path_control_receiver}"; path_control_loss=$(cut -f4 <<< "$path_control_row")
             if awk -v g="$path_control_receiver" -v r="$path_control_rate" 'BEGIN {exit !(g<r*0.70)}'; then
                 path_control_quality=slow-peer; measurement_state=MEASUREMENT_UNSTABLE; reject_reason="path-control-peer-too-slow"; rc=2
+                declare -F failure_set >/dev/null && failure_set PATH_CONTROL peer-too-slow "receiver ${path_control_receiver}Mbit below 70% of ${path_control_rate}Mbit" "" 2
             elif loss_spike "$path_control_loss" 0.5 0; then
                 path_control_quality=dirty; legacy_baseline_quality=bad; measurement_state=PATH_DIRTY
                 scan_decision="path-dirty"; reject_reason="path-control-dirty"; rc="$MEASURE_PATH_QUALITY_RC"
+                declare -F failure_set >/dev/null && failure_set PATH_CONTROL path-dirty "retrans-est ${path_control_loss}%" "" "$rc"
             else
                 path_control_quality=clean; legacy_baseline_quality=good
             fi
@@ -6069,7 +6901,7 @@ measure_sweep() {
         :
     elif ! apply_fq "$iface"; then
         rc=1
-    elif saturation_row=$(sample_repeated "$peer" "$port" "$saturation_duration" 1 2 saturation 3 6); then
+    elif saturation_row=$(sample_repeated "$peer" "$port" "$saturation_duration" 1 "$MEASURE_SATURATION_SAMPLES" saturation "$MEASURE_SATURATION_MAX_SAMPLES" 6 "$saturation_planning_rate" unshaped); then
         saturation_receiver=$(cut -f1 <<< "$saturation_row"); saturation_loss=$(cut -f4 <<< "$saturation_row")
         saturation_sender=$(cut -f15 <<< "$saturation_row"); saturation_sender="${saturation_sender:-$saturation_receiver}"
         saturation_fallback=$(cut -f19 <<< "$saturation_row"); saturation_fallback="${saturation_fallback:-1}"
@@ -6088,14 +6920,17 @@ measure_sweep() {
             if (( rc == 0 )) && ! apply_shaping "$iface" "$path_control_rate"; then
                 rc=1
             elif (( rc == 0 )); then
-                if path_control_row=$(sample_repeated "$peer" "$port" "$control_duration" 1 3 path-control 3 8); then
+                if path_control_row=$(sample_repeated "$peer" "$port" "$control_duration" 1 "$MEASURE_CONTROL_SAMPLES" path-control "$MEASURE_CONTROL_MAX_SAMPLES" 8 \
+                    "$path_control_rate" shaped "$saturation_sender" "$saturation_loss" "$(cut -f8 <<< "$saturation_row")"); then
                     path_control_receiver=$(cut -f1 <<< "$path_control_row"); path_control_sender=$(cut -f15 <<< "$path_control_row")
                     path_control_sender="${path_control_sender:-$path_control_receiver}"; path_control_loss=$(cut -f4 <<< "$path_control_row")
                     if awk -v g="$path_control_receiver" -v r="$path_control_rate" 'BEGIN {exit !(g<r*0.70)}'; then
                         path_control_quality=slow-peer; measurement_state=MEASUREMENT_UNSTABLE; reject_reason="path-control-peer-too-slow"; rc=2
+                        declare -F failure_set >/dev/null && failure_set PATH_CONTROL peer-too-slow "receiver ${path_control_receiver}Mbit below 70% of ${path_control_rate}Mbit" "" 2
                     elif loss_spike "$path_control_loss" 0.5 0; then
                         path_control_quality=dirty; legacy_baseline_quality=bad; measurement_state=PATH_DIRTY
                         scan_decision="path-dirty"; reject_reason="path-control-dirty"; rc="$MEASURE_PATH_QUALITY_RC"
+                        declare -F failure_set >/dev/null && failure_set PATH_CONTROL path-dirty "retrans-est ${path_control_loss}%" "" "$rc"
                     else
                         path_control_quality=clean; legacy_baseline_quality=good
                     fi
@@ -6106,7 +6941,7 @@ measure_sweep() {
         if (( rc == 0 )) && [[ "$path_control_quality" == clean ]]; then
             if (( policer_suspected )); then measurement_state=CLEAN_POLICER_FOUND
             else
-                measurement_state=CLEAN_NO_POLICER; no_knee=1; no_knee_reason=saturation-clean; scan_decision=no-knee-clean
+                measurement_state=CLEAN_NO_POLICER; no_knee=1; no_knee_reason="saturation-clean"; scan_decision=no-knee-clean
                 (( force_scan )) && { no_knee=0; no_knee_reason=""; scan_decision=forced-scan; }
             fi
         fi
@@ -6122,7 +6957,8 @@ measure_sweep() {
             log INFO "CAPACITY_DISCOVERY: 单流明显低于高带宽标称值，追加 ${capacity_parallel} 流容量探针"
             if ! apply_fq "$iface"; then
                 rc=1
-            elif capacity_row=$(sample_repeated "$peer" "$port" "$saturation_duration" "$capacity_parallel" 2 capacity-aggregate 3 8); then
+            elif capacity_row=$(sample_repeated "$peer" "$port" "$saturation_duration" "$capacity_parallel" "$MEASURE_SATURATION_SAMPLES" capacity-aggregate "$MEASURE_SATURATION_MAX_SAMPLES" 8 \
+                "$saturation_planning_rate" unshaped "$saturation_sender" "$saturation_loss" "$(cut -f8 <<< "$saturation_row")"); then
                 aggregate_receiver=$(cut -f1 <<< "$capacity_row")
                 if awk -v a="$aggregate_receiver" -v b="$capacity_receiver" 'BEGIN {exit !(a>b)}'; then capacity_receiver="$aggregate_receiver"; fi
                 capacity_mode=single+aggregate
@@ -6148,6 +6984,7 @@ measure_sweep() {
             saturation_state=unstable; measurement_state=MEASUREMENT_UNSTABLE
             no_knee=0; no_knee_reason=""; scan_decision=inconclusive-peer-too-slow
             reject_reason="capacity-below-nominal-after-aggregate"; rc=2
+            declare -F failure_set >/dev/null && failure_set CAPACITY_DISCOVERY peer-too-slow "aggregate receiver ${capacity_receiver}Mbit below nominal ${nominal}Mbit" "" 2
         fi
         if (( rc == 0 )); then
             if awk -v g="$capacity_receiver" -v c="$cap" 'BEGIN {exit !(g>c)}'; then
@@ -6201,11 +7038,11 @@ measure_sweep() {
 
     if (( rc == 0 )); then
         if (( no_knee )); then
-            tests=6; [[ "$capacity_mode" == single+aggregate ]] && tests=9
+            tests=$((MEASURE_CONTROL_MAX_SAMPLES + MEASURE_SATURATION_MAX_SAMPLES)); [[ "$capacity_mode" == single+aggregate ]] && tests=$((tests + MEASURE_SATURATION_MAX_SAMPLES))
             estimated=$(estimate_control_saturation_bytes "$path_control_rate" "$control_duration" "$capacity_receiver" \
                 "$saturation_duration" "$([[ "$capacity_mode" == single+aggregate ]] && echo 1 || echo 0)")
         else
-            tests=29; [[ "$capacity_mode" == single+aggregate ]] && tests=32
+            tests=$((MEASURE_CONTROL_MAX_SAMPLES + MEASURE_SATURATION_MAX_SAMPLES + MEASURE_CANDIDATE_MAX_SAMPLES + MEASURE_VERIFY_MAX_SAMPLES*2 + 20)); [[ "$capacity_mode" == single+aggregate ]] && tests=$((tests + MEASURE_SATURATION_MAX_SAMPLES))
             estimated=$(estimate_measurement_plan_bytes "$path_control_rate" "$control_duration" "$capacity_receiver" \
                 "$saturation_duration" "$high" "$coarse_duration" "$confirm_duration" "$([[ "$capacity_mode" == single+aggregate ]] && echo 1 || echo 0)")
         fi
@@ -6218,7 +7055,7 @@ measure_sweep() {
             if (( rc == 0 )); then apply_shaping "$iface" "$low" || rc=$?; fi
             if (( rc == 0 )); then
                 measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
-                    "rate-${low}" "$threshold" "$path_control_loss" || rc=$?
+                    "rate-${low}" "$threshold" "$path_control_loss" "$low" || rc=$?
                 base_row="$MEASURE_LEVEL_ROW"
                 base_gp=$(cut -f1 <<< "${base_row:-$'0\t0\t0\t0'}")
                 base_loss=$(cut -f4 <<< "${base_row:-$'0\t0\t0\t0'}")
@@ -6232,7 +7069,7 @@ measure_sweep() {
                     measurement_cooldown BETWEEN_LEVEL "$lower_rate" "$coarse_duration" || { rc=$?; break; }
                     apply_shaping "$iface" "$lower_rate" || { rc=$?; break; }
                     measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
-                        "lower-control-${lower_rate}" "$threshold" "$path_control_loss" || { rc=$?; break; }
+                        "lower-control-${lower_rate}" "$threshold" "$path_control_loss" "$lower_rate" || { rc=$?; break; }
                     if (( ! MEASURE_LEVEL_SPIKE_CONFIRMED )); then
                         base_row="$MEASURE_LEVEL_ROW"; base_gp=$(cut -f1 <<< "$base_row"); base_loss=$(cut -f4 <<< "$base_row")
                         last_ok="$lower_rate"; last_ok_gp="$base_gp"; broke_at="$known_broke"
@@ -6260,7 +7097,7 @@ measure_sweep() {
                     measurement_cooldown BETWEEN_LEVEL "$rate" "$coarse_duration" || { rc=$?; break; }
                     apply_shaping "$iface" "$rate" || { rc=$?; break; }
                     measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
-                        "rate-${rate}" "$threshold" "$clean_reference_loss" || { rc=$?; break; }
+                        "rate-${rate}" "$threshold" "$clean_reference_loss" "$rate" || { rc=$?; break; }
                     row="$MEASURE_LEVEL_ROW"
                     gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
                     printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%%\n' "$rate" "$gp" "$loss"
@@ -6281,7 +7118,7 @@ measure_sweep() {
                     measurement_cooldown BETWEEN_LEVEL "$rate" "$coarse_duration" || { rc=$?; break; }
                     apply_shaping "$iface" "$rate" || { rc=$?; break; }
                     measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
-                        "refine-${rate}" "$threshold" "$clean_reference_loss" || { rc=$?; break; }
+                        "refine-${rate}" "$threshold" "$clean_reference_loss" "$rate" || { rc=$?; break; }
                     row="$MEASURE_LEVEL_ROW"
                     gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
                     printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%% (refine)\n' "$rate" "$gp" "$loss"
@@ -6299,13 +7136,14 @@ measure_sweep() {
                 measurement_cooldown BETWEEN_LEVEL "$candidate" "$confirm_duration" || rc=$?
                 if (( rc == 0 )); then apply_shaping "$iface" "$candidate" || rc=$?; fi
                 if (( rc == 0 )); then
-                    confirm_row=$(sample_repeated "$peer" "$port" "$confirm_duration" "$parallel" 2 "confirm-${candidate}" 3 6) || rc=$?
+                    confirm_row=$(sample_repeated "$peer" "$port" "$confirm_duration" "$parallel" "$MEASURE_CANDIDATE_SAMPLES" "confirm-${candidate}" "$MEASURE_CANDIDATE_MAX_SAMPLES" 6 "$candidate" shaped) || rc=$?
                     confirm_gp=$(cut -f1 <<< "${confirm_row:-$'0\t0\t0\t999'}")
                     confirm_loss=$(cut -f4 <<< "${confirm_row:-$'0\t0\t0\t999'}")
                     if (( rc == 0 )) && measurement_sample_acceptable "$confirm_gp" "$confirm_loss" "$candidate" "$min_efficiency" "$threshold" "$base_loss"; then
                         recommend="$candidate"; confirmed=1
                     elif (( rc == 0 )); then
                         reject_reason="confirmation-failed"
+                        declare -F failure_set >/dev/null && failure_set CANDIDATE_CONFIRM candidate-confirm-failed "candidate ${candidate}Mbit did not meet throughput/retrans gates" "" 2
                         log WARN "候选档 ${candidate} Mbit 复测未通过吞吐/重传门槛，不生成推荐值"
                     fi
                 fi
@@ -6324,8 +7162,12 @@ measure_sweep() {
 
     if (( rc == 0 )) && [[ -n "${recommend:-}" ]]; then scan_decision=recommend; measurement_state=CLEAN_POLICER_FOUND; fi
     if (( rc == 0 )) && [[ "$reject_reason" == confirmation-failed ]]; then scan_decision=inconclusive-confirmation; fi
+    if (( rc == MEASURE_BUDGET_RC )); then
+        measurement_state=MEASUREMENT_BUDGET_EXCEEDED; scan_decision=budget-exceeded
+        reject_reason=budget-exceeded; recommend=""; confirmed=0; no_knee=0
+    fi
 
-    if (( rc == 0 || rc == MEASURE_PATH_QUALITY_RC || rc == 2 )); then
+    if (( rc == 0 || rc == MEASURE_PATH_QUALITY_RC || rc == MEASURE_BUDGET_RC || rc == MEASUREMENT_PREFLIGHT_RC || rc == 2 )); then
         printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nHARDWARE_CLASS\t%s\nLINK_MBIT\t%s\nRX_QUEUES\t%s\nTX_QUEUES\t%s\nSCAN_CAP_MBIT\t%s\nSAMPLE_DURATION_SECONDS\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nCLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t%s\nBASELINE_QUALITY\t%s\nSCAN_DECISION\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nMIN_EFFICIENCY_RATIO\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nCANDIDATE\t%s\nCONFIRM_MBIT\t%s\nCONFIRM_RETRANS_RATIO_EST_PERCENT\t%s\nCONFIRMED\t%s\nREJECT_REASON\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nNO_KNEE_REASON\t%s\nABOVE_CAP\t%s\n' \
             "$peer" "$port" "$iface" "$HARDWARE_CLASS" "$HARDWARE_LINK_MBIT" "$HARDWARE_RX_QUEUES" "$HARDWARE_TX_QUEUES" "$cap" "$duration" \
             "${saturation_receiver:-}" "${saturation_loss:-}" "${clean_reference_loss:-${path_control_loss:-0}}" "$legacy_baseline_quality" "$scan_decision" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$no_knee_reason" "$above_cap" > "$dir/summary.tsv"
@@ -6334,8 +7176,8 @@ measure_sweep() {
             "${saturation_sender:-}" "${saturation_receiver:-}" "${saturation_loss:-}" "$saturation_state" "$capacity_mode" "${capacity_receiver:-}" \
             "$policer_suspected" "$low" "$high" "$step" "${clean_reference_rate:-$path_control_rate}" \
             "${clean_reference_receiver:-$path_control_receiver}" "${clean_reference_loss:-$path_control_loss}" "${last_ok:-}" >> "$dir/summary.tsv"
-        printf 'CONTROL_DURATION_SECONDS\t%s\nSATURATION_DURATION_SECONDS\t%s\nCOARSE_DURATION_SECONDS\t%s\nCONFIRM_DURATION_SECONDS\t%s\nPLANNED_SAMPLE_UPPER_BOUND\t%s\nESTIMATED_TRAFFIC_BYTES_UPPER_BOUND\t%s\n' \
-            "$control_duration" "$saturation_duration" "$coarse_duration" "$confirm_duration" "${tests:-0}" "${estimated:-0}" >> "$dir/summary.tsv"
+        printf 'CONTROL_DURATION_SECONDS\t%s\nSATURATION_DURATION_SECONDS\t%s\nCOARSE_DURATION_SECONDS\t%s\nCONFIRM_DURATION_SECONDS\t%s\nPLANNED_SAMPLE_UPPER_BOUND\t%s\nESTIMATED_TRAFFIC_BYTES_UPPER_BOUND\t%s\nMEASUREMENT_PROFILE\t%s\n' \
+            "$control_duration" "$saturation_duration" "$coarse_duration" "$confirm_duration" "${tests:-0}" "${estimated:-0}" "$MEASUREMENT_PROFILE" >> "$dir/summary.tsv"
         printf 'BASELINE_QUALITY_SEMANTICS\tpath-control-compatibility-alias\n' >> "$dir/summary.tsv"
         confidence_row="${confirm_row:-${saturation_row:-}}"
         if [[ -n "$confidence_row" ]]; then
@@ -6379,7 +7221,21 @@ measure_sweep() {
         log INFO "完整结果: $dir"
     fi
     traffic_report "$iface"
-    measure_restore || rc=$?
+    health_family="$MEASURE_PEER_FAMILY"; health_address="$MEASURE_PEER_ADDRESS"; health_rtt="${PATH_RTT_MEDIAN_MS:-na}"
+    if measure_restore; then :; else restore_rc=$?; rc="$ROLLBACK_FAILURE_RC"; declare -F failure_set >/dev/null && failure_set ROLLBACK rollback-failed "temporary qdisc restore failed (restore rc=$restore_rc)" "" "$ROLLBACK_FAILURE_RC"; fi
+    if declare -F measurement_finalize_run >/dev/null; then
+        measurement_finalize_run sweep "$peer" "$port" "$iface" "$rc" "$([[ "$restore_rc" == 0 ]] && printf complete || printf failed)" || {
+            log WARN "measurement history finalization failed; networking state remains authoritative"
+        }
+        (( rc == 0 )) || failure_summary_print "$dir/summary.tsv" || true
+    fi
+    if (( rc == 2 )) && [[ "$path_control_quality" == clean || "$path_control_quality" == good ]]; then
+        if [[ "$scan_decision" == inconclusive-policer-out-of-range ]]; then health_semantic="knee-not-located"
+        else health_semantic=measurement-inconclusive
+        fi
+    fi
+    measurement_peer_health_finalize "$peer" "$health_family" "$health_address" "$port" "$rc" "$health_rtt" \
+        "${saturation_receiver:-na}" "$path_control_quality" "$health_semantic" || log WARN "peer health 写入失败；网络事务不受影响"
     return "$rc"
 }
 
@@ -6392,7 +7248,7 @@ measure_path_check() {
     require_root || return 1; acquire_lock || return 1; tc_dependencies || return 1
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" rate="$4" preferred_address="${5:-}" preferred_source="${6:-}"
-    local iface dir row="" gp="" sender="" loss="" quality=unknown rc=0 accepted=0
+    local iface dir row="" gp="" sender="" loss="" quality=unknown rc=0 accepted=0 restore_rc=0
     validate_peer "$peer" "$port" || return 1
     is_uint "$rate" && (( rate > 0 )) || { die "路径检查速率无效"; return 1; }
     measure_lock_requested_peer "$peer" "$port" "$requested" "$preferred_address" "$preferred_source" || return $?
@@ -6400,25 +7256,29 @@ measure_path_check() {
     measure_require_locked_port "$peer" "$port" || return $?
     qdisc_guard "$iface" || return 1
     new_measure_run path-check || return 1; dir="$MEASURE_RUN_DIR"
-    measure_set_latency_baseline "$peer" || return 1
-    path_profile_tuning_gate 0 || {
-        rc=$?
-        measure_clear_peer_lock
-        return "$rc"
-    }
-    measure_begin "$iface" || return 1
+    if declare -F measurement_environment_preflight >/dev/null; then
+        if measurement_environment_preflight "$iface" "$rate"; then :; else
+            rc=$?; measurement_finalize_run path-check "$peer" "$port" "$iface" "$rc" not-needed || true
+            failure_summary_print "$dir/summary.tsv" || true; measure_clear_peer_lock; return "$rc"
+        fi
+    fi
+    if measure_set_latency_baseline "$peer"; then :; else rc=$?; measurement_abort_before_begin path-check "$peer" "$port" "$iface" "$rc"; return $?; fi
+    if path_profile_tuning_gate 0; then :; else rc=$?; measurement_abort_before_begin path-check "$peer" "$port" "$iface" "$rc"; return $?; fi
+    if measure_begin "$iface"; then :; else rc=$?; measurement_abort_before_begin path-check "$peer" "$port" "$iface" "$rc"; return $?; fi
     log INFO "路径预检: 临时整形 ${rate} Mbit/s，检查对端是否足以承载测量"
     if ! apply_shaping "$iface" "$rate"; then
         rc=1
-    elif row=$(sample_repeated "$peer" "$port" 5 1 3 path-check 3 8); then
+    elif row=$(sample_repeated "$peer" "$port" 5 1 3 path-check 3 8 "$rate" shaped); then
         gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
         sender=$(cut -f15 <<< "$row"); sender="${sender:-$gp}"
         if awk -v g="$gp" -v r="$rate" 'BEGIN {exit !(g < r*0.70)}'; then
             quality=slow-peer
+            declare -F failure_set >/dev/null && failure_set PATH_CONTROL peer-too-slow "receiver ${gp}Mbit below 70% of ${rate}Mbit" "" 2
             log ERR "路径预检仅达到 ${gp} Mbit/s，明显低于 ${rate} Mbit/s；更换更近对端后重试"
             rc=2
         elif loss_spike "$loss" 0.5 0; then
             quality=dirty
+            declare -F failure_set >/dev/null && failure_set PATH_CONTROL path-dirty "retrans-est ${loss}%" "" "$MEASURE_PATH_QUALITY_RC"
             log ERR "低速路径控制重传比例过高 (${loss}%)；PATH_DIRTY"
             rc="$MEASURE_PATH_QUALITY_RC"
         else
@@ -6434,7 +7294,12 @@ measure_path_check() {
         measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         log INFO "路径预检结果: $dir"
     fi
-    measure_restore || rc=$?
+    traffic_report "$iface"
+    if measure_restore; then :; else restore_rc=$?; rc="$ROLLBACK_FAILURE_RC"; declare -F failure_set >/dev/null && failure_set ROLLBACK rollback-failed "temporary qdisc restore failed (restore rc=$restore_rc)" "" "$ROLLBACK_FAILURE_RC"; fi
+    if declare -F measurement_finalize_run >/dev/null; then
+        measurement_finalize_run path-check "$peer" "$port" "$iface" "$rc" "$([[ "$restore_rc" == 0 ]] && printf complete || printf failed)" || log WARN "path-check history finalization failed"
+        (( rc == 0 )) || failure_summary_print "$dir/summary.tsv" || true
+    fi
     return "$rc"
 }
 
@@ -6446,7 +7311,8 @@ measure_verify() {
     local preferred_address="${9:-}" preferred_source="${10:-}"
     local multi_parallel
     local one_count multi_count combined_count one_spread multi_spread combined_spread combined_loaded combined_contaminated
-    local confidence confidence_score confidence_grade confidence_reasons
+    local confidence confidence_score confidence_grade confidence_reasons restore_rc=0 health_family health_address health_rtt preflight_capacity
+    local verify_planning_rate verify_rate_semantics
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && (( duration >= 3 && duration <= 120 )) || { die "verify duration 超出安全范围"; return 1; }
     is_uint "$expected_rate" && (( expected_rate <= 1000000 )) || { die "verify 期望速率无效"; return 1; }
@@ -6461,16 +7327,30 @@ measure_verify() {
     qdisc_guard "$iface" || return 1
     multi_parallel=$(recommended_verify_flows "$iface" "$expected_rate") || return 1
     new_measure_run verify || return 1; dir="$MEASURE_RUN_DIR"
-    measure_set_latency_baseline "$peer" || return 1
-    path_profile_tuning_gate 0 || {
-        rc=$?
-        measure_clear_peer_lock
-        return "$rc"
-    }
-    measure_begin "$iface" || return 1
+    preflight_capacity="$expected_rate"
+    if (( preflight_capacity == 0 )); then preflight_capacity=$(detect_link_speed "$iface"); is_uint "$preflight_capacity" || preflight_capacity=0; fi
+    if (( expected_rate > 0 )); then
+        verify_planning_rate="$expected_rate"; verify_rate_semantics=shaped
+    elif (( preflight_capacity > 0 )); then
+        verify_planning_rate="$preflight_capacity"; verify_rate_semantics=unshaped
+    else
+        verify_planning_rate=$(recommended_scan_cap "$iface" 0) || return 1
+        verify_rate_semantics=unshaped
+    fi
+    if declare -F measurement_environment_preflight >/dev/null; then
+        if measurement_environment_preflight "$iface" "$preflight_capacity"; then :; else
+            rc=$?; measurement_finalize_run verify "$peer" "$port" "$iface" "$rc" not-needed || true
+            failure_summary_print "$dir/summary.tsv" || true; measure_clear_peer_lock; return "$rc"
+        fi
+    fi
+    if measure_set_latency_baseline "$peer"; then :; else rc=$?; measurement_abort_before_begin verify "$peer" "$port" "$iface" "$rc"; return $?; fi
+    if path_profile_tuning_gate 0; then :; else rc=$?; measurement_abort_before_begin verify "$peer" "$port" "$iface" "$rc"; return $?; fi
+    if measure_begin "$iface"; then :; else rc=$?; measurement_abort_before_begin verify "$peer" "$port" "$iface" "$rc"; return $?; fi
     measurement_cooldown PRE_VERIFY "$expected_rate" "$duration" || rc=$?
-    if (( rc == 0 )); then one=$(sample_repeated "$peer" "$port" "$duration" 1 2 verify-single 3 6) || rc=$?; fi
-    if (( rc == 0 )); then multi=$(sample_repeated "$peer" "$port" "$duration" "$multi_parallel" 2 "verify-multi-${multi_parallel}" 3 6) || rc=$?; fi
+    if (( rc == 0 )); then one=$(sample_repeated "$peer" "$port" "$duration" 1 "$MEASURE_VERIFY_SAMPLES" verify-single "$MEASURE_VERIFY_MAX_SAMPLES" 6 \
+        "$verify_planning_rate" "$verify_rate_semantics") || rc=$?; fi
+    if (( rc == 0 )); then multi=$(sample_repeated "$peer" "$port" "$duration" "$multi_parallel" "$MEASURE_VERIFY_SAMPLES" "verify-multi-${multi_parallel}" "$MEASURE_VERIFY_MAX_SAMPLES" 6 \
+        "$verify_planning_rate" "$verify_rate_semantics" "$(cut -f15 <<< "${one:-}")" "$(cut -f4 <<< "${one:-}")" "$(cut -f8 <<< "${one:-}")") || rc=$?; fi
     if (( rc == 0 )); then
         one_gp=$(cut -f1 <<< "$one"); one_loss=$(cut -f4 <<< "$one")
         multi_gp=$(cut -f1 <<< "$multi"); multi_loss=$(cut -f4 <<< "$multi")
@@ -6513,12 +7393,24 @@ measure_verify() {
             log INFO "负载 RTT p95: 单流 $(cut -f7 <<< "$one") ms，多流 $(cut -f7 <<< "$multi") ms；置信度 ${confidence_grade} (${confidence_score}/100)"
         else
             log ERR "最终复验未通过（$reject_reason）：单流 ${one_gp} Mbit/s，多流 ${multi_gp} Mbit/s"
+            if [[ "$reject_reason" == *retrans* ]]; then
+                declare -F failure_set >/dev/null && failure_set FINAL_VERIFY verify-retrans-failed "$reject_reason" "" 2
+            else
+                declare -F failure_set >/dev/null && failure_set FINAL_VERIFY verify-throughput-failed "$reject_reason" "" 2
+            fi
             rc=2
         fi
         log INFO "验证结果: $dir"
     fi
     traffic_report "$iface"
-    measure_restore || rc=$?
+    health_family="$MEASURE_PEER_FAMILY"; health_address="$MEASURE_PEER_ADDRESS"; health_rtt="${PATH_RTT_MEDIAN_MS:-na}"
+    if measure_restore; then :; else restore_rc=$?; rc="$ROLLBACK_FAILURE_RC"; declare -F failure_set >/dev/null && failure_set ROLLBACK rollback-failed "temporary qdisc restore failed (restore rc=$restore_rc)" "" "$ROLLBACK_FAILURE_RC"; fi
+    if declare -F measurement_finalize_run >/dev/null; then
+        measurement_finalize_run verify "$peer" "$port" "$iface" "$rc" "$([[ "$restore_rc" == 0 ]] && printf complete || printf failed)" || log WARN "verify history finalization failed"
+        (( rc == 0 )) || failure_summary_print "$dir/summary.tsv" || true
+    fi
+    measurement_peer_health_finalize "$peer" "$health_family" "$health_address" "$port" "$rc" "$health_rtt" \
+        "${multi_gp:-na}" "${PATH_CONTROL_QUALITY:-unknown}" || log WARN "peer health 写入失败"
     return "$rc"
 }
 
@@ -6527,9 +7419,9 @@ measure_compare() {
     require_commands iperf3 jq timeout || return 1
     local peer="$1" port="$2" requested="$3" rate="$4" duration="${5:-6}" rounds="${6:-2}"
     local preferred_address="${7:-}" preferred_source="${8:-}"
-    local iface dir speed estimate_rate estimate rc=0 round mode row verdict confidence
+    local iface dir speed estimate_rate estimate rc=0 round mode row verdict confidence sample_plan sample_semantics
     local fq_gp shaped_gp fq_rpg shaped_rpg fq_bloat shaped_bloat fq_spread shaped_spread combined_spread combined_loaded
-    local confidence_score confidence_grade confidence_reasons throughput_delta receiver_fallback=0
+    local confidence_score confidence_grade confidence_reasons throughput_delta receiver_fallback=0 restore_rc=0 preflight_capacity
     local -a fq_goodputs=() shaped_goodputs=() fq_retrans_gib=() shaped_retrans_gib=() fq_bloats=() shaped_bloats=()
     validate_peer "$peer" "$port" || return 1
     is_uint "$rate" && (( rate >= 1 && rate <= 1000000 )) || { die "compare rate 必须是 1–1000000 的整数"; return 1; }
@@ -6540,21 +7432,30 @@ measure_compare() {
     measure_require_locked_port "$peer" "$port" || return $?
     qdisc_guard "$iface" || return 1
     new_measure_run compare || return 1; dir="$MEASURE_RUN_DIR"
-    measure_set_latency_baseline "$peer" || return 1
     speed=$(detect_link_speed "$iface"); estimate_rate="$rate"
     if is_uint "$speed" && (( speed > estimate_rate )); then estimate_rate="$speed"; fi
+    preflight_capacity="$estimate_rate"; is_uint "$preflight_capacity" || preflight_capacity="$rate"
+    if declare -F measurement_environment_preflight >/dev/null; then
+        if measurement_environment_preflight "$iface" "$preflight_capacity"; then :; else
+            rc=$?; measurement_finalize_run compare "$peer" "$port" "$iface" "$rc" not-needed || true
+            failure_summary_print "$dir/summary.tsv" || true; measure_clear_peer_lock; return "$rc"
+        fi
+    fi
+    if measure_set_latency_baseline "$peer"; then :; else rc=$?; measurement_abort_before_begin compare "$peer" "$port" "$iface" "$rc"; return $?; fi
     estimate=$(estimate_sweep_bytes "$estimate_rate" "$duration" "$((rounds * 2))")
     log INFO "A/B 对照将交错执行 FQ 与 ${rate} Mbit HTB/FQ，各 ${rounds} 轮；最多约 $(human_bytes "$estimate") 出站流量"
-    measure_begin "$iface" || return 1
+    if measure_begin "$iface"; then :; else rc=$?; measurement_abort_before_begin compare "$peer" "$port" "$iface" "$rc"; return $?; fi
     for ((round=1; round<=rounds; round++)); do
         if (( round % 2 )); then local -a modes=(fq shaped); else local -a modes=(shaped fq); fi
         for mode in "${modes[@]}"; do
             if [[ "$mode" == fq ]]; then
                 apply_fq "$iface" || { rc=$?; break 2; }
+                sample_plan="$estimate_rate"; sample_semantics=unshaped
             else
                 apply_shaping "$iface" "$rate" || { rc=$?; break 2; }
+                sample_plan="$rate"; sample_semantics=shaped
             fi
-            row=$(sample_repeated "$peer" "$port" "$duration" 1 1 "compare-${mode}-r${round}") || { rc=$?; break 2; }
+            row=$(sample_repeated "$peer" "$port" "$duration" 1 1 "compare-${mode}-r${round}" 1 0 "$sample_plan" "$sample_semantics") || { rc=$?; break 2; }
             [[ "$(cut -f19 <<< "$row")" != 1 ]] || receiver_fallback=1
             if [[ "$mode" == fq ]]; then
                 fq_goodputs+=("$(cut -f1 <<< "$row")"); fq_retrans_gib+=("$(cut -f5 <<< "$row")")
@@ -6591,7 +7492,11 @@ measure_compare() {
         log INFO "结果: $dir"
     fi
     traffic_report "$iface"
-    measure_restore || rc=$?
+    if measure_restore; then :; else restore_rc=$?; rc="$ROLLBACK_FAILURE_RC"; declare -F failure_set >/dev/null && failure_set ROLLBACK rollback-failed "temporary qdisc restore failed (restore rc=$restore_rc)" "" "$ROLLBACK_FAILURE_RC"; fi
+    if declare -F measurement_finalize_run >/dev/null; then
+        measurement_finalize_run compare "$peer" "$port" "$iface" "$rc" "$([[ "$restore_rc" == 0 ]] && printf complete || printf failed)" || log WARN "compare history finalization failed"
+        (( rc == 0 )) || failure_summary_print "$dir/summary.tsv" || true
+    fi
     return "$rc"
 }
 
@@ -8133,7 +9038,7 @@ verify_persistence_artifacts() {
 show_status() {
     local iface="" cc available profile_state service_state service_active shaping=off config_state baseline_state buffer_state="unavailable" script_state
     local hardware_state="unavailable" queue_state="unavailable" backlog_state="unavailable" scaling_state="unavailable" path_state="none"
-    local nic_policy_state=single status_rc=0 tuning_model
+    local nic_policy_state=single status_rc=0 tuning_model persistence_version=absent persistence_sync=OUT_OF_SYNC
     load_config || return 1
     if (( MULTI_NIC_ENABLED == 1 )); then
         nic_policy_state=valid
@@ -8160,13 +9065,20 @@ show_status() {
         scaling_state=$(hardware_scaling_note)
     fi
     script_state=$(persistence_script_state)
+    if [[ -f "$PERSIST_SCRIPT" && ! -L "$PERSIST_SCRIPT" ]]; then
+        persistence_version=$(awk -F'"' '$1=="SCRIPT_VERSION=" {print $2; exit}' "$PERSIST_SCRIPT" 2>/dev/null)
+        [[ "$persistence_version" == "$SCRIPT_VERSION" && "$script_state" != *differs* && "$script_state" != *foreign* && "$script_state" != *not\ executable* ]] && persistence_sync=SYNCED
+    fi
     path_state=$(latest_path_brief 2>/dev/null || printf 'none\n')
     if (( BANDWIDTH_MBIT == 0 && RTT_MS == 0 )); then
-        tuning_model="$ROLE / defaults only (no measurement-derived bandwidth or RTT)"
+        tuning_model="defaults-only / $SYSCTL_PROFILE"
     else
         tuning_model="$ROLE / ${BANDWIDTH_MBIT} Mbit / ${RTT_MS} ms"
     fi
     printf '%-20s %s\n' "Version" "v${SCRIPT_VERSION}"
+    printf '%-20s %s\n' "CLI script" "v${SCRIPT_VERSION}"
+    printf '%-20s %s\n' "Persistence copy" "v${persistence_version:-unknown}"
+    printf '%-20s %s\n' "Persistence sync" "$persistence_sync"
     printf '%-20s %s\n' "Kernel" "$(uname -r)"
     printf '%-20s %s\n' "Congestion control" "$cc (available: $available)"
     printf '%-20s %s\n' "BBR generation" "$(bbr_generation_status "$cc")"
@@ -8185,6 +9097,7 @@ show_status() {
     printf '%-20s %s\n' "Config" "$config_state ($CONFIG_FILE)"
     printf '%-20s %s\n' "Baseline" "$baseline_state"
     printf '%-20s %s\n' "Path consistency" "$path_state"
+    if declare -F status_measurement_details >/dev/null; then status_measurement_details; fi
     if (( MULTI_NIC_ENABLED == 1 )); then
         printf '%-20s %s\n' "NIC policy mode" "multi / $nic_policy_state / $(nic_policy_interface_list 2>/dev/null | grep -c . || true) managed"
         nic_inventory || status_rc=1
@@ -8222,7 +9135,10 @@ verify_system_state() {
         systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未启用"; rc=1; }
         systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未运行"; rc=1; }
         nic_verify_runtime_policies || rc=1
-        if (( rc == 0 )); then log OK "全部网卡运行时与持久化状态一致"; else die "多网卡验证发现不一致"; fi
+        if (( rc == 0 )); then log OK "全部网卡运行时与持久化状态一致"; else
+            declare -F failure_set >/dev/null && failure_set RUNTIME_VERIFY runtime-verify-failed "multi-NIC runtime/persistence drift" || true
+            die "多网卡验证发现不一致"
+        fi
         return "$rc"
     fi
     if (( TC_ENABLED == 1 )) && [[ "$TC_INTERFACE" == auto ]]; then
@@ -8235,9 +9151,20 @@ verify_system_state() {
     systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未启用"; rc=1; }
     systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未运行"; rc=1; }
     if (( TC_ENABLED )); then verify_shaping "$iface" "$TC_RATE_MBIT" || rc=1
-    else [[ "$(root_qdisc_kind "$iface")" == fq ]] || { log ERR "root qdisc 不是 fq"; rc=1; }
+    else
+        local actual_qdisc
+        actual_qdisc=$(root_qdisc_kind "$iface" 2>/dev/null || printf unreadable)
+        if [[ "$actual_qdisc" != fq ]]; then
+            log ERR "$iface qdisc drift"
+            log ERR "expected: fq"
+            log ERR "actual:   $actual_qdisc"
+            rc=1
+        fi
     fi
-    if (( rc == 0 )); then log OK "运行时与持久化状态一致"; else die "验证发现不一致"; fi
+    if (( rc == 0 )); then log OK "运行时与持久化状态一致"; else
+        declare -F failure_set >/dev/null && failure_set RUNTIME_VERIFY runtime-verify-failed "$iface runtime/persistence drift" || true
+        die "验证发现不一致"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -9480,7 +10407,7 @@ dns_policy_collect() {
 
     DNS_POLICY_DECISION=ready
     if [[ "$DNS_POLICY_CURRENT" == "$target" ]]; then
-        DNS_POLICY_ACTION=verify-and-repair
+        DNS_POLICY_ACTION="verify-and-repair"
         DNS_POLICY_REASON="策略文件已匹配；仍将事务性重载并执行真实查询验证"
     elif [[ "$target" == strict-dot ]]; then
         DNS_POLICY_ACTION=install-strict-dot
@@ -10992,7 +11919,7 @@ ipv6_policy_collect() {
     case "$target:$IPV6_POLICY_CURRENT" in
         disabled-temporary:disabled-temporary|disabled-persistent:disabled-persistent)
             IPV6_POLICY_DECISION=noop
-            IPV6_POLICY_ACTION=verify-current
+            IPV6_POLICY_ACTION="verify-current"
             IPV6_POLICY_REASON="当前策略已匹配；只执行独立一致性验证"
             ;;
         disabled-temporary:*)
@@ -11181,8 +12108,8 @@ ipv6_policy_status() {
 # -----------------------------------------------------------------------------
 
 self_update() {
-    require_root || return 1; acquire_lock || return 1; require_commands curl awk sha256sum sort install grep || return 1
-    local latest latest_version current target tmp base expected actual backup newest persist_distinct=0
+    require_root || return 1; acquire_lock || return 1; require_commands bash cmp cp curl awk sha256sum sort install grep readlink || return 1
+    local latest latest_version current target tmp base expected actual backup newest persist_distinct=0 postcheck_rc=0
     current=$(current_script_path 2>/dev/null || true)
     if [[ -z "$current" ]]; then
         current=$(command -v bbr 2>/dev/null || true)
@@ -11219,6 +12146,7 @@ self_update() {
     atomic_install "$tmp/current.before" "$backup" 0755 || { rm -rf "$tmp"; die "无法写入上一版本备份: $backup"; return 1; }
     if [[ -e "$PERSIST_SCRIPT" && "$(readlink -f "$PERSIST_SCRIPT")" != "$(readlink -f "$target")" ]]; then
         persist_distinct=1
+        cp -a -- "$PERSIST_SCRIPT" "$tmp/persist.before" || { rm -rf "$tmp"; die "无法备份 systemd 持久化副本"; return 1; }
     fi
     if ! atomic_install "$tmp/net-tcp-tune.sh" "$target" 0755; then
         rm -rf "$tmp"
@@ -11235,8 +12163,808 @@ self_update() {
         die "持久化副本更新失败；当前 bbr 命令已回滚到更新前版本"
         return 1
     fi
+    # Verify the installed bytes, parser and both version markers after the
+    # atomic replacements.  This is intentionally file-only: update never
+    # reapplies networking or changes the current runtime configuration.
+    bash -n "$target" || postcheck_rc=1
+    [[ "$(sha256sum "$target" | awk '{print $1}')" == "$expected" ]] || postcheck_rc=1
+    grep -Fxc "SCRIPT_VERSION=\"${latest#v}\"" "$target" >/dev/null || postcheck_rc=1
+    if (( persist_distinct )); then
+        bash -n "$PERSIST_SCRIPT" || postcheck_rc=1
+        cmp -s "$target" "$PERSIST_SCRIPT" || postcheck_rc=1
+        grep -Fxc "SCRIPT_VERSION=\"${latest#v}\"" "$PERSIST_SCRIPT" >/dev/null || postcheck_rc=1
+    fi
+    if (( postcheck_rc != 0 )); then
+        atomic_install "$tmp/current.before" "$target" 0755 || {
+            rm -rf "$tmp"; die "更新后自检失败，且当前命令回滚失败；上一版本仍保存在 $backup"; return 1;
+        }
+        if (( persist_distinct )); then
+            atomic_install "$tmp/persist.before" "$PERSIST_SCRIPT" 0755 || {
+                rm -rf "$tmp"; die "更新后自检失败；当前命令已恢复，但持久化副本回滚失败"; return 1;
+            }
+        fi
+        rm -rf "$tmp"
+        die "更新后 bash/version/checksum/persistence 自检失败；程序文件已回滚，网络运行时未改变"
+        return 1
+    fi
     rm -rf "$tmp"
-    log OK "已更新到 $latest；上一版本保存在 $backup"
+    log OK "已更新到 $latest；bash/version/checksum/persistence 自检通过；上一版本保存在 $backup"
+    log INFO "更新仅替换程序文件，未自动重新应用网络配置；可运行 bbr verify 检查当前 runtime"
+}
+
+# -----------------------------------------------------------------------------
+# Reliability/diagnostics: failure taxonomy, bounded history, preflight,
+# read-only doctor/export, and auto dry-run. No runtime networking is changed.
+# -----------------------------------------------------------------------------
+
+FAILURE_SCHEMA="1"
+HISTORY_SCHEMA="1"
+MAX_HISTORY_ENTRIES="${BBRV3_MAX_HISTORY_ENTRIES:-20}"
+if ! is_uint "$MAX_HISTORY_ENTRIES" || (( MAX_HISTORY_ENTRIES < 1 || MAX_HISTORY_ENTRIES > 1000 )); then MAX_HISTORY_ENTRIES=20; fi
+FAILURE_STAGE=""
+FAILURE_REASON=""
+FAILURE_DETAIL=""
+FAILURE_SUGGESTION=""
+
+failure_reset() {
+    FAILURE_STAGE=""; FAILURE_REASON=""; FAILURE_DETAIL=""; FAILURE_SUGGESTION=""
+}
+
+failure_pending_write() {
+    local file="${MEASURE_RUN_DIR:-}/.failure-pending.tsv" temp
+    [[ -n "${MEASURE_RUN_DIR:-}" && "$MEASURE_RUN_DIR" == "$HISTORY_DIR/"* && -d "$MEASURE_RUN_DIR" && ! -L "$MEASURE_RUN_DIR" ]] || return 0
+    temp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+    if ! printf 'STAGE\t%s\nREASON\t%s\nDETAIL\t%s\nSUGGESTION\t%s\n' \
+        "$FAILURE_STAGE" "$FAILURE_REASON" "$FAILURE_DETAIL" "$FAILURE_SUGGESTION" > "$temp"; then
+        rm -f -- "$temp"; return 1
+    fi
+    chmod 0600 "$temp" || { rm -f -- "$temp"; return 1; }
+    mv -f -- "$temp" "$file"
+}
+
+failure_pending_load() {
+    local file="$1" line key value stage="" reason="" detail="" suggestion=""
+    local -A seen=()
+    [[ -f "$file" && ! -L "$file" && "$file" == "$HISTORY_DIR/"*/.failure-pending.tsv ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *$'\t'* ]] || return 1
+        key="${line%%$'\t'*}"; value="${line#*$'\t'}"
+        [[ -z "${seen[$key]+x}" && "$value" != *$'\t'* && "$value" != *$'\n'* ]] || return 1
+        seen[$key]=1
+        case "$key" in
+            STAGE) stage="$value" ;; REASON) reason="$value" ;; DETAIL) detail="$value" ;; SUGGESTION) suggestion="$value" ;;
+            *) return 1 ;;
+        esac
+    done < "$file"
+    [[ "$stage" =~ ^[A-Z][A-Z0-9_]{1,47}$ ]] && failure_reason_valid "$reason" || return 1
+    [[ -n "${seen[DETAIL]+x}" && -n "${seen[SUGGESTION]+x}" ]] || return 1
+    FAILURE_STAGE="$stage"; FAILURE_REASON="$reason"; FAILURE_DETAIL="$detail"; FAILURE_SUGGESTION="$suggestion"
+}
+
+failure_reason_valid() {
+    case "$1" in
+        peer-unavailable|peer-busy|peer-reset|peer-timeout|peer-too-slow|path-dirty|path-changed|endpoint-changed|\
+        route-ambiguous|nexthop-unresolved|sample-contaminated|cpu-busy|high-steal|measurement-unstable|\
+        budget-exceeded|no-clean-reference|no-knee-confidence|candidate-confirm-failed|verify-throughput-failed|\
+        verify-retrans-failed|tc-ownership-conflict|runtime-verify-failed|rollback-failed|protocol-failure|\
+        dependency-missing|disk-space-low|memory-low|background-traffic|internal-error|none) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+failure_reason_explanation() {
+    case "$1" in
+        peer-unavailable) printf '测速对端当前不可用' ;;
+        peer-busy) printf '测速对端正在服务其他测试' ;;
+        peer-reset) printf '测速连接被对端重置' ;;
+        peer-timeout) printf '测速连接或测试超时' ;;
+        peer-too-slow) printf '对端吞吐不足以建立可靠控制样本' ;;
+        path-dirty) printf '低速路径控制样本存在显著重传' ;;
+        path-changed) printf '测量期间网络路径发生变化' ;;
+        endpoint-changed) printf '测量期间测速端点发生变化' ;;
+        route-ambiguous) printf '无法证明唯一且稳定的出口路径' ;;
+        nexthop-unresolved) printf 'Linux nexthop object 无法解析为唯一 leaf' ;;
+        sample-contaminated) printf '样本受到背景流量或本机资源竞争污染' ;;
+        cpu-busy) printf 'CPU 忙碌度过高，测速结果可能受本机限制' ;;
+        high-steal) printf '虚拟机 CPU steal 过高' ;;
+        measurement-unstable) printf '重复样本离散度过高' ;;
+        budget-exceeded) printf '测量流量或时间硬预算已耗尽' ;;
+        no-clean-reference) printf '无法建立低速干净参考' ;;
+        no-knee-confidence) printf '没有足够证据定位拐点' ;;
+        candidate-confirm-failed) printf '候选速率未通过确认测试' ;;
+        verify-throughput-failed) printf '最终复验吞吐未达到安全门槛' ;;
+        verify-retrans-failed) printf '最终复验重传超过安全门槛' ;;
+        tc-ownership-conflict) printf 'root qdisc 不属于本项目，拒绝接管' ;;
+        runtime-verify-failed) printf '运行时状态与预期配置不一致' ;;
+        rollback-failed) printf '系统状态自动回滚未完整完成' ;;
+        dependency-missing) printf '缺少所需的本地命令' ;;
+        disk-space-low) printf '状态目录或临时目录可用空间不足' ;;
+        memory-low) printf '可用内存不足以安全执行测速' ;;
+        background-traffic) printf '接口现有背景流量过高' ;;
+        protocol-failure) printf 'iperf3 协议或结果解析失败' ;;
+        none) printf '无' ;;
+        *) printf '内部操作失败' ;;
+    esac
+}
+
+failure_default_suggestion() {
+    case "$1" in
+        peer-*) printf '稍后重试，或使用自有 iperf3 服务端。' ;;
+        path-*|endpoint-*|route-*|nexthop-*) printf '检查路由、策略路由与默认出口稳定性，然后重新测量。' ;;
+        cpu-busy|high-steal|sample-contaminated|background-traffic) printf '停止其他高负载任务并等待线路空闲后重试。' ;;
+        budget-exceeded) printf '提高显式预算或改用 quick profile 后重新开始；本次不会复用未验证候选。' ;;
+        tc-ownership-conflict) printf '先确认并由原管理工具移除第三方 qdisc；本项目不会强制覆盖。' ;;
+        rollback-failed) printf '立即运行 bbr doctor，并依据保留的事务快照人工检查。' ;;
+        *) printf '运行 bbr doctor 查看只读诊断，再根据具体差异处理。' ;;
+    esac
+}
+
+state_safe_text() {
+    local value="$1" limit="${2:-512}"
+    value=${value//$'\t'/ }; value=${value//$'\r'/ }; value=${value//$'\n'/ }
+    value=$(printf '%s' "$value" | LC_ALL=C tr -d '\001-\010\013\014\016-\037\177')
+    printf '%s' "${value:0:limit}"
+}
+
+failure_set() {
+    local stage="$1" reason="$2" detail="${3:-}" suggestion="${4:-}" rc="${5:-1}"
+    [[ "$stage" =~ ^[A-Z][A-Z0-9_]{1,47}$ ]] || stage=UNKNOWN
+    failure_reason_valid "$reason" || reason=internal-error
+    detail=$(state_safe_text "$detail" 240); suggestion=$(state_safe_text "$suggestion" 240)
+    FAILURE_STAGE="$stage"; FAILURE_REASON="$reason"; FAILURE_DETAIL="$detail"
+    FAILURE_SUGGESTION="${suggestion:-$(failure_default_suggestion "$reason")}"; : "$rc"
+    failure_pending_write || true
+}
+
+failure_from_rc() {
+    local rc="$1" stage="${2:-MEASUREMENT}"
+    case "$rc" in
+        "$IPERF_UNAVAILABLE_RC") failure_set "$stage" peer-unavailable "public endpoint unavailable" "" "$rc" ;;
+        "$IPERF_CONTAMINATED_RC") failure_set "$stage" sample-contaminated "sample contamination threshold exceeded" "" "$rc" ;;
+        "$IPERF_UNSTABLE_RC") failure_set "$stage" measurement-unstable "sample spread threshold exceeded" "" "$rc" ;;
+        "$MEASURE_PATH_QUALITY_RC") failure_set PATH_CONTROL path-dirty "low-rate path control was not clean" "" "$rc" ;;
+        "$MEASURE_ROUTE_MISMATCH_RC") failure_set ROUTE_GUARD path-changed "route fingerprint changed" "" "$rc" ;;
+        "${MEASURE_BUDGET_RC:-70}") failure_set "${MEASURE_BUDGET_STAGE:-$stage}" budget-exceeded "measurement hard budget reached" "" "$rc" ;;
+        "$MEASUREMENT_PREFLIGHT_RC") [[ -n "$FAILURE_REASON" ]] || failure_set PREFLIGHT sample-contaminated "environment preflight rejected measurement" "" "$rc" ;;
+        "$ROLLBACK_FAILURE_RC") failure_set ROLLBACK rollback-failed "restoration did not complete" "" "$rc" ;;
+        2) [[ -n "$FAILURE_REASON" ]] || failure_set "$stage" no-knee-confidence "measurement evidence was inconclusive" "" "$rc" ;;
+        *) [[ -n "$FAILURE_REASON" ]] || failure_set "$stage" internal-error "operation exited with rc=$rc" "" "$rc" ;;
+    esac
+}
+
+failure_record_write() {
+    local dir="$1" stage="$2" reason="$3" detail="$4" rc="$5" rollback="$6" persistent="$7"
+    local original_stage="${8:-}" original_reason="${9:-}" original_rc="${10:-}" failure_file="$dir/failure.tsv" temp
+    [[ "$dir" == "$HISTORY_DIR/"* && -d "$dir" && ! -L "$dir" ]] || return 1
+    temp=$(mktemp "${failure_file}.tmp.XXXXXX") || return 1
+    if ! printf 'SCHEMA\t%s\nSTAGE\t%s\nREASON\t%s\nEXPLANATION\t%s\nDETAIL\t%s\nRC\t%s\nROLLBACK\t%s\nPERSISTENT_CHANGES\t%s\nSUGGESTION\t%s\n' \
+        "$FAILURE_SCHEMA" "$stage" "$reason" "$(failure_reason_explanation "$reason")" \
+        "$(history_safe_value "$detail")" "$rc" "$rollback" "$persistent" \
+        "$(history_safe_value "$(failure_default_suggestion "$reason")")" > "$temp"; then
+        rm -f -- "$temp"; return 1
+    fi
+    if [[ -n "$original_reason" ]]; then
+        printf 'ORIGINAL_STAGE\t%s\nORIGINAL_REASON\t%s\nORIGINAL_RC\t%s\n' \
+            "$original_stage" "$original_reason" "$original_rc" >> "$temp" || { rm -f -- "$temp"; return 1; }
+    fi
+    chmod 0600 "$temp" || { rm -f -- "$temp"; return 1; }
+    mv -f -- "$temp" "$failure_file"
+}
+
+history_safe_value() {
+    state_safe_text "$1" 512
+}
+
+history_summary_update() {
+    local file="$1" temp key value
+    local -A replace=()
+    [[ "$file" == "$HISTORY_DIR/"*/summary.tsv && ! -L "$file" ]] || return 1
+    shift
+    (( $# % 2 == 0 )) || return 1
+    while (($# >= 2)); do
+        key="$1"; value="$2"; shift 2
+        [[ "$key" =~ ^[A-Z][A-Z0-9_]{1,63}$ ]] || return 1
+        replace[$key]="$(history_safe_value "$value")"
+    done
+    temp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+    if [[ -f "$file" ]]; then
+        awk -F'\t' -v keys="$(printf '%s,' "${!replace[@]}")" '
+            BEGIN {n=split(keys,a,","); for(i=1;i<=n;i++) drop[a[i]]=1}
+            !($1 in drop) {print}
+        ' "$file" > "$temp" || { rm -f -- "$temp"; return 1; }
+    fi
+    for key in "${!replace[@]}"; do printf '%s\t%s\n' "$key" "${replace[$key]}" >> "$temp"; done
+    chmod 0600 "$temp" || { rm -f -- "$temp"; return 1; }
+    mv -f -- "$temp" "$file"
+}
+
+measurement_finalize_run() {
+    local kind="$1" peer="$2" port="$3" iface="$4" rc="$5" rollback="${6:-complete}"
+    local summary="${MEASURE_RUN_DIR:-}/summary.tsv" pending="${MEASURE_RUN_DIR:-}/.failure-pending.tsv"
+    local result=SUCCESS reason=none stage=COMPLETE detail="" suggestion="" persistent=none
+    [[ -n "${MEASURE_RUN_DIR:-}" && "$MEASURE_RUN_DIR" == "$HISTORY_DIR/"* && -d "$MEASURE_RUN_DIR" ]] || return 0
+    if declare -F measurement_usage_update >/dev/null; then measurement_usage_update || true; fi
+    if (( rc != 0 )); then
+        failure_pending_load "$pending" 2>/dev/null || failure_from_rc "$rc" "${MEASURE_BUDGET_STAGE:-MEASUREMENT}"
+        result=FAILURE; reason="$FAILURE_REASON"; stage="$FAILURE_STAGE"; detail="$FAILURE_DETAIL"; suggestion="$FAILURE_SUGGESTION"
+    fi
+    [[ "$rollback" != failed ]] || persistent=temporary-state-unknown
+    history_summary_update "$summary" \
+        HISTORY_SCHEMA "$HISTORY_SCHEMA" TYPE "$kind" PEER "$peer" PORT "${port:-none}" INTERFACE "$iface" RESULT "$result" \
+        FAILURE_STAGE "$stage" FAILURE_REASON "$reason" FAILURE_DETAIL "$detail" SUGGESTED_ACTION "$suggestion" \
+        INTERNAL_RC "$rc" ROLLBACK_RESULT "$rollback" PERSISTENT_CHANGES "$persistent" COMPLETED_AT "$(utc_now)" \
+        MEASUREMENT_PROFILE "${MEASUREMENT_PROFILE:-standard}" TEST_TX_BYTES_USED "${TEST_TX_BYTES_USED:-0}" \
+        TEST_RX_BYTES_USED "${TEST_RX_BYTES_USED:-0}" TEST_DURATION_USED "${TEST_DURATION_USED:-0}" \
+        MAX_TEST_TX_BYTES "${MEASURE_MAX_TX_BYTES:-0}" MAX_TEST_DURATION_SECONDS "${MEASURE_MAX_DURATION_SECONDS:-0}" || return 1
+    if (( rc != 0 )); then
+        failure_record_write "$MEASURE_RUN_DIR" "$stage" "$reason" "$detail" "$rc" "$rollback" "$persistent" || return 1
+    fi
+    rm -f -- "$pending"
+}
+
+failure_finalize_outer_rollback() {
+    local summary="$1" original_rc="$2" rollback_rc="$3" dir
+    local stage reason detail suggestion final_rc="$original_rc" rollback=complete persistent=none
+    local original_stage="" original_reason="" original_detail="" original_suggestion=""
+    [[ "$summary" == "$HISTORY_DIR/"*/summary.tsv && -f "$summary" && ! -L "$summary" ]] || return 1
+    dir="${summary%/summary.tsv}"
+    stage=$(summary_value "$summary" FAILURE_STAGE); reason=$(summary_value "$summary" FAILURE_REASON)
+    detail=$(summary_value "$summary" FAILURE_DETAIL); suggestion=$(summary_value "$summary" SUGGESTED_ACTION)
+    if [[ -z "$reason" || "$reason" == none ]]; then
+        failure_reset; failure_from_rc "$original_rc" AUTO_TUNE
+        stage="$FAILURE_STAGE"; reason="$FAILURE_REASON"; detail="$FAILURE_DETAIL"; suggestion="$FAILURE_SUGGESTION"
+    fi
+    if (( rollback_rc != 0 )); then
+        original_stage="$stage"; original_reason="$reason"; original_detail="$detail"; original_suggestion="$suggestion"
+        stage=ROLLBACK; reason="rollback-failed"; final_rc="$ROLLBACK_FAILURE_RC"; rollback=failed
+        persistent=unknown-review-transaction
+        detail="outer rollback rc=$rollback_rc after ${original_reason:-unknown} (original rc=$original_rc)"
+        suggestion=$(failure_default_suggestion rollback-failed)
+    fi
+    history_summary_update "$summary" RESULT FAILURE FAILURE_STAGE "$stage" FAILURE_REASON "$reason" \
+        FAILURE_DETAIL "$detail" SUGGESTED_ACTION "$suggestion" INTERNAL_RC "$final_rc" \
+        ROLLBACK_RESULT "$rollback" PERSISTENT_CHANGES "$persistent" \
+        ORIGINAL_FAILURE_STAGE "$original_stage" ORIGINAL_FAILURE_REASON "$original_reason" \
+        ORIGINAL_FAILURE_DETAIL "$original_detail" ORIGINAL_FAILURE_SUGGESTION "$original_suggestion" \
+        ORIGINAL_INTERNAL_RC "$([[ -n "$original_reason" ]] && printf '%s' "$original_rc")" COMPLETED_AT "$(utc_now)" || return 1
+    failure_record_write "$dir" "$stage" "$reason" "$detail" "$final_rc" "$rollback" "$persistent" \
+        "$original_stage" "$original_reason" "$original_rc"
+}
+
+failure_summary_print() {
+    local summary="${1:-${MEASURE_RUN_DIR:-}/summary.tsv}" final="${2:-0}" reason rollback persistent original
+    if [[ -n "${ACTION_TRANSACTION_DIR:-}" && "$final" != 1 ]]; then return 0; fi
+    [[ -f "$summary" && ! -L "$summary" ]] || return 1
+    [[ "$(summary_value "$summary" RESULT)" == FAILURE ]] || return 0
+    reason=$(summary_value "$summary" FAILURE_REASON)
+    printf '\nFailure summary\n\n'
+    printf '%-20s %s\n' Stage "$(summary_value "$summary" FAILURE_STAGE)"
+    printf '%-20s %s (%s)\n' Reason "$reason" "$(failure_reason_explanation "$reason")"
+    printf '%-20s %s:%s\n' Peer "$(summary_value "$summary" PEER)" "$(summary_value "$summary" PORT)"
+    printf '%-20s %s\n' 'Traffic used' "$(human_bytes "$(summary_value "$summary" TEST_TX_BYTES_USED)") TX"
+    rollback=$(summary_value "$summary" ROLLBACK_RESULT); persistent=$(summary_value "$summary" PERSISTENT_CHANGES)
+    [[ -n "$persistent" ]] || persistent=unknown
+    if [[ "$rollback" == failed ]]; then printf '%-20s %s\n' Rollback 'ROLLBACK FAILED'
+    else printf '%-20s %s\n' Rollback "$rollback"
+    fi
+    original=$(summary_value "$summary" ORIGINAL_FAILURE_REASON)
+    [[ -z "$original" ]] || printf '%-20s %s\n' 'Original reason' "$original"
+    printf '%-20s %s\n' 'Persistent changes' "$persistent"
+    printf '\nSuggested action\n  %s\n' "$(summary_value "$summary" SUGGESTED_ACTION)"
+}
+
+history_id_valid() {
+    [[ "$1" =~ ^[0-9]{8}T[0-9]{6}Z-(path|path-check|probe|sweep|verify|compare)(-[0-9]+)?$ ]]
+}
+
+history_summary_files() {
+    [[ -d "$HISTORY_DIR" && ! -L "$HISTORY_DIR" ]] || return 0
+    find "$HISTORY_DIR" -mindepth 2 -maxdepth 2 -type f -name summary.tsv -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-
+}
+
+history_field() {
+    [[ "$2" =~ ^[A-Z][A-Z0-9_]{1,63}$ ]] || return 1
+    awk -F'\t' -v key="$2" '$1==key {print $2; exit}' "$1" 2>/dev/null
+}
+
+history_summary_well_formed() {
+    local file="$1" line key value
+    local -A seen=()
+    [[ -f "$file" && ! -L "$file" && "$file" == "$HISTORY_DIR/"*/summary.tsv ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *$'\t'* ]] || return 1
+        key="${line%%$'\t'*}"; value="${line#*$'\t'}"
+        [[ "$key" =~ ^[A-Z][A-Z0-9_]{1,63}$ && "$value" != *$'\t'* && "$value" != *$'\r'* ]] || return 1
+        [[ -z "${seen[$key]+x}" ]] || return 1
+        seen[$key]=1
+        if LC_ALL=C grep -q $'[\001-\010\013\014\016-\037\177]' <<< "$value"; then return 1; fi
+    done < "$file"
+}
+
+history_schema_supported() {
+    local schema
+    history_summary_well_formed "$1" || return 1
+    schema=$(history_field "$1" HISTORY_SCHEMA)
+    [[ -z "$schema" ]] && return 0 # v8.0.5 and earlier history remains readable.
+    is_uint "$schema" && (( 10#$schema <= HISTORY_SCHEMA ))
+}
+
+history_print_one() {
+    local file="$1" id result decision knee recommend verify traffic reason peer time schema
+    [[ -f "$file" && ! -L "$file" && "$file" == "$HISTORY_DIR/"*/summary.tsv ]] || return 1
+    schema=$(history_field "$file" HISTORY_SCHEMA)
+    history_schema_supported "$file" || { die "history 使用不支持的更新 schema: ${schema:-invalid}"; return 1; }
+    id="${file%/summary.tsv}"; id="${id##*/}"
+    time=$(history_field "$file" COMPLETED_AT); [[ -n "$time" ]] || time="${id%%-*}"
+    result=$(history_field "$file" RESULT); [[ -n "$result" ]] || result=LEGACY
+    decision=$(history_field "$file" SCAN_DECISION); [[ -n "$decision" ]] || decision=$(history_field "$file" TYPE)
+    knee=$(history_field "$file" KNEE_MBIT); recommend=$(history_field "$file" RECOMMEND)
+    verify=$(history_field "$file" VERDICT); [[ -n "$verify" ]] || verify=$(history_field "$file" FINAL_VERIFY_MODE)
+    traffic=$(history_field "$file" TEST_TX_BYTES_USED); [[ -n "$traffic" ]] || traffic=0
+    reason=$(history_field "$file" FAILURE_REASON); [[ -n "$reason" ]] || reason=none
+    peer=$(history_field "$file" PEER); [[ -n "$peer" ]] || peer=unknown
+    printf '%s\n' "ID                 $id" "Time               $time" "Operation          $(history_field "$file" TYPE)" \
+        "Peer               $peer" "Result             $result" "Decision           ${decision:-unknown}" \
+        "Knee               ${knee:-none}" "Recommendation     ${recommend:-none}" "Verify             ${verify:-none}" \
+        "Traffic TX         $(human_bytes "$traffic")" "Failure reason     $reason"
+}
+
+history_show() {
+    local id="$1" file
+    history_id_valid "$id" || { die "非法 history ID: $id"; return 1; }
+    file="$HISTORY_DIR/$id/summary.tsv"
+    [[ -f "$file" && ! -L "$file" ]] || { die "history 不存在: $id"; return 1; }
+    history_print_one "$file"
+}
+
+history_latest() {
+    local file
+    file=$(history_summary_files | head -n1)
+    [[ -n "$file" ]] || { printf 'No measurement history.\n'; return 0; }
+    history_print_one "$file"
+}
+
+history_list() {
+    local file id type result decision reason count=0
+    printf '%-31s %-9s %-9s %-28s %s\n' ID Type Result Decision/verify Failure
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        id="${file%/summary.tsv}"; id="${id##*/}"; type=$(history_field "$file" TYPE)
+        if ! history_schema_supported "$file"; then
+            printf '%-31s %-9s %-9s %-28s %s\n' "$id" unknown INVALID unsupported-schema ignored
+            continue
+        fi
+        result=$(history_field "$file" RESULT); [[ -n "$result" ]] || result=LEGACY
+        decision=$(history_field "$file" SCAN_DECISION); [[ -n "$decision" ]] || decision=$(history_field "$file" VERDICT)
+        reason=$(history_field "$file" FAILURE_REASON); [[ -n "$reason" ]] || reason=none
+        printf '%-31s %-9s %-9s %-28s %s\n' "$id" "${type:-unknown}" "$result" "${decision:-none}" "$reason"
+        ((count+=1)); (( count < MAX_HISTORY_ENTRIES )) || break
+    done < <(history_summary_files)
+    (( count > 0 )) || printf '%s\n' '(no measurement history)'
+}
+
+history_prune_internal() {
+    local keep="${1:-$MAX_HISTORY_ENTRIES}" dir id count=0
+    is_uint "$keep" && (( keep >= 1 && keep <= 1000 )) || keep=20
+    [[ ! -L "$HISTORY_DIR" ]] || return 1
+    [[ -d "$HISTORY_DIR" ]] || return 0
+    while IFS= read -r dir; do
+        [[ -d "$dir" && ! -L "$dir" && "$dir" == "$HISTORY_DIR/"* ]] || continue
+        id="${dir##*/}"
+        history_id_valid "$id" || continue
+        ((count+=1)); (( count <= keep )) && continue
+        [[ "$dir" != "${MEASURE_RUN_DIR:-}" ]] || continue
+        remove_tree_within "$dir" "$HISTORY_DIR" || return 1
+    done < <(find "$HISTORY_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-)
+}
+
+history_prune() {
+    require_root || return 1; acquire_lock || return 1
+    history_prune_internal "$MAX_HISTORY_ENTRIES" || return 1
+    log OK "measurement history 已清理，仅保留最近 $MAX_HISTORY_ENTRIES 次；baseline/config/transaction 未改变"
+}
+
+history_latest_matching() {
+    local wanted="$1" file value
+    while IFS= read -r file; do
+        history_schema_supported "$file" || continue
+        value=$(history_field "$file" RESULT)
+        [[ "$value" == "$wanted" ]] || continue
+        printf '%s\n' "$file"; return 0
+    done < <(history_summary_files)
+    return 1
+}
+
+history_latest_type() {
+    local wanted_type="$1" file
+    while IFS= read -r file; do
+        history_schema_supported "$file" || continue
+        [[ "$(history_field "$file" TYPE)" == "$wanted_type" ]] || continue
+        printf '%s\n' "$file"
+        return 0
+    done < <(history_summary_files)
+    return 1
+}
+
+history_latest_type_result() {
+    local wanted_type="$1" wanted_result="$2" file
+    while IFS= read -r file; do
+        history_schema_supported "$file" || continue
+        [[ "$(history_field "$file" TYPE)" == "$wanted_type" ]] || continue
+        [[ "$(history_field "$file" RESULT)" == "$wanted_result" ]] || continue
+        printf '%s\n' "$file"
+        return 0
+    done < <(history_summary_files)
+    return 1
+}
+
+status_measurement_details() {
+    local file completed age decision delivered shaping stored_fp family address source iface current current_fp state=unknown
+    file=$(history_latest_type_result sweep SUCCESS 2>/dev/null || true)
+    if [[ -z "$file" ]]; then
+        printf '%-20s %s\n' 'Last measurement' none 'Measurement age' n/a Measurement none Decision none \
+            'Delivered capacity' 'not measured' 'Shaping rate' none
+        return 0
+    fi
+    completed=$(history_field "$file" COMPLETED_AT); age=$(history_age_brief "$completed")
+    decision=$(history_field "$file" MEASUREMENT_STATE)
+    [[ -n "$decision" ]] || decision=$(history_field "$file" SCAN_DECISION)
+    delivered=$(history_field "$file" CAPACITY_RECEIVER_MBIT)
+    [[ -n "$delivered" ]] || delivered=$(history_field "$file" SATURATION_RECEIVER_MBIT)
+    shaping=$(history_field "$file" RECOMMEND)
+    stored_fp=$(history_field "$file" PATH_ROUTE_FINGERPRINT); family=$(history_field "$file" LOCKED_FAMILY)
+    address=$(history_field "$file" LOCKED_ADDRESS); source=$(history_field "$file" LOCKED_SOURCE)
+    iface=$(history_field "$file" LOCKED_INTERFACE)
+    if [[ "$stored_fp" =~ ^[0-9a-f]{64}$ && ( "$family" == 4 || "$family" == 6 ) && -n "$address" && -n "$source" && -n "$iface" ]]; then
+        current=$(path_capture_route_identity "$family" "$address" "$source" "$iface" 2>/dev/null || true)
+        current_fp="${current%%$'\t'*}"
+        if [[ "$current_fp" == "$stored_fp" ]]; then state=verified
+        elif [[ -n "$current_fp" ]]; then state=stale
+        else state=unverifiable
+        fi
+    fi
+    [[ -n "$delivered" ]] && delivered="$delivered Mbit" || delivered='not measured'
+    [[ -n "$shaping" ]] && shaping="$shaping Mbit" || shaping=none
+    printf '%-20s %s\n' 'Last measurement' "${completed:-unknown}" 'Measurement age' "$age" \
+        Measurement "$state" Decision "${decision:-unknown}" \
+        'Delivered capacity' "$delivered" 'Shaping rate' "$shaping"
+}
+
+history_age_brief() {
+    local timestamp="$1" then_epoch now seconds
+    then_epoch=$(date -u -d "$timestamp" +%s 2>/dev/null || true); now=$(date +%s)
+    is_uint "$then_epoch" && is_uint "$now" && (( now >= then_epoch )) || { printf 'unknown\n'; return; }
+    seconds=$((now-then_epoch))
+    if (( seconds < 3600 )); then printf '%sm\n' "$((seconds/60))"
+    elif (( seconds < 86400 )); then printf '%sh %sm\n' "$((seconds/3600))" "$(((seconds%3600)/60))"
+    else printf '%sd %sh\n' "$((seconds/86400))" "$(((seconds%86400)/3600))"; fi
+}
+
+measurement_environment_preflight() {
+    local iface="$1" capacity="${2:-0}" seconds="${BBRV3_PREFLIGHT_SECONDS:-2}"
+    local cpu_before cpu_after metrics busy steal tx_before tx_after rx_before rx_after tx_rate rx_rate ratio
+    local available_kib load cpus state_target tmp_available established=0 hard_busy="${BBRV3_PREFLIGHT_MAX_CPU_BUSY:-95}"
+    local hard_steal="${BBRV3_PREFLIGHT_MAX_STEAL:-15}" hard_background="${BBRV3_PREFLIGHT_MAX_BACKGROUND_PERCENT:-15}"
+    # Deterministic unit tests may bypass only the observation delay.  Formal
+    # CLI runs do not set this internal switch.
+    [[ "${BBRV3_SKIP_MEASUREMENT_PREFLIGHT:-0}" != 1 ]] || return 0
+    validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
+    is_uint "$seconds" && (( seconds >= 1 && seconds <= 3 )) || seconds=2
+    is_decimal "$hard_busy" || hard_busy=95; is_decimal "$hard_steal" || hard_steal=15
+    is_decimal "$hard_background" || hard_background=15
+    available_kib=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)
+    if is_uint "$available_kib" && (( available_kib < 65536 )); then
+        failure_set PREFLIGHT memory-low "MemAvailable=${available_kib}KiB"
+        die "可用内存仅 $(human_bytes "$((available_kib*1024))")，拒绝开始高流量测速"
+        return "$MEASUREMENT_PREFLIGHT_RC"
+    fi
+    state_target="$STATE_DIR"; [[ -e "$state_target" ]] || state_target=$(dirname "$STATE_DIR")
+    tmp_available=$(df -Pk "$state_target" /tmp 2>/dev/null | awk 'NR>1 {if(min=="" || $4<min)min=$4} END {print min+0}')
+    if is_uint "$tmp_available" && (( tmp_available < 32768 )); then
+        failure_set PREFLIGHT disk-space-low "minimum available=${tmp_available}KiB"
+        die "状态目录或 /tmp 可用空间不足 32 MiB，拒绝开始测速"
+        return "$MEASUREMENT_PREFLIGHT_RC"
+    fi
+    cpu_before=$(cpu_snapshot); tx_before=$(interface_counter "$iface" tx_bytes); rx_before=$(interface_counter "$iface" rx_bytes)
+    sleep "$seconds"
+    cpu_after=$(cpu_snapshot); tx_after=$(interface_counter "$iface" tx_bytes); rx_after=$(interface_counter "$iface" rx_bytes)
+    metrics=$(cpu_delta_metrics "$cpu_before" "$cpu_after"); IFS=$'\t' read -r busy steal <<< "$metrics"
+    tx_rate=$(awk -v a="$tx_before" -v b="$tx_after" -v s="$seconds" 'BEGIN {d=b-a;if(d<0)d=0;printf "%.2f",d*8/s/1000000}')
+    rx_rate=$(awk -v a="$rx_before" -v b="$rx_after" -v s="$seconds" 'BEGIN {d=b-a;if(d<0)d=0;printf "%.2f",d*8/s/1000000}')
+    cpus=$(cpu_count); load=$(awk '{print $1}' /proc/loadavg 2>/dev/null || printf 'na')
+    command_exists ss && established=$(ss -Htan state established 2>/dev/null | awk 'END {print NR+0}')
+    log INFO "测速环境预检: CPU ${busy}% / steal ${steal}% / load ${load}/${cpus} CPU / 背景 TX ${tx_rate} Mbit/s / RX ${rx_rate} Mbit/s / established ${established}"
+    if is_decimal "$steal" && awk -v v="$steal" -v m="$hard_steal" 'BEGIN {exit !(v>m)}'; then
+        failure_set PREFLIGHT high-steal "steal=${steal}% > ${hard_steal}%"
+        die "CPU steal ${steal}% 过高，拒绝开始测速；请稍后重试"
+        return "$MEASUREMENT_PREFLIGHT_RC"
+    fi
+    if is_decimal "$busy" && awk -v v="$busy" -v m="$hard_busy" 'BEGIN {exit !(v>m)}'; then
+        failure_set PREFLIGHT cpu-busy "cpu=${busy}% > ${hard_busy}%"
+        die "CPU 忙碌度 ${busy}% 过高，拒绝开始测速；请稍后重试"
+        return "$MEASUREMENT_PREFLIGHT_RC"
+    fi
+    if is_decimal "$capacity" && awk -v c="$capacity" 'BEGIN {exit !(c>0)}'; then
+        ratio=$(awk -v tx="$tx_rate" -v rx="$rx_rate" -v c="$capacity" 'BEGIN {v=(tx>rx?tx:rx)*100/c;printf "%.2f",v}')
+        if awk -v v="$ratio" -v m="$hard_background" 'BEGIN {exit !(v>m)}'; then
+            failure_set PREFLIGHT background-traffic "background=${ratio}% of ${capacity}Mbit"
+            die "当前 $iface 已有约 TX ${tx_rate}/RX ${rx_rate} Mbit/s 背景流量（${ratio}%），拒绝生成自动推荐"
+            return "$MEASUREMENT_PREFLIGHT_RC"
+        elif awk -v v="$ratio" 'BEGIN {exit !(v>5)}'; then
+            log WARN "当前 $iface 背景流量约占参考容量 ${ratio}%，可能降低测量置信度"
+        fi
+    elif awk -v tx="$tx_rate" -v rx="$rx_rate" 'BEGIN {v=(tx>rx?tx:rx);exit !(v>25)}'; then
+        log WARN "容量未知且 $iface 已有明显背景流量（TX ${tx_rate}/RX ${rx_rate} Mbit/s）"
+    fi
+    if is_decimal "$load" && is_uint "$cpus" && awk -v l="$load" -v c="$cpus" 'BEGIN {exit !(l>c*2)}'; then
+        log WARN "load average ${load} 相对 ${cpus} CPU 偏高；单个样本仍会执行逐核污染门禁"
+    fi
+}
+
+doctor_command_state() {
+    command_exists "$1" && printf available || printf missing
+}
+
+doctor_default_route_summary() {
+    local family="$1" output count record iface gateway gateway_family nhid
+    output=$(default_route_output "$family" 2>/dev/null || true)
+    count=$(awk '$1=="default" {n++} END {print n+0}' <<< "$output")
+    (( count > 0 )) || { printf 'absent\n'; return; }
+    (( count == 1 )) || { printf 'ambiguous (%s defaults)\n' "$count"; return; }
+    record=$(route_unique_path_record "$output" "doctor IPv${family#-} default" "${family#-}" 2>/dev/null || true)
+    [[ -n "$record" ]] || { printf 'unresolved/ECMP\n'; return; }
+    IFS=$'\t' read -r iface gateway gateway_family nhid <<< "$record"
+    printf '%s / gateway %s / nhid %s\n' "$iface" "$gateway" "$nhid"
+}
+
+doctor_latest_brief() {
+    local wanted="$1" wanted_type="${2:-}" file id
+    if [[ -n "$wanted_type" ]]; then
+        file=$(history_latest_type_result "$wanted_type" "$wanted" 2>/dev/null || true)
+    else
+        file=$(history_latest_matching "$wanted" 2>/dev/null || true)
+    fi
+    [[ -n "$file" ]] || { printf 'none\n'; return; }
+    id="${file%/summary.tsv}"; id="${id##*/}"
+    printf '%s / %s / %s\n' "$id" "$(history_field "$file" TYPE)" "$(history_field "$file" FAILURE_REASON)"
+}
+
+doctor_peer_summary() {
+    local total=0 valid=0 penalized=0 file now
+    [[ -d "$PEER_HEALTH_DIR" && ! -L "$PEER_HEALTH_DIR" ]] || { printf 'none\n'; return; }
+    now=$(date +%s)
+    for file in "$PEER_HEALTH_DIR"/endpoint-*.tsv; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        ((total+=1))
+        if peer_health_load "$file" 2>/dev/null; then
+            ((valid+=1)); (( PH_TEMPORARY_PENALTY_UNTIL <= now )) || ((penalized+=1))
+        fi
+    done
+    printf '%s valid / %s total / %s temporarily penalized\n' "$valid" "$total" "$penalized"
+}
+
+doctor_report() {
+    local config_state=absent baseline_state=missing service_state=absent service_active=inactive iface interfaces iface_line
+    local cc available profile_state=absent persist_state latest_verify=none persist_version=absent persist_sync=OUT_OF_SYNC
+    if [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
+        if load_config 2>/dev/null; then config_state=valid; else config_state=invalid; reset_config; fi
+    else reset_config
+    fi
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf unknown)
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || printf unknown)
+    [[ ! -f "$SYSCTL_FILE" ]] || profile_state=installed
+    [[ ! -f "$SERVICE_FILE" ]] || service_state=$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || printf disabled)
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && service_active=active
+    if [[ -e "$BASELINE_DIR" || -L "$BASELINE_DIR" ]]; then
+        if tcp_baseline_validate "$BASELINE_DIR" >/dev/null 2>&1; then baseline_state="valid / $(baseline_provenance)"; else baseline_state=invalid; fi
+    fi
+    persist_state=$(persistence_script_state)
+    if [[ -f "$PERSIST_SCRIPT" && ! -L "$PERSIST_SCRIPT" ]]; then
+        persist_version=$(awk -F'"' '$1=="SCRIPT_VERSION=" {print $2; exit}' "$PERSIST_SCRIPT" 2>/dev/null)
+        [[ "$persist_version" == "$SCRIPT_VERSION" && "$persist_state" != *differs* && "$persist_state" != *foreign* && "$persist_state" != *not\ executable* ]] && persist_sync=SYNCED
+    fi
+    printf 'bbrv3-lite doctor (read-only)\n\n'
+    printf '%-25s %s\n' Version "v$SCRIPT_VERSION" Kernel "$(uname -r 2>/dev/null || printf unknown)" \
+        OS "$(os_id 2>/dev/null || printf unknown) / $(os_codename 2>/dev/null || printf unknown)" \
+        Virtualization "$(virtualization_type 2>/dev/null || printf unknown)" \
+        'BBR availability' "$available" 'Current congestion control' "$cc" \
+        'Sysctl profile' "$SYSCTL_PROFILE / $profile_state" Config "$config_state / $CONFIG_FILE" \
+        'Persistence service' "$service_state / $service_active" 'CLI script' "v$SCRIPT_VERSION" \
+        'Persistence copy' "v${persist_version:-unknown}" 'Persistence sync' "$persist_sync ($persist_state)" \
+        'Disk baseline' "$baseline_state"
+    printf '%-25s %s\n' 'IPv4 default route' "$(doctor_default_route_summary -4)" \
+        'IPv6 default route' "$(doctor_default_route_summary -6)"
+    printf '%-25s %s\n' 'IPv4 policy rules' "$(ip -4 rule show 2>/dev/null | awk 'END {print NR+0}')" \
+        'IPv6 policy rules' "$(ip -6 rule show 2>/dev/null | awk 'END {print NR+0}')" \
+        'Nexthop objects' "$(ip nexthop show 2>/dev/null | awk 'END {print NR+0}')"
+    interfaces=$(ip -o link show 2>/dev/null | awk -F': ' '{sub(/@.*/,"",$2); print $2}' | awk '!seen[$0]++')
+    printf '\nInterfaces\n'
+    while IFS= read -r iface; do
+        validate_interface_name "$iface" && [[ "$iface" != auto ]] || continue
+        iface_line="driver $(detect_driver "$iface") / MTU $(detect_mtu "$iface") / RX:TX $(detect_rx_queues "$iface"):$(detect_tx_queues "$iface") / qdisc $(root_qdisc_kind "$iface" 2>/dev/null || printf unreadable)"
+        printf '  %-20s %s\n' "$iface" "$iface_line"
+        printf '  %-20s offloads %s\n' '' "$(detect_offload_summary "$iface" 2>/dev/null || printf unavailable)"
+    done <<< "$interfaces"
+    latest_verify=$(history_latest_type verify 2>/dev/null || true)
+    printf '\nRecent state\n'
+    printf '%-25s %s\n' 'Latest successful measurement' "$(doctor_latest_brief SUCCESS sweep)" \
+        'Latest failed measurement' "$(doctor_latest_brief FAILURE)" \
+        'Latest verify' "${latest_verify:-none}" 'Peer health' "$(doctor_peer_summary)"
+    printf '\nTC ownership\n'
+    while IFS= read -r iface; do
+        validate_interface_name "$iface" && [[ "$iface" != auto ]] || continue
+        if managed_htb "$iface" 2>/dev/null; then
+            printf '  %s: managed HTB/FQ (%s Mbit)\n' "$iface" "$(managed_rate_mbit "$iface" 2>/dev/null || printf unknown)"
+        else
+            printf '  %s: %s root; %s\n' "$iface" "$(root_qdisc_kind "$iface" 2>/dev/null || printf unreadable)" \
+                "$(managed_htb_diagnostic "$iface" 2>/dev/null || printf ownership-unavailable)"
+        fi
+    done <<< "$interfaces"
+    printf '\nNo network settings were changed.\n'
+}
+
+diagnostic_capture() {
+    local file="$1"; shift
+    { "$@" 2>&1 || printf '\n[command failed: rc=%s]\n' "$?"; } > "$file"
+    chmod 0600 "$file" 2>/dev/null || true
+}
+
+diagnostic_copy_latest_history() {
+    local type="$1" destination="$2" source temp attempt
+    for attempt in 1 2 3; do
+        source=$(history_latest_type "$type" 2>/dev/null || true)
+        [[ -n "$source" ]] || { : > "$destination"; chmod 0600 "$destination" 2>/dev/null || true; return 0; }
+        temp=$(mktemp "${destination}.snapshot.XXXXXX") || return 1
+        if cp -- "$source" "$temp" 2>/dev/null; then
+            chmod 0600 "$temp" && mv -f -- "$temp" "$destination"
+            return
+        fi
+        rm -f -- "$temp"
+    done
+    : > "$destination"; chmod 0600 "$destination" 2>/dev/null || true
+}
+
+diagnostic_redact_stream() {
+    local hostname_value="${1:-}" include_addresses="${2:-0}" address_map="${3:-/dev/null}"
+    awk -F'\t' -v host="$hostname_value" -v include_addresses="$include_addresses" '
+        function literal_replace(text, old, new, p) {
+            if(old=="") return text
+            while((p=index(text,old))>0) text=substr(text,1,p-1) new substr(text,p+length(old))
+            return text
+        }
+        FILENAME != "-" {if($1!="__MAP__") {address[++address_count]=$1; replacement[address_count]=$2}; next}
+        {
+            low=tolower($0)
+            if(low ~ /(token|password|secret|credential|authorization|(^|[^a-z])psk([^a-z]|$))/) {print "[REDACTED SENSITIVE LINE]"; next}
+            if(low ~ /(machine[-_ ]?id|boot[-_ ]?id|product[-_ ]?uuid|dmi.*uuid|instance[-_ ]?id|ssh.*host.*key)/) {print "[REDACTED MACHINE IDENTITY]"; next}
+            line=literal_replace($0,host,"HOST_REDACTED")
+            if(include_addresses==0) for(i=1;i<=address_count;i++) line=literal_replace(line,address[i],replacement[i])
+            print line
+        }
+    ' "$address_map" - | sed -E \
+        -e 's/([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}/MAC_REDACTED/g' \
+        -e 's/[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}/UUID_REDACTED/g' \
+        -e 's/(^|[^[:xdigit:]])[[:xdigit:]]{32}([^[:xdigit:]]|$)/\1MACHINE_ID_REDACTED\2/g' \
+        -e 's/(^|[^[:alnum:]])i-[[:xdigit:]]{8,}([^[:alnum:]]|$)/\1INSTANCE_ID_REDACTED\2/g'
+}
+
+diagnostic_address_map_build() {
+    local dir="$1" map="$2" address digest
+    printf '__MAP__\t__MAP__\n' > "$map" || return 1
+    while IFS= read -r address; do
+        [[ -n "$address" ]] || continue
+        [[ "$address" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] && continue
+        digest=$(printf '%s' "$address" | sha256sum | awk '{print substr($1,1,12)}') || return 1
+        [[ "$digest" =~ ^[0-9a-f]{12}$ ]] || return 1
+        printf '%s\tADDR#%s\n' "$address" "$digest" >> "$map" || return 1
+    done < <(
+        grep -ERho '([0-9]{1,3}[.]){3}[0-9]{1,3}|[[:xdigit:]:]*::[[:xdigit:]:]*|([[:xdigit:]]{1,4}:){3,7}[[:xdigit:]]{1,4}' "$dir" 2>/dev/null |
+            awk 'NF {print length($0) "\t" $0}' | sort -t$'\t' -k1,1nr -k2,2 | cut -f2- | awk '!seen[$0]++'
+    )
+}
+
+doctor_export() {
+    local include_addresses="${1:-0}" stamp id final file hostname_value tmp_available address_map
+    [[ "$include_addresses" == 0 || "$include_addresses" == 1 ]] || return 1
+    require_commands awk cp cut df find grep gzip hostname mktemp chmod mv sed sha256sum sort tar || return 1
+    tmp_available=$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4+0}')
+    if ! is_uint "$tmp_available" || (( tmp_available < 32768 )); then
+        failure_set DIAGNOSTIC_EXPORT disk-space-low "/tmp available=${tmp_available:-unknown}KiB"
+        die "/tmp 可用空间不足 32 MiB，未创建诊断包"
+        return "$DIAGNOSTIC_EXPORT_RC"
+    fi
+    umask 077
+    stamp=$(date -u +'%Y%m%d-%H%M%S'); id="diag-${stamp}-$$"
+    DIAGNOSTIC_TEMP_DIR=$(mktemp -d "/tmp/.bbrv3-lite-diagnostic.XXXXXX") || return "$DIAGNOSTIC_EXPORT_RC"
+    printf 'DIAGNOSTIC_ID\t%s\nCREATED_AT\t%s\nVERSION\t%s\nADDRESSES_INCLUDED\t%s\n' "$id" "$(utc_now)" "$SCRIPT_VERSION" "$include_addresses" > "$DIAGNOSTIC_TEMP_DIR/meta.txt"
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/status.txt" doctor_report
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/verify.txt" verify_system_state
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/sysctl.txt" bash -c 'for key in net.core.default_qdisc net.ipv4.tcp_congestion_control net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog; do sysctl "$key" 2>&1 || true; done'
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/routes-v4.txt" ip -4 route show table all
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/routes-v6.txt" ip -6 route show table all
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/rules-v4.txt" ip -4 rule show
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/rules-v6.txt" ip -6 rule show
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/nexthops.txt" ip nexthop show
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/tc-qdisc.txt" sh -c 'for i in /sys/class/net/*; do n=${i##*/}; echo "## $n"; tc qdisc show dev "$n" 2>&1 || true; done'
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/tc-class.txt" sh -c 'for i in /sys/class/net/*; do n=${i##*/}; echo "## $n"; tc class show dev "$n" 2>&1 || true; done'
+    diagnostic_capture "$DIAGNOSTIC_TEMP_DIR/tc-filter.txt" sh -c 'for i in /sys/class/net/*; do n=${i##*/}; echo "## $n"; tc filter show dev "$n" 2>&1 || true; done'
+    {
+        printf 'enabled='; systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true
+        printf 'active='; systemctl is-active "$SERVICE_NAME" 2>/dev/null || true
+        printf 'persistence-copy=%s\n' "$(persistence_script_state)"
+    } > "$DIAGNOSTIC_TEMP_DIR/service.txt"
+    if load_config 2>/dev/null; then write_config_stream > "$DIAGNOSTIC_TEMP_DIR/config.redacted.txt"; else printf 'CONFIG_UNAVAILABLE\n' > "$DIAGNOSTIC_TEMP_DIR/config.redacted.txt"; fi
+    # Copy through an archive-local temporary file.  If prune unlinks the
+    # source after cp opens it, Unix keeps that file descriptor readable; if
+    # the unlink wins the open race, retry against the new latest entry.
+    diagnostic_copy_latest_history sweep "$DIAGNOSTIC_TEMP_DIR/latest-sweep-summary.tsv" || return "$DIAGNOSTIC_EXPORT_RC"
+    diagnostic_copy_latest_history verify "$DIAGNOSTIC_TEMP_DIR/latest-verify-summary.tsv" || return "$DIAGNOSTIC_EXPORT_RC"
+    peers_show > "$DIAGNOSTIC_TEMP_DIR/peer-health.tsv" 2>&1 || printf 'peer health unavailable\n' > "$DIAGNOSTIC_TEMP_DIR/peer-health.tsv"
+    chmod 0600 "$DIAGNOSTIC_TEMP_DIR"/*
+    (( include_addresses == 0 )) || log WARN "诊断包将包含完整网络地址；hostname、MAC、机器身份与 secret 仍会脱敏"
+    hostname_value=$(hostname 2>/dev/null || true)
+    address_map=$(mktemp "$DIAGNOSTIC_TEMP_DIR/.redaction-map.XXXXXX") || return "$DIAGNOSTIC_EXPORT_RC"
+    if (( include_addresses == 0 )); then diagnostic_address_map_build "$DIAGNOSTIC_TEMP_DIR" "$address_map" || return "$DIAGNOSTIC_EXPORT_RC"
+    else printf '__MAP__\t__MAP__\n' > "$address_map"
+    fi
+    for file in "$DIAGNOSTIC_TEMP_DIR"/*; do
+        [[ -f "$file" ]] || continue
+        diagnostic_redact_stream "$hostname_value" "$include_addresses" "$address_map" < "$file" > "$file.redacted"
+        chmod 0600 "$file.redacted" && mv -f -- "$file.redacted" "$file"
+    done
+    rm -f -- "$address_map"
+    if grep -ERiq '(token|password|secret|credential|authorization|(^|[^a-z])psk([^a-z]|$))' "$DIAGNOSTIC_TEMP_DIR"; then
+        rm -rf -- "$DIAGNOSTIC_TEMP_DIR"; DIAGNOSTIC_TEMP_DIR=""
+        die "诊断包 secret deny-list 校验失败；没有生成归档"
+        return "$DIAGNOSTIC_EXPORT_RC"
+    fi
+    final="/tmp/bbrv3-lite-diagnostic-${stamp}.tar.gz"; [[ ! -e "$final" && ! -L "$final" ]] || final="/tmp/bbrv3-lite-diagnostic-${stamp}-$$.tar.gz"
+    DIAGNOSTIC_TEMP_ARCHIVE=$(mktemp "/tmp/.bbrv3-lite-diagnostic-archive.XXXXXX") || {
+        rm -rf -- "$DIAGNOSTIC_TEMP_DIR"; DIAGNOSTIC_TEMP_DIR=""; return "$DIAGNOSTIC_EXPORT_RC";
+    }
+    if ! tar -C "$DIAGNOSTIC_TEMP_DIR" -czf "$DIAGNOSTIC_TEMP_ARCHIVE" .; then
+        rm -f -- "$DIAGNOSTIC_TEMP_ARCHIVE"; DIAGNOSTIC_TEMP_ARCHIVE=""; rm -rf -- "$DIAGNOSTIC_TEMP_DIR"; DIAGNOSTIC_TEMP_DIR=""; return "$DIAGNOSTIC_EXPORT_RC"
+    fi
+    chmod 0600 "$DIAGNOSTIC_TEMP_ARCHIVE" || { rm -f -- "$DIAGNOSTIC_TEMP_ARCHIVE"; DIAGNOSTIC_TEMP_ARCHIVE=""; rm -rf -- "$DIAGNOSTIC_TEMP_DIR"; DIAGNOSTIC_TEMP_DIR=""; return "$DIAGNOSTIC_EXPORT_RC"; }
+    if ! mv -n -- "$DIAGNOSTIC_TEMP_ARCHIVE" "$final" || [[ -e "$DIAGNOSTIC_TEMP_ARCHIVE" || ! -f "$final" || -L "$final" ]]; then
+        rm -f -- "$DIAGNOSTIC_TEMP_ARCHIVE"; DIAGNOSTIC_TEMP_ARCHIVE=""; rm -rf -- "$DIAGNOSTIC_TEMP_DIR"; DIAGNOSTIC_TEMP_DIR=""
+        die "诊断包目标发生并发冲突；没有覆盖现有文件"
+        return "$DIAGNOSTIC_EXPORT_RC"
+    fi
+    DIAGNOSTIC_TEMP_ARCHIVE=""
+    rm -rf -- "$DIAGNOSTIC_TEMP_DIR"; DIAGNOSTIC_TEMP_DIR=""
+    printf 'Diagnostic ID: %s\nDiagnostic bundle: %s\nPermissions: 600\nUpload: never automatic\n' "$id" "$final"
+}
+
+auto_dry_run() {
+    local requested="${1:-auto}" profile="${2:-standard}" max_bytes="${3:-0}" max_duration="${4:-900}" peer="${5:-}"
+    local iface qdisc cap duration estimate dependency_state=ready route_state dependency first_plan
+    local first_stage first_rate first_duration first_reserved
+    measurement_profile_configure "$profile" || return 1
+    iface=$(detect_interface "$requested") || return 1
+    qdisc=$(root_qdisc_kind "$iface" 2>/dev/null || printf unreadable)
+    hardware_profile_values "$iface" 0 || return 1
+    cap=$(recommended_scan_cap "$iface" 0) || return 1
+    duration=$(recommended_measure_duration "$iface" 0) || return 1
+    first_plan=$(measurement_first_sample_plan auto 0 "$cap" "$duration") || return 1
+    IFS=$'\t' read -r first_stage first_rate first_duration _ _ first_reserved _ <<< "$first_plan"
+    estimate=$(estimate_measurement_plan_bytes "$((cap*40/100))" "$duration" "$cap" "$duration" "$cap" "$duration" "$((duration+2))" 1)
+    (( max_bytes > 0 && estimate > max_bytes )) && estimate="$max_bytes"
+    for dependency in ip tc sysctl systemctl iperf3 jq ping timeout; do command_exists "$dependency" || dependency_state="missing: $dependency"; done
+    if [[ -n "$peer" ]]; then route_state=$(target_route_records "$peer" 2>/dev/null || printf unresolved); else route_state="not selected (formal run will freeze one endpoint)"; fi
+    printf 'Dry-run\n\n'
+    printf '%-25s %s\n' 'Managed interface' "$iface" 'IPv4 default' "$(doctor_default_route_summary -4)" \
+        'IPv6 default' "$(doctor_default_route_summary -6)" 'Peer route' "$route_state" \
+        'Current CC' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf unknown)" \
+        'Current qdisc' "$qdisc" 'Hardware profile' "$HARDWARE_CLASS" 'Measurement mode' "$profile" \
+        'Peer mode' "$([[ -n "$peer" ]] && printf explicit || printf public-selection-at-run-time)" \
+        'Planning bandwidth' "${EFFECTIVE_BANDWIDTH_MBIT:-unknown} Mbit (${EFFECTIVE_BANDWIDTH_SOURCE:-unknown})" \
+        'First-sample safety ceiling' "${first_rate} Mbit (${first_stage})" \
+        'Minimum first-sample budget' "~$(human_bytes "$first_reserved") (${first_duration}s sample)" \
+        'Dependencies' "$dependency_state" 'Estimated max traffic' "$(human_bytes "$estimate")" \
+        'Hard traffic budget' "$(human_bytes "$max_bytes")" 'Estimated duration' '3–8 min' \
+        'Hard duration budget' "${max_duration}s"
+    printf '\nWould:\n  temporarily enable BBR/FQ\n  run PATH_CONTROL, SATURATION, coarse/fine scan and final verify\n  apply HTB only if a verified knee is found\n  persist only after final verify\n\nDiscovery boundary:\n  local route/sysctl/qdisc inspection is performed\n  an explicit --peer may trigger DNS/route discovery only\n  no ping, TCP precheck or iperf throughput test is performed\n\nNo system changes were made.\nNo throughput measurement was performed.\n'
 }
 
 # -----------------------------------------------------------------------------
@@ -11248,7 +12976,8 @@ show_help() {
 ${SCRIPT_NAME} v${SCRIPT_VERSION} - measured BBR/HTB/FQ tuning
 
 Usage:
-  ${0##*/} auto
+  ${0##*/} auto [--dry-run] [--interface DEV] [--measurement-profile quick|standard|strict]
+                 [--max-test-gib GIB] [--max-duration SEC] [--peer HOST]
   ${0##*/} detect [--interface DEV] [--target HOST]
   ${0##*/} install [--profile balanced|adaptive] [--role proxy|mixed|bulk]
                      [--bandwidth MBIT --rtt MS] [--interface DEV]
@@ -11274,6 +13003,12 @@ Usage:
   ${0##*/} measure sweep --peer HOST [--nominal MBIT] [--low MBIT --high MBIT]
                          [--step MBIT] [--duration 8] [--parallel 1]
                          [--margin 3] [--loss-threshold 0.1] [--cap MBIT] [--force-scan]
+                 Measurement commands accept --measurement-profile quick|standard|strict,
+                 --max-test-gib GIB and --max-duration SEC.
+  ${0##*/} peers [reset]
+  ${0##*/} history [latest|show ID|prune]
+  ${0##*/} doctor [--export [--include-addresses]]
+                 --include-addresses 只保留网络地址；hostname、MAC、机器身份和 secret 仍脱敏。
   ${0##*/} kernel status|install [--track lts|main]|remove
   ${0##*/} dns status|plan POLICY|apply POLICY|verify|restore
              POLICY: native|strict-dot|plain (aliases: auto|dot)
@@ -11304,6 +13039,73 @@ require_no_arguments() {
         die "$context 不接受额外参数: $*"
         return 1
     }
+}
+
+gib_to_bytes() {
+    local gib="$1" bytes
+    is_decimal "$gib" || { die "GiB 预算必须是正数"; return 1; }
+    bytes=$(awk -v g="$gib" 'BEGIN {if(g<0.01 || g>1024) exit 1; printf "%.0f",g*1073741824}') || {
+        die "GiB 预算必须在 0.01–1024 之间"; return 1;
+    }
+    is_uint "$bytes" || return 1
+    printf '%s\n' "$bytes"
+}
+
+cmd_auto() {
+    local dry_run=0 requested=auto measurement_profile=standard max_gib=6 max_duration=900 peer="" max_bytes
+    while (($#)); do
+        case "$1" in
+            --dry-run) dry_run=1; shift ;;
+            --interface) require_option_value "$@" || return 1; requested="$2"; shift 2 ;;
+            --measurement-profile) require_option_value "$@" || return 1; measurement_profile="$2"; shift 2 ;;
+            --max-test-gib) require_option_value "$@" || return 1; max_gib="$2"; shift 2 ;;
+            --max-duration) require_option_value "$@" || return 1; max_duration="$2"; shift 2 ;;
+            --peer) require_option_value "$@" || return 1; peer="$2"; shift 2 ;;
+            *) die "auto 不支持参数: $1"; return 1 ;;
+        esac
+    done
+    validate_interface_name "$requested" || { die "非法 --interface"; return 1; }
+    measurement_profile_configure "$measurement_profile" || return 1
+    max_bytes=$(gib_to_bytes "$max_gib") || return 1
+    is_uint "$max_duration" && (( max_duration >= 30 && max_duration <= 86400 )) || { die "--max-duration 必须是 30–86400 秒"; return 1; }
+    if (( dry_run )); then auto_dry_run "$requested" "$measurement_profile" "$max_bytes" "$max_duration" "$peer"; return; fi
+    [[ -z "$peer" ]] || { die "非 dry-run 的 auto 仍通过交互界面选择对端；--peer 仅用于只读规划"; return 1; }
+    AUTO_MEASUREMENT_PROFILE="$measurement_profile"; AUTO_MAX_TX_BYTES="$max_bytes"; AUTO_MAX_DURATION_SECONDS="$max_duration"
+    AUTO_REQUESTED_INTERFACE="$requested"
+    auto_tune_wizard
+}
+
+cmd_peers() {
+    local action="${1:-show}"; (($# == 0)) || shift
+    case "$action" in
+        show) require_no_arguments "peers" "$@" || return 1; peers_show ;;
+        reset) require_no_arguments "peers reset" "$@" || return 1; peers_reset ;;
+        *) die "peers 子命令应为 reset（无参数时只读显示）" ;;
+    esac
+}
+
+cmd_history() {
+    local action="${1:-list}"; (($# == 0)) || shift
+    case "$action" in
+        list) require_no_arguments "history" "$@" || return 1; history_list ;;
+        latest) require_no_arguments "history latest" "$@" || return 1; history_latest ;;
+        show) (($# == 1)) || { die "history show 需要一个 ID"; return 1; }; history_show "$1" ;;
+        prune) require_no_arguments "history prune" "$@" || return 1; history_prune ;;
+        *) die "history 子命令应为 latest/show/prune" ;;
+    esac
+}
+
+cmd_doctor() {
+    local export_bundle=0 include_addresses=0
+    while (($#)); do
+        case "$1" in
+            --export) export_bundle=1; shift ;;
+            --include-addresses) include_addresses=1; shift ;;
+            *) die "doctor 不支持参数: $1"; return 1 ;;
+        esac
+    done
+    (( include_addresses == 0 || export_bundle == 1 )) || { die "--include-addresses 必须与 --export 一起使用"; return 1; }
+    if (( export_bundle )); then doctor_export "$include_addresses"; else doctor_report; fi
 }
 
 parse_common_profile_options() {
@@ -11457,6 +13259,7 @@ cmd_measure() {
     local action="${1:-}"; shift || true
     local peer="" port=5201 iface=auto duration=10 parallel=4 nominal=0 low=0 high=0 step=0 margin=3 threshold=0.1 force=0 cap=0
     local rate=0 rounds=2 samples=7 pmtu=1
+    local measurement_profile=standard max_gib=6 max_duration=900 max_bytes
     if [[ "$action" == deps ]]; then
         require_no_arguments "measure deps" "$@" || return 1
         install_measure_dependencies
@@ -11468,6 +13271,9 @@ cmd_measure() {
     while (($#)); do
         case "$1" in
             --peer) require_option_value "$@" || return 1; peer="$2"; shift 2 ;;
+            --measurement-profile) require_option_value "$@" || return 1; measurement_profile="$2"; shift 2 ;;
+            --max-test-gib) require_option_value "$@" || return 1; max_gib="$2"; shift 2 ;;
+            --max-duration) require_option_value "$@" || return 1; max_duration="$2"; shift 2 ;;
             --port)
                 [[ "$action" != path ]] || { die "measure path 不使用 --port"; return 1; }
                 require_option_value "$@" || return 1; port="$2"; shift 2
@@ -11512,6 +13318,9 @@ cmd_measure() {
         esac
     done
     [[ -n "$peer" ]] || { die "需要 --peer HOST"; return 1; }
+    measurement_profile_configure "$measurement_profile" || return 1
+    max_bytes=$(gib_to_bytes "$max_gib") || return 1
+    measurement_budget_configure "$max_bytes" "$max_duration" || return 1
     if [[ "$action" == path ]]; then
         is_uint "$samples" && (( samples >= 3 && samples <= 20 )) || { die "measure path --samples 必须是 3–20"; return 1; }
     fi
@@ -11634,12 +13443,12 @@ activate_public_peer_candidate() {
 }
 
 interactive_select_peer() {
-    local choice spec rtt
+    local choice spec rtt requested="${AUTO_REQUESTED_INTERFACE:-auto}"
     printf '%s\n' '测速对端：' '  1) 自动选择公共节点（Leaseweb / OVH / Clouvider）' '  2) 自有 iperf3 服务器（推荐）'
     read -r -p '选择 [1]: ' choice || return 1
     case "${choice:-1}" in
         1)
-            auto_pick_peer auto || return 1
+            auto_pick_peer "$requested" || return 1
             WIZARD_PUBLIC_PEER=1; WIZARD_FAILOVERS=0
             activate_public_peer_candidate 0 || return 1
             return 0
@@ -11650,7 +13459,7 @@ interactive_select_peer() {
         *) die "无效对端选择"; return 1 ;;
     esac
     parse_peer_spec "$spec" || return 1
-    measure_lock_peer "$PEER_HOST" auto "$PEER_PORT" || return $?
+    measure_lock_peer "$PEER_HOST" "$requested" "$PEER_PORT" || return $?
     WIZARD_PUBLIC_PEER=0; WIZARD_PEER="$PEER_HOST"; WIZARD_PORT="$PEER_PORT"
     WIZARD_PEER_ADDRESS="$MEASURE_PEER_ADDRESS"; WIZARD_PEER_FAMILY="$MEASURE_PEER_FAMILY"
     WIZARD_PEER_SOURCE="$MEASURE_PEER_SOURCE"; WIZARD_PEER_IFACE="$MEASURE_PEER_IFACE"
@@ -11660,7 +13469,8 @@ interactive_select_peer() {
 }
 
 auto_measure_with_peer_failover() {
-    local iface="$1" nominal="$2" index=0 count=1 rc
+    local iface="$1" nominal="$2" index=0 count=1 rc last_rc=1 attempted=0
+    local unavailable=0 busy=0 dirty=0 unstable=0 reason summary
     local duration="${WIZARD_SAMPLE_DURATION:-5}" cap="${WIZARD_SCAN_CAP:-5000}"
     if (( ${WIZARD_PUBLIC_PEER:-0} )); then count=${#PUBLIC_PEER_CANDIDATES[@]}; fi
     for ((index=0; index<count; index++)); do
@@ -11697,15 +13507,30 @@ auto_measure_with_peer_failover() {
         else
             rc=$?
         fi
-        if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == MEASURE_PATH_QUALITY_RC || rc == MEASURE_ROUTE_MISMATCH_RC || rc == IPERF_UNSTABLE_RC || rc == IPERF_CONTAMINATED_RC || rc == 2) )); then
+        last_rc="$rc"; ((attempted+=1))
+        summary="${MEASURE_RUN_DIR:-}/summary.tsv"
+        reason=""; [[ -f "$summary" ]] && reason=$(summary_value "$summary" FAILURE_REASON)
+        case "$reason" in
+            peer-busy) ((busy+=1)) ;;
+            peer-unavailable|peer-timeout|peer-reset|protocol-failure) ((unavailable+=1)) ;;
+            path-dirty) ((dirty+=1)) ;;
+            *) ((unstable+=1)) ;;
+        esac
+        if (( ${WIZARD_PUBLIC_PEER:-0} )) && [[ "$(operation_rc_class "$rc")" == peer-failover ]]; then
             (( rc != MEASURE_PATH_QUALITY_RC )) || log WARN "当前公共对端低速 path control 判定 PATH_DIRTY；下一个候选将重新执行完整实验"
             (( index + 1 < count )) && continue
             break
         fi
         return "$rc"
     done
-    die "所有公共 iperf3 对端均不可用、过慢、路径不干净或测量不稳定；请稍后重试或使用自有 iperf3 服务器"
-    return 1
+    printf '\n公共测速失败\n\n'
+    printf '%-20s %s\n' Candidates "$count" 'Candidates tried' "$attempted/$count" Unavailable "$unavailable" \
+        Busy "$busy" 'Dirty path' "$dirty" Unstable "$unstable" 'Successful sweep' 0 \
+        'Traffic used' "$(human_bytes "${TEST_TX_BYTES_USED:-0}") TX" \
+        Rollback 'temporary qdisc complete; outer transaction will restore' 'Persistent changes' none
+    printf '\n建议:\n  1. 稍后重试\n  2. 使用自有 iperf3 服务端\n  3. 运行 bbr doctor 查看诊断\n'
+    log ERR "所有公共 iperf3 对端均不可用、过慢、路径不干净或测量不稳定"
+    return "$last_rc"
 }
 
 auto_verify_with_peer_failover() {
@@ -11867,7 +13692,7 @@ auto_tune_execute() {
         log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
     fi
     verify_runtime_tuning "$iface" || return 1
-    if auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$clean_reference_loss"; then
+    if auto_verify_with_peer_failover "$iface" "$(measurement_profile_verify_duration 6)" "$expected_rate" "$min_efficiency" "$clean_reference_loss"; then
         verify_summary="$MEASURE_RUN_DIR/summary.tsv"
         verify_path_fingerprint=$(summary_value "$verify_summary" PATH_ROUTE_FINGERPRINT)
         [[ "$verify_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
@@ -11931,19 +13756,61 @@ auto_tune_execute() {
     log INFO "扫描记录: $summary"
 }
 
+auto_first_sample_budget_prepare() {
+    local mode="$1" nominal="$2" cap="$3" base_duration="$4" plan
+    plan=$(measurement_first_sample_plan "$mode" "$nominal" "$cap" "$base_duration") || return 1
+    IFS=$'\t' read -r AUTO_FIRST_SAMPLE_STAGE AUTO_FIRST_SAMPLE_RATE AUTO_FIRST_SAMPLE_DURATION \
+        _ _ AUTO_FIRST_SAMPLE_RESERVED_BYTES AUTO_FIRST_SAMPLE_RESERVED_SECONDS <<< "$plan"
+}
+
+auto_first_sample_budget_gate() {
+    local max_bytes="$1" max_duration="$2" mode="$3" nominal="$4" cap="$5" base_duration="$6" rc=0
+    auto_first_sample_budget_prepare "$mode" "$nominal" "$cap" "$base_duration" || return 1
+    [[ "$AUTO_FIRST_SAMPLE_STAGE" == NONE ]] && return 0
+    if measurement_first_sample_budget_check "$max_bytes" "$max_duration" "$mode" "$nominal" "$cap" "$base_duration"; then
+        return 0
+    else
+        rc=$?
+    fi
+    (( rc == MEASURE_BUDGET_RC )) || return "$rc"
+    printf '\n执行摘要\n'
+    printf '  硬流量预算      %s TX\n' "$(human_bytes "$max_bytes")"
+    printf '  首样本安全预留  %s TX（%s %s Mbit/s × %ss）\n' \
+        "$(human_bytes "$AUTO_FIRST_SAMPLE_RESERVED_BYTES")" "$AUTO_FIRST_SAMPLE_STAGE" \
+        "$AUTO_FIRST_SAMPLE_RATE" "$AUTO_FIRST_SAMPLE_DURATION"
+    printf '  首样本时间预留  %ss / hard limit %ss\n' "$AUTO_FIRST_SAMPLE_RESERVED_SECONDS" "$max_duration"
+    log ERR "MEASUREMENT_BUDGET_EXCEEDED：当前预算不足以安全启动第一次吞吐采样"
+    log INFO "请提高 --max-test-gib（必须大于首样本安全预留）；不要降低安全余量"
+    log INFO "未创建调优 transaction、未写入 baseline、未修改 sysctl/qdisc，也未启动 iperf"
+    return "$MEASURE_BUDGET_RC"
+}
+
 auto_tune_run_transaction() {
-    local iface="$1" rc rollback_rc=0
+    local iface="$1" nominal="$4" rc rollback_rc=0 failure_dir="" measurement_mode=none
+    if [[ -n "${WIZARD_PEER:-}" ]]; then
+        if (( nominal > 0 )); then measurement_mode=known; else measurement_mode=auto; fi
+    fi
+    if auto_first_sample_budget_gate "${AUTO_MAX_TX_BYTES:-6442450944}" "${AUTO_MAX_DURATION_SECONDS:-900}" \
+        "$measurement_mode" "$nominal" "${WIZARD_SCAN_CAP:-5000}" "${WIZARD_SAMPLE_DURATION:-5}"; then :
+    else
+        rc=$?; return "$rc"
+    fi
     action_transaction_begin_multi "$iface" || return 1
     action_transaction_mark_mutated || { action_transaction_discard_snapshot || true; return 1; }
     if auto_tune_execute "$@"; then
         action_transaction_commit
         return
     else
-        rc=$?
+        rc=$?; failure_dir="${MEASURE_RUN_DIR:-}"
     fi
     log WARN "自动调优未完成，正在恢复开始前状态"
     action_transaction_rollback || rollback_rc=$?
-    (( rollback_rc == 0 )) || return "$rollback_rc"
+    if [[ -n "$failure_dir" && -f "$failure_dir/summary.tsv" ]] && declare -F failure_finalize_outer_rollback >/dev/null; then
+        failure_finalize_outer_rollback "$failure_dir/summary.tsv" "$rc" "$rollback_rc" || \
+            log WARN "最终 failure summary 原子更新失败；保留原始 history 与事务证据"
+        failure_summary_print "$failure_dir/summary.tsv" 1 || true
+    fi
+    (( rollback_rc == 0 )) || return "$ROLLBACK_FAILURE_RC"
     return "$rc"
 }
 
@@ -11953,23 +13820,38 @@ auto_tune_wizard() {
     require_systemd_runtime || return 1
     [[ -t 0 ]] || { die "auto 向导需要交互终端"; return 1; }
     local bandwidth_input nominal=0 role_choice role=mixed peer_rtt=0 tuning_rtt=0 profile=balanced estimate="动态估算" iface
+    local measurement_profile="${AUTO_MEASUREMENT_PROFILE:-standard}" max_tx_bytes="${AUTO_MAX_TX_BYTES:-6442450944}"
+    local max_duration="${AUTO_MAX_DURATION_SECONDS:-900}" requested="${AUTO_REQUESTED_INTERFACE:-auto}" estimate_bytes=0
+    local measurement_mode=auto
     local backup_count=0 candidate_index candidate tmp_iface
     WIZARD_PEER=""; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PUBLIC_INDEX=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0; WIZARD_ROUTE_GUARD_ACTIVE=0
     WIZARD_PEER_ADDRESS=""; WIZARD_PEER_FAMILY=""; WIZARD_PEER_SOURCE=""; WIZARD_PEER_IFACE=""
     nic_auto_policy_reset
     WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SWEEP_ADDRESS=""; WIZARD_SWEEP_FAMILY=""; WIZARD_SWEEP_SOURCE=""; WIZARD_SWEEP_IFACE=""
     WIZARD_SCAN_CAP=5000; WIZARD_SAMPLE_DURATION=5
+    measurement_profile_configure "$measurement_profile" || return 1
     printf '\n%s v%s 自动调优\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
     printf '首次修改前会保存不可覆盖的基线：%s\n' "$BASELINE_DIR"
     printf '包含本工具涉及的 sysctl、配置/服务、qdisc/class，以及 IPv4/IPv6 路由快照。\n\n'
-    ensure_interactive_measure_dependencies || return 1
-
     read -r -p '标称带宽 Mbit/s（a=自动测量，0=仅安装 BBR+FQ）[a]: ' bandwidth_input || return 1
     bandwidth_input="${bandwidth_input:-a}"
     if [[ "$bandwidth_input" != a && "$bandwidth_input" != auto ]]; then
         is_uint "$bandwidth_input" && (( bandwidth_input <= 1000000 )) || { die "带宽必须是非负整数或 a"; return 1; }
         nominal="$bandwidth_input"
     fi
+    if [[ "$bandwidth_input" == a || "$bandwidth_input" == auto ]]; then measurement_mode=auto
+    elif (( nominal > 0 )); then measurement_mode=known
+    else measurement_mode=none
+    fi
+    iface=$(detect_interface "$requested") || return 1
+    WIZARD_SCAN_CAP=$(recommended_scan_cap "$iface" "$nominal") || return 1
+    WIZARD_SAMPLE_DURATION=$(recommended_measure_duration "$iface" "$nominal") || return 1
+    if auto_first_sample_budget_gate "$max_tx_bytes" "$max_duration" "$measurement_mode" "$nominal" \
+        "$WIZARD_SCAN_CAP" "$WIZARD_SAMPLE_DURATION"; then :
+    else
+        return $?
+    fi
+    ensure_interactive_measure_dependencies || return 1
 
     if [[ "$nominal" != 0 || "$bandwidth_input" == a || "$bandwidth_input" == auto ]]; then
         interactive_select_peer || return 1
@@ -11985,15 +13867,22 @@ auto_tune_wizard() {
     case "${role_choice:-1}" in 1) role=mixed ;; 2) role=proxy ;; 3) role=bulk ;; *) die "无效用途"; return 1 ;; esac
     tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
     iface="${WIZARD_PEER_IFACE:-}"
-    [[ -n "$iface" ]] || iface=$(detect_interface auto) || return 1
+    [[ -n "$iface" ]] || iface=$(detect_interface "$requested") || return 1
+    WIZARD_SCAN_CAP=$(recommended_scan_cap "$iface" "$nominal") || return 1
+    WIZARD_SAMPLE_DURATION=$(recommended_measure_duration "$iface" "$nominal") || return 1
+    if auto_first_sample_budget_gate "$max_tx_bytes" "$max_duration" "$measurement_mode" "$nominal" \
+        "$WIZARD_SCAN_CAP" "$WIZARD_SAMPLE_DURATION"; then :
+    else
+        return $?
+    fi
     auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-}" || return 1
     shaping_target_preflight "$iface" auto auto || return 1
     WIZARD_ROUTE_GUARD_ACTIVE=1
-    WIZARD_SCAN_CAP=$(recommended_scan_cap "$iface" "$nominal") || return 1
-    WIZARD_SAMPLE_DURATION=$(recommended_measure_duration "$iface" "$nominal") || return 1
     if (( nominal > 0 && tuning_rtt > 0 )); then
         profile=adaptive
-        estimate="约 $(human_bytes "$(estimate_sweep_bytes "$((nominal * 13 / 10))" "$WIZARD_SAMPLE_DURATION" 20)") 上行"
+        estimate_bytes=$(estimate_measurement_plan_bytes "$((nominal * 40 / 100))" "$WIZARD_SAMPLE_DURATION" "$nominal" "$WIZARD_SAMPLE_DURATION" "$((nominal * 13 / 10))" "$WIZARD_SAMPLE_DURATION" "$((WIZARD_SAMPLE_DURATION+2))" 0)
+        (( estimate_bytes > max_tx_bytes )) && estimate_bytes="$max_tx_bytes"
+        estimate="≤ $(human_bytes "$estimate_bytes") 上行（正常上界；peer failure retries 仍计入硬预算）"
     elif [[ -n "${WIZARD_PEER:-}" ]]; then
         estimate="将按实测带宽动态计算，扫描上限 ${WIZARD_SCAN_CAP} Mbit/s"
     else
@@ -12006,6 +13895,7 @@ auto_tune_wizard() {
     printf '  硬件模型        %s / %s CPU / %s MiB / RX:TX %s:%s\n' "$HARDWARE_CLASS" "$HARDWARE_CPU_COUNT" "$HARDWARE_MEMORY_MB" "$HARDWARE_RX_QUEUES" "$HARDWARE_TX_QUEUES"
     printf '  链路/采样       %s Mbit（%s）/ %ss\n' "$HARDWARE_LINK_MBIT" "$HARDWARE_LINK_TRUST" "$WIZARD_SAMPLE_DURATION"
     printf '  扫描策略        初始上限 %s Mbit；自动测量后可按基准扩展\n' "$WIZARD_SCAN_CAP"
+    printf '  测量深度        %s\n' "$measurement_profile"
     printf '  标称带宽        %s\n' "$([[ "$bandwidth_input" == a || "$bandwidth_input" == auto ]] && echo 自动测量 || echo "${nominal} Mbit/s")"
     if [[ -n "${WIZARD_PEER:-}" ]]; then
         printf '  iperf3 对端     %s:%s（测速 RTT %sms）\n' "$WIZARD_PEER" "$WIZARD_PORT" "${peer_rtt:-unknown}"
@@ -12022,9 +13912,19 @@ auto_tune_wizard() {
         printf '  缓冲区调优 RTT  %sms（按用途下限与测速 RTT 取较大值）\n' "$tuning_rtt"
     fi
     printf '  预计时间/流量   约 3–8 分钟 / %s\n' "$estimate"
+    printf '  硬流量预算      %s TX\n' "$(human_bytes "$max_tx_bytes")"
+    if [[ "$AUTO_FIRST_SAMPLE_STAGE" == NONE ]]; then
+        printf '  首样本安全预留  不运行测速\n'
+    else
+        printf '  首样本安全预留  %s TX（%s %s Mbit/s × %ss）\n' \
+            "$(human_bytes "$AUTO_FIRST_SAMPLE_RESERVED_BYTES")" "$AUTO_FIRST_SAMPLE_STAGE" \
+            "$AUTO_FIRST_SAMPLE_RATE" "$AUTO_FIRST_SAMPLE_DURATION"
+    fi
+    printf '  时间预算        %ss\n' "$max_duration"
     printf '  持久化位置      %s + %s\n' "$CONFIG_FILE" "$SERVICE_FILE"
     confirm "确认开始？" || { log INFO "已取消，未修改系统"; return 0; }
 
+    measurement_budget_configure "$max_tx_bytes" "$max_duration" || return 1
     qdisc_guard "$iface" || return 1
     BANDWIDTH_MBIT="$nominal"; network_tuning_preflight "$iface" 1 || return 1
     auto_tune_run_transaction "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" "$peer_rtt"
@@ -12095,6 +13995,27 @@ measurement_menu() {
         read -r -p '选择: ' choice || return 0
         case "$choice" in
             1|2|3|4|5) submenu_run measurement_action "$choice" || return 90 ;;
+            0) return 0 ;;
+            *) invalid_menu_choice ;;
+        esac
+    done
+}
+
+diagnostics_menu() {
+    local choice id
+    while true; do
+        ui_clear
+        printf '%s\n' '状态 / 诊断' '1) 完整状态与一致性验证' '2) Doctor（只读）' \
+            '3) 测量历史' '4) 查看公共 peer 健康' '5) 导出脱敏诊断包' '6) 清理旧测量历史' '7) 重置 peer 健康缓存' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run status_and_verify_action ;;
+            2) submenu_run doctor_report ;;
+            3) submenu_run history_list ;;
+            4) submenu_run peers_show ;;
+            5) submenu_run doctor_export 0 ;;
+            6) if confirm '仅保留最近的测量历史？'; then submenu_run history_prune; else log INFO "已取消"; ui_pause; fi ;;
+            7) if confirm '仅重置本机 peer health cache？'; then submenu_run peers_reset; else log INFO "已取消"; ui_pause; fi ;;
             0) return 0 ;;
             *) invalid_menu_choice ;;
         esac
@@ -12222,14 +14143,14 @@ interactive_menu() {
         ui_clear
         printf '\n%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
         printf '%s\n' '1) 自动调优（推荐）' '2) 安装/刷新 BBR + FQ' '3) 测量与复验' '4) 多网卡 / TC 管理' \
-            '5) 完整状态与一致性验证' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复/更新/卸载' '0) 退出'
+            '5) 状态 / 诊断' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复/更新/卸载' '0) 退出'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
             1) submenu_run auto_tune_wizard ;;
             2) submenu_run cmd_install ;;
             3) if ! menu_run measurement_menu; then return 0; fi ;;
             4) if ! menu_run tc_menu; then return 0; fi ;;
-            5) submenu_run status_and_verify_action ;;
+            5) if ! menu_run diagnostics_menu; then return 0; fi ;;
             6) if ! menu_run kernel_menu; then return 0; fi ;;
             7) if ! menu_run dns_menu; then return 0; fi ;;
             8) if ! menu_run ipv6_menu; then return 0; fi ;;
@@ -12248,7 +14169,7 @@ main() {
         return
     fi
     case "$command" in
-        auto) require_no_arguments "auto" "$@" || return 1; auto_tune_wizard ;;
+        auto) cmd_auto "$@" ;;
         detect) cmd_detect "$@" ;;
         install) cmd_install "$@" ;;
         explain) cmd_explain "$@" ;;
@@ -12256,6 +14177,9 @@ main() {
         tc) cmd_tc "$@" ;;
         nic) cmd_nic "$@" ;;
         measure) cmd_measure "$@" ;;
+        peers) cmd_peers "$@" ;;
+        history) cmd_history "$@" ;;
+        doctor) cmd_doctor "$@" ;;
         kernel) cmd_kernel "$@" ;;
         dns) cmd_dns "$@" ;;
         ipv6) cmd_ipv6 "$@" ;;

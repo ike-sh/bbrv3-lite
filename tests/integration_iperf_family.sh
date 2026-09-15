@@ -13,8 +13,15 @@ V4_LOCAL=198.51.100.1
 V4_PEER=198.51.100.2
 V6_LOCAL=2001:db8:801::1
 V6_PEER=2001:db8:801::2
+V6_POLICY_SOURCE=2001:db8:802::1
+V6_POLICY_LINK=2001:db8:802::2
+V6_POLICY_PEER=2001:db8:803::2
 V4_PORT=5231
 V6_PORT=5232
+V6_POLICY_PORT=5233
+NHID_A=806101
+NHID_B=806102
+NHID_CHANGED=806103
 SERVER_PID=""
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -29,6 +36,13 @@ stop_server() {
 
 cleanup() {
     stop_server
+    ip -6 rule del to "$V6_POLICY_PEER/128" table 806 priority 805 >/dev/null 2>&1 || true
+    ip -6 rule del from "$V6_POLICY_SOURCE/128" table 806 priority 806 >/dev/null 2>&1 || true
+    ip -6 route del table 806 default >/dev/null 2>&1 || true
+    ip -6 route del default metric 32000 >/dev/null 2>&1 || true
+    ip nexthop del id "$NHID_CHANGED" >/dev/null 2>&1 || true
+    ip nexthop del id "$NHID_B" >/dev/null 2>&1 || true
+    ip nexthop del id "$NHID_A" >/dev/null 2>&1 || true
     ip link del "$HOST_IF" >/dev/null 2>&1 || true
     ip netns del "$NS_NAME" >/dev/null 2>&1 || true
     rm -rf -- "$TEST_ROOT"
@@ -59,9 +73,14 @@ ip netns exec "$NS_NAME" sysctl -qw net.ipv6.conf.lo.disable_ipv6=0
 
 ip addr add "$V4_LOCAL/30" dev "$HOST_IF"
 ip -6 addr add "$V6_LOCAL/64" dev "$HOST_IF" nodad
+ip -6 addr add "$V6_POLICY_SOURCE/64" dev "$HOST_IF" nodad preferred_lft 600 valid_lft 1200
+ip -6 addr add fe80::8061/64 dev "$HOST_IF" nodad
 ip link set "$HOST_IF" up
 ip -n "$NS_NAME" addr add "$V4_PEER/30" dev "$PEER_IF"
 ip -n "$NS_NAME" -6 addr add "$V6_PEER/64" dev "$PEER_IF" nodad
+ip -n "$NS_NAME" -6 addr add "$V6_POLICY_LINK/64" dev "$PEER_IF" nodad
+ip -n "$NS_NAME" -6 addr add fe80::8062/64 dev "$PEER_IF" nodad
+ip -n "$NS_NAME" -6 addr add "$V6_POLICY_PEER/128" dev lo nodad
 ip -n "$NS_NAME" link set "$PEER_IF" up
 ip -n "$NS_NAME" link set lo up
 
@@ -89,6 +108,7 @@ resolve_route_target_addresses() {
         dualstack.integration)
             printf '6\t%s\n4\t%s\n' "$V6_PEER" "$V4_PEER"
             ;;
+        "$V6_POLICY_PEER") printf '6\t%s\n' "$V6_POLICY_PEER" ;;
         "$V6_PEER") printf '6\t%s\n' "$V6_PEER" ;;
         "$V4_PEER") printf '4\t%s\n' "$V4_PEER" ;;
         *) return 1 ;;
@@ -150,5 +170,90 @@ MEASURE_IFACE="$HOST_IF"
 row=$(iperf_sample "$V6_PEER" "$V6_PORT" 2 1)
 is_decimal "$(cut -f1 <<< "$row")" || fail "real explicit IPv6 sample did not produce goodput"
 [[ "$(<"/proc/sys/net/ipv6/conf/${HOST_IF}/disable_ipv6")" == 0 ]] || fail "explicit IPv6 sample changed IPv6 state"
+
+stop_server
+measure_clear_peer_lock
+MEASURE_IFACE=""
+
+# Build an RA-like IPv6 default using a single nexthop object and link-local
+# gateway. A source-specific rule proves the selected source and policy table
+# are part of the frozen measurement path. Both veth ends use MTU 1400 so the
+# real IPv6 PMTU/MSS calculation is exercised as well.
+ip link set "$HOST_IF" mtu 1400
+ip -n "$NS_NAME" link set "$PEER_IF" mtu 1400
+ip nexthop add id "$NHID_A" via fe80::8062 dev "$HOST_IF"
+ip -6 route add default nhid "$NHID_A" src "$V6_POLICY_SOURCE" proto ra metric 32000
+ip -6 route add table 806 default nhid "$NHID_A" src "$V6_POLICY_SOURCE" proto ra metric 512
+ip -6 rule add to "$V6_POLICY_PEER/128" table 806 priority 805
+ip -6 rule add from "$V6_POLICY_SOURCE/128" table 806 priority 806
+
+route_output=$(ip -6 route get "$V6_POLICY_PEER" from "$V6_POLICY_SOURCE")
+[[ "$route_output" == *"dev $HOST_IF"* && "$route_output" == *"src $V6_POLICY_SOURCE"* && "$route_output" == *"table 806"* ]] ||
+    fail "IPv6 policy route did not preserve source/interface/table semantics: $route_output"
+fib_output=$(ip -6 route get fibmatch "$V6_POLICY_PEER" from "$V6_POLICY_SOURCE")
+[[ "$fib_output" == *"nhid $NHID_A"* ]] || fail "RA-like policy route did not expose its single nhid"
+[[ "$(nexthop_object_leaf_record "$NHID_A" integration-policy 6 | cut -f1-3)" == $HOST_IF$'\t'fe80::8062$'\t'6 ]] ||
+    fail "IPv6 single nhid did not resolve to the link-local leaf"
+
+ip netns exec "$NS_NAME" iperf3 -s -6 -B "$V6_POLICY_PEER" -p "$V6_POLICY_PORT" > "$TEST_ROOT/iperf6-policy.log" 2>&1 &
+SERVER_PID=$!
+for _ in 1 2 3 4 5; do
+    if timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$V6_POLICY_PEER" "$V6_POLICY_PORT" >/dev/null 2>&1; then break; fi
+    sleep 1
+done
+timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$V6_POLICY_PEER" "$V6_POLICY_PORT" >/dev/null 2>&1 ||
+    fail "policy-routed IPv6 iperf3 server did not start"
+
+export BBRV3_PATH_PMTU_CAP=1500
+measure_lock_peer "$V6_POLICY_PEER" "$HOST_IF" "$V6_POLICY_PORT" "" "$V6_POLICY_SOURCE"
+[[ "$MEASURE_PEER_FAMILY" == 6 && "$MEASURE_PEER_SOURCE" == "$V6_POLICY_SOURCE" ]] ||
+    fail "IPv6 policy endpoint did not freeze the requested source"
+MEASURE_IFACE="$HOST_IF"
+policy_route_before=$(ip -6 route get "$V6_POLICY_PEER" from "$V6_POLICY_SOURCE")
+policy_fib_before=$(ip -6 route get fibmatch "$V6_POLICY_PEER" from "$V6_POLICY_SOURCE")
+policy_identity_locked=$(path_capture_route_identity 6 "$V6_POLICY_PEER" "$V6_POLICY_SOURCE" "$HOST_IF")
+if measure_set_latency_baseline "$V6_POLICY_PEER" 3 1; then :; else
+    rc=$?
+    printf 'IPv6 route before profile: %s\n' "$policy_route_before" >&2
+    printf 'IPv6 route after profile:  %s\n' "$(ip -6 route get "$V6_POLICY_PEER" from "$V6_POLICY_SOURCE")" >&2
+    printf 'IPv6 fib before profile:   %s\n' "$policy_fib_before" >&2
+    printf 'IPv6 fib after profile:    %s\n' "$(ip -6 route get fibmatch "$V6_POLICY_PEER" from "$V6_POLICY_SOURCE")" >&2
+    printf 'Identity locked:           %s\n' "$policy_identity_locked" >&2
+    printf 'Identity after profile:    %s\n' "$(path_capture_route_identity 6 "$V6_POLICY_PEER" "$V6_POLICY_SOURCE" "$HOST_IF" || printf unavailable)" >&2
+    fail "policy-routed IPv6 path profile failed with rc=$rc"
+fi
+[[ "$PATH_PMTU" == 1400 && "$PATH_MSS" == 1340 ]] || fail "IPv6 PMTU/MSS was not measured as 1400/1340"
+policy_identity_before=$(path_capture_route_identity 6 "$V6_POLICY_PEER" "$V6_POLICY_SOURCE" "$HOST_IF")
+if row=$(iperf_sample "$V6_POLICY_PEER" "$V6_POLICY_PORT" 2 1); then :; else
+    rc=$?
+    printf 'IPv6 route before sample: %s\n' "$route_output" >&2
+    printf 'IPv6 route after sample:  %s\n' "$(ip -6 route get "$V6_POLICY_PEER" from "$V6_POLICY_SOURCE")" >&2
+    printf 'IPv6 fib after sample:    %s\n' "$(ip -6 route get fibmatch "$V6_POLICY_PEER" from "$V6_POLICY_SOURCE")" >&2
+    printf 'Identity before sample:   %s\n' "$policy_identity_before" >&2
+    printf 'Identity after sample:    %s\n' "$(path_capture_route_identity 6 "$V6_POLICY_PEER" "$V6_POLICY_SOURCE" "$HOST_IF" || printf unavailable)" >&2
+    fail "policy-routed IPv6 sample failed with rc=$rc"
+fi
+is_decimal "$(cut -f1 <<< "$row")" || fail "policy-routed IPv6 measurement did not produce goodput"
+
+# Address lifetime changes and nhid renumbering with the same resolved leaf
+# are presentation/control-plane churn, not forwarding-path changes.
+ip -6 addr change "$V6_POLICY_SOURCE/64" dev "$HOST_IF" nodad preferred_lft 300 valid_lft 900
+ip nexthop add id "$NHID_B" via fe80::8062 dev "$HOST_IF"
+ip -6 route replace default nhid "$NHID_B" src "$V6_POLICY_SOURCE" proto ra metric 32000
+ip -6 route replace table 806 default nhid "$NHID_B" src "$V6_POLICY_SOURCE" proto ra metric 512
+path_verify_route_identity || fail "address lifetime / equivalent nhid churn caused false path drift"
+
+# A real gateway-leaf change after the measurement lock must be rejected
+# before another iperf payload starts, even though it remains on the same dev.
+ip -n "$NS_NAME" -6 addr add fe80::8063/64 dev "$PEER_IF" nodad
+ip nexthop add id "$NHID_CHANGED" via fe80::8063 dev "$HOST_IF"
+ip -6 route replace default nhid "$NHID_CHANGED" src "$V6_POLICY_SOURCE" proto ra metric 32000
+ip -6 route replace table 806 default nhid "$NHID_CHANGED" src "$V6_POLICY_SOURCE" proto ra metric 512
+if iperf_sample "$V6_POLICY_PEER" "$V6_POLICY_PORT" 2 1 >/dev/null 2>&1; then
+    fail "real IPv6 gateway change during the locked measurement was accepted"
+else
+    rc=$?
+fi
+[[ "$rc" == "$MEASURE_ROUTE_MISMATCH_RC" ]] || fail "IPv6 route drift returned rc=$rc instead of $MEASURE_ROUTE_MISMATCH_RC"
 
 echo "iperf family integration test: OK ($HOST_IF)"

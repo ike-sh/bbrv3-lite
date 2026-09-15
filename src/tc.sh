@@ -511,8 +511,14 @@ qdisc_filter_guard() {
     qdisc_tree_filters_absent "$iface" || rc=$?
     case "$rc" in
         0) return 0 ;;
-        1) die "拒绝覆盖带外部 tc filter 的 root qdisc 树（$iface）；请先自行移除 filter" ;;
-        *) die "无法完整审计 $iface 的 root qdisc filter；拒绝修改" ;;
+        1)
+            declare -F failure_set >/dev/null && failure_set TC_OWNERSHIP tc-ownership-conflict "external root/class/leaf filter on $iface" || true
+            die "拒绝覆盖带外部 tc filter 的 root qdisc 树（$iface）；请先自行移除 filter"
+            ;;
+        *)
+            declare -F failure_set >/dev/null && failure_set TC_OWNERSHIP tc-ownership-conflict "filter audit unavailable on $iface" || true
+            die "无法完整审计 $iface 的 root qdisc filter；拒绝修改"
+            ;;
     esac
 }
 
@@ -818,6 +824,24 @@ managed_htb_diagnostic() {
     printf 'root-1=%s class-1:10=%s fq-10=%s rate=%sMbit' "$root" "$class" "$leaf" "$rate"
 }
 
+tc_ownership_conflict_report() {
+    local iface="$1" section output qdisc_text class_text selectors selector
+    for section in qdisc class; do
+        output=$(tc "$section" show dev "$iface" 2>&1 || printf '[unavailable]')
+        log ERR "$iface $section state:"
+        printf '%s\n' "$output" >&2
+    done
+    qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null || true)
+    class_text=$(tc class show dev "$iface" 2>/dev/null || true)
+    selectors=$(printf '%s\n%s\n' "$qdisc_text" "$class_text" | qdisc_tree_selectors_from_stream 2>/dev/null || true)
+    log ERR "$iface root-tree filter state:"
+    while IFS= read -r selector; do
+        [[ -n "$selector" && "$selector" != !* ]] || continue
+        output=$(tc filter show dev "$iface" parent "$selector" 2>&1 || printf '[unavailable]')
+        printf 'parent %s:\n%s\n' "$selector" "${output:-[none]}" >&2
+    done <<< "$selectors"
+}
+
 qdisc_guard() {
     local iface="$1" kind detail unsupported qdisc_text class_text rows class_rows expected_count class_count handle
     kind=$(root_qdisc_kind "$iface") || { die "无法读取 $iface 的 root qdisc"; return 1; }
@@ -852,10 +876,16 @@ qdisc_guard() {
             ;;
         htb)
             detail=$(managed_htb_diagnostic "$iface")
+            declare -F failure_set >/dev/null && failure_set TC_OWNERSHIP tc-ownership-conflict "root htb; $detail" || true
+            tc_ownership_conflict_report "$iface"
             die "拒绝覆盖未管理的 root qdisc 'htb'（$iface；$detail）"
             return 1
             ;;
         *)
+            qdisc_text=$(tc qdisc show dev "$iface" 2>/dev/null || true)
+            class_text=$(tc class show dev "$iface" 2>/dev/null || true)
+            declare -F failure_set >/dev/null && failure_set TC_OWNERSHIP tc-ownership-conflict "root=$kind; qdisc=${qdisc_text//$'\n'/ }; classes=${class_text//$'\n'/ }" || true
+            tc_ownership_conflict_report "$iface"
             die "拒绝覆盖未管理的 root qdisc '$kind'（$iface）；请先自行恢复或删除"
             return 1
             ;;

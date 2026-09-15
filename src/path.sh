@@ -63,7 +63,10 @@ path_route_normalize() {
                 # Route MTU is captured separately so a real PMTU change still
                 # changes the fingerprint.
                 if ($i=="cache") break
-                if ($i=="uid" || $i=="expires") {i++; continue}
+                # A nexthop object numeric ID is allocation metadata.  Its
+                # resolved leaf is validated separately and is the topology
+                # identity, so RA-driven ID churn must not look like drift.
+                if ($i=="uid" || $i=="expires" || $i=="nhid" || $i=="metric" || $i=="proto") {i++; continue}
                 value=$i
                 if (value==address) value="<target>"
                 out=(out=="" ? value : out " " value)
@@ -91,8 +94,9 @@ path_hash_payload() {
 # not look like an egress change. The endpoint fingerprint retains the literal.
 path_capture_route_identity() {
     local family="$1" address="$2" source="$3" iface="$4"
-    local route fib route_norm fib_norm gateway table iface_mtu route_mtu route_payload
+    local route fib gateway table iface_mtu route_mtu route_payload
     local route_fp endpoint_fp route_state fib_state route_iface fib_iface
+    local route_gateway route_gateway_family fib_gateway fib_gateway_family
     [[ "$family" == 4 || "$family" == 6 ]] || return 1
     measure_source_address_is_valid "$family" "$source" || return 1
     validate_interface_name "$iface" && [[ "$iface" != auto ]] || return 1
@@ -109,17 +113,28 @@ path_capture_route_identity() {
         return 1
     }
 
-    route_norm=$(path_route_normalize "$address" <<< "$route") || return 1
-    fib_norm=$(path_route_normalize "$address" <<< "$fib") || return 1
-    [[ -n "$route_norm" && -n "$fib_norm" ]] || return 1
-    gateway=$(path_token_after via <<< "$route"); gateway="${gateway:-none}"
-    table=$(path_token_after table <<< "$fib"); table="${table:-main}"
+    IFS=$'\t' read -r route_iface route_gateway route_gateway_family _ <<< "$route_state"
+    IFS=$'\t' read -r fib_iface fib_gateway fib_gateway_family _ <<< "$fib_state"
+    gateway="$route_gateway"; [[ "$gateway" != none ]] || gateway="$fib_gateway"
+    # route-get reports the table actually selected after policy lookup.  Some
+    # iproute2/kernel combinations intermittently omit the table token from
+    # fibmatch once a destination exception/cache entry exists, so use the
+    # selected route first and fibmatch only as a fallback.  Both records are
+    # still resolved and fail-closed above.
+    table=$(path_token_after table <<< "$route")
+    [[ -n "$table" ]] || table=$(path_token_after table <<< "$fib")
+    table="${table:-main}"
     iface_mtu=$(detect_mtu "$iface"); is_uint "$iface_mtu" || iface_mtu=unknown
     route_mtu=$(path_token_after mtu <<< "$route")
     if ! is_uint "${route_mtu:-}"; then route_mtu="$iface_mtu"; fi
 
-    route_payload=$(printf 'family=%s\nsource=%s\ninterface=%s\ngateway=%s\ntable=%s\ninterface_mtu=%s\nroute_mtu=%s\nroute_state=%s\nfib_state=%s\nroute=%s\nfib=%s\n' \
-        "$family" "$source" "$iface" "$gateway" "$table" "$iface_mtu" "$route_mtu" "$route_state" "$fib_state" "$route_norm" "$fib_norm") || return 1
+    # Only forwarding semantics are fingerprinted.  In particular, nhid,
+    # expires/cache, protocol and metric presentation are intentionally absent.
+    # route_unique_path_record above still resolves every nhid and rejects
+    # groups/ECMP/invalid leaves on every capture.
+    route_payload=$(printf 'family=%s\nsource=%s\ninterface=%s\ngateway=%s\ngateway_family=%s\ntable=%s\ninterface_mtu=%s\nroute_mtu=%s\nroute_leaf=%s|%s|%s\nfib_leaf=%s|%s|%s\n' \
+        "$family" "$source" "$iface" "$gateway" "$route_gateway_family" "$table" "$iface_mtu" "$route_mtu" \
+        "$route_iface" "$route_gateway" "$route_gateway_family" "$fib_iface" "$fib_gateway" "$fib_gateway_family") || return 1
     route_fp=$(path_hash_payload <<< "$route_payload") || return 1
     endpoint_fp=$(printf '%saddress=%s\n' "$route_payload" "$address" | path_hash_payload) || return 1
     [[ "$route_fp" =~ ^[0-9a-f]{64}$ && "$endpoint_fp" =~ ^[0-9a-f]{64}$ ]] || return 1

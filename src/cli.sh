@@ -7,7 +7,8 @@ show_help() {
 ${SCRIPT_NAME} v${SCRIPT_VERSION} - measured BBR/HTB/FQ tuning
 
 Usage:
-  ${0##*/} auto
+  ${0##*/} auto [--dry-run] [--interface DEV] [--measurement-profile quick|standard|strict]
+                 [--max-test-gib GIB] [--max-duration SEC] [--peer HOST]
   ${0##*/} detect [--interface DEV] [--target HOST]
   ${0##*/} install [--profile balanced|adaptive] [--role proxy|mixed|bulk]
                      [--bandwidth MBIT --rtt MS] [--interface DEV]
@@ -33,6 +34,12 @@ Usage:
   ${0##*/} measure sweep --peer HOST [--nominal MBIT] [--low MBIT --high MBIT]
                          [--step MBIT] [--duration 8] [--parallel 1]
                          [--margin 3] [--loss-threshold 0.1] [--cap MBIT] [--force-scan]
+                 Measurement commands accept --measurement-profile quick|standard|strict,
+                 --max-test-gib GIB and --max-duration SEC.
+  ${0##*/} peers [reset]
+  ${0##*/} history [latest|show ID|prune]
+  ${0##*/} doctor [--export [--include-addresses]]
+                 --include-addresses 只保留网络地址；hostname、MAC、机器身份和 secret 仍脱敏。
   ${0##*/} kernel status|install [--track lts|main]|remove
   ${0##*/} dns status|plan POLICY|apply POLICY|verify|restore
              POLICY: native|strict-dot|plain (aliases: auto|dot)
@@ -63,6 +70,73 @@ require_no_arguments() {
         die "$context 不接受额外参数: $*"
         return 1
     }
+}
+
+gib_to_bytes() {
+    local gib="$1" bytes
+    is_decimal "$gib" || { die "GiB 预算必须是正数"; return 1; }
+    bytes=$(awk -v g="$gib" 'BEGIN {if(g<0.01 || g>1024) exit 1; printf "%.0f",g*1073741824}') || {
+        die "GiB 预算必须在 0.01–1024 之间"; return 1;
+    }
+    is_uint "$bytes" || return 1
+    printf '%s\n' "$bytes"
+}
+
+cmd_auto() {
+    local dry_run=0 requested=auto measurement_profile=standard max_gib=6 max_duration=900 peer="" max_bytes
+    while (($#)); do
+        case "$1" in
+            --dry-run) dry_run=1; shift ;;
+            --interface) require_option_value "$@" || return 1; requested="$2"; shift 2 ;;
+            --measurement-profile) require_option_value "$@" || return 1; measurement_profile="$2"; shift 2 ;;
+            --max-test-gib) require_option_value "$@" || return 1; max_gib="$2"; shift 2 ;;
+            --max-duration) require_option_value "$@" || return 1; max_duration="$2"; shift 2 ;;
+            --peer) require_option_value "$@" || return 1; peer="$2"; shift 2 ;;
+            *) die "auto 不支持参数: $1"; return 1 ;;
+        esac
+    done
+    validate_interface_name "$requested" || { die "非法 --interface"; return 1; }
+    measurement_profile_configure "$measurement_profile" || return 1
+    max_bytes=$(gib_to_bytes "$max_gib") || return 1
+    is_uint "$max_duration" && (( max_duration >= 30 && max_duration <= 86400 )) || { die "--max-duration 必须是 30–86400 秒"; return 1; }
+    if (( dry_run )); then auto_dry_run "$requested" "$measurement_profile" "$max_bytes" "$max_duration" "$peer"; return; fi
+    [[ -z "$peer" ]] || { die "非 dry-run 的 auto 仍通过交互界面选择对端；--peer 仅用于只读规划"; return 1; }
+    AUTO_MEASUREMENT_PROFILE="$measurement_profile"; AUTO_MAX_TX_BYTES="$max_bytes"; AUTO_MAX_DURATION_SECONDS="$max_duration"
+    AUTO_REQUESTED_INTERFACE="$requested"
+    auto_tune_wizard
+}
+
+cmd_peers() {
+    local action="${1:-show}"; (($# == 0)) || shift
+    case "$action" in
+        show) require_no_arguments "peers" "$@" || return 1; peers_show ;;
+        reset) require_no_arguments "peers reset" "$@" || return 1; peers_reset ;;
+        *) die "peers 子命令应为 reset（无参数时只读显示）" ;;
+    esac
+}
+
+cmd_history() {
+    local action="${1:-list}"; (($# == 0)) || shift
+    case "$action" in
+        list) require_no_arguments "history" "$@" || return 1; history_list ;;
+        latest) require_no_arguments "history latest" "$@" || return 1; history_latest ;;
+        show) (($# == 1)) || { die "history show 需要一个 ID"; return 1; }; history_show "$1" ;;
+        prune) require_no_arguments "history prune" "$@" || return 1; history_prune ;;
+        *) die "history 子命令应为 latest/show/prune" ;;
+    esac
+}
+
+cmd_doctor() {
+    local export_bundle=0 include_addresses=0
+    while (($#)); do
+        case "$1" in
+            --export) export_bundle=1; shift ;;
+            --include-addresses) include_addresses=1; shift ;;
+            *) die "doctor 不支持参数: $1"; return 1 ;;
+        esac
+    done
+    (( include_addresses == 0 || export_bundle == 1 )) || { die "--include-addresses 必须与 --export 一起使用"; return 1; }
+    if (( export_bundle )); then doctor_export "$include_addresses"; else doctor_report; fi
 }
 
 parse_common_profile_options() {
@@ -216,6 +290,7 @@ cmd_measure() {
     local action="${1:-}"; shift || true
     local peer="" port=5201 iface=auto duration=10 parallel=4 nominal=0 low=0 high=0 step=0 margin=3 threshold=0.1 force=0 cap=0
     local rate=0 rounds=2 samples=7 pmtu=1
+    local measurement_profile=standard max_gib=6 max_duration=900 max_bytes
     if [[ "$action" == deps ]]; then
         require_no_arguments "measure deps" "$@" || return 1
         install_measure_dependencies
@@ -227,6 +302,9 @@ cmd_measure() {
     while (($#)); do
         case "$1" in
             --peer) require_option_value "$@" || return 1; peer="$2"; shift 2 ;;
+            --measurement-profile) require_option_value "$@" || return 1; measurement_profile="$2"; shift 2 ;;
+            --max-test-gib) require_option_value "$@" || return 1; max_gib="$2"; shift 2 ;;
+            --max-duration) require_option_value "$@" || return 1; max_duration="$2"; shift 2 ;;
             --port)
                 [[ "$action" != path ]] || { die "measure path 不使用 --port"; return 1; }
                 require_option_value "$@" || return 1; port="$2"; shift 2
@@ -271,6 +349,9 @@ cmd_measure() {
         esac
     done
     [[ -n "$peer" ]] || { die "需要 --peer HOST"; return 1; }
+    measurement_profile_configure "$measurement_profile" || return 1
+    max_bytes=$(gib_to_bytes "$max_gib") || return 1
+    measurement_budget_configure "$max_bytes" "$max_duration" || return 1
     if [[ "$action" == path ]]; then
         is_uint "$samples" && (( samples >= 3 && samples <= 20 )) || { die "measure path --samples 必须是 3–20"; return 1; }
     fi
@@ -393,12 +474,12 @@ activate_public_peer_candidate() {
 }
 
 interactive_select_peer() {
-    local choice spec rtt
+    local choice spec rtt requested="${AUTO_REQUESTED_INTERFACE:-auto}"
     printf '%s\n' '测速对端：' '  1) 自动选择公共节点（Leaseweb / OVH / Clouvider）' '  2) 自有 iperf3 服务器（推荐）'
     read -r -p '选择 [1]: ' choice || return 1
     case "${choice:-1}" in
         1)
-            auto_pick_peer auto || return 1
+            auto_pick_peer "$requested" || return 1
             WIZARD_PUBLIC_PEER=1; WIZARD_FAILOVERS=0
             activate_public_peer_candidate 0 || return 1
             return 0
@@ -409,7 +490,7 @@ interactive_select_peer() {
         *) die "无效对端选择"; return 1 ;;
     esac
     parse_peer_spec "$spec" || return 1
-    measure_lock_peer "$PEER_HOST" auto "$PEER_PORT" || return $?
+    measure_lock_peer "$PEER_HOST" "$requested" "$PEER_PORT" || return $?
     WIZARD_PUBLIC_PEER=0; WIZARD_PEER="$PEER_HOST"; WIZARD_PORT="$PEER_PORT"
     WIZARD_PEER_ADDRESS="$MEASURE_PEER_ADDRESS"; WIZARD_PEER_FAMILY="$MEASURE_PEER_FAMILY"
     WIZARD_PEER_SOURCE="$MEASURE_PEER_SOURCE"; WIZARD_PEER_IFACE="$MEASURE_PEER_IFACE"
@@ -419,7 +500,8 @@ interactive_select_peer() {
 }
 
 auto_measure_with_peer_failover() {
-    local iface="$1" nominal="$2" index=0 count=1 rc
+    local iface="$1" nominal="$2" index=0 count=1 rc last_rc=1 attempted=0
+    local unavailable=0 busy=0 dirty=0 unstable=0 reason summary
     local duration="${WIZARD_SAMPLE_DURATION:-5}" cap="${WIZARD_SCAN_CAP:-5000}"
     if (( ${WIZARD_PUBLIC_PEER:-0} )); then count=${#PUBLIC_PEER_CANDIDATES[@]}; fi
     for ((index=0; index<count; index++)); do
@@ -456,15 +538,30 @@ auto_measure_with_peer_failover() {
         else
             rc=$?
         fi
-        if (( ${WIZARD_PUBLIC_PEER:-0} && (rc == IPERF_UNAVAILABLE_RC || rc == MEASURE_PATH_QUALITY_RC || rc == MEASURE_ROUTE_MISMATCH_RC || rc == IPERF_UNSTABLE_RC || rc == IPERF_CONTAMINATED_RC || rc == 2) )); then
+        last_rc="$rc"; ((attempted+=1))
+        summary="${MEASURE_RUN_DIR:-}/summary.tsv"
+        reason=""; [[ -f "$summary" ]] && reason=$(summary_value "$summary" FAILURE_REASON)
+        case "$reason" in
+            peer-busy) ((busy+=1)) ;;
+            peer-unavailable|peer-timeout|peer-reset|protocol-failure) ((unavailable+=1)) ;;
+            path-dirty) ((dirty+=1)) ;;
+            *) ((unstable+=1)) ;;
+        esac
+        if (( ${WIZARD_PUBLIC_PEER:-0} )) && [[ "$(operation_rc_class "$rc")" == peer-failover ]]; then
             (( rc != MEASURE_PATH_QUALITY_RC )) || log WARN "当前公共对端低速 path control 判定 PATH_DIRTY；下一个候选将重新执行完整实验"
             (( index + 1 < count )) && continue
             break
         fi
         return "$rc"
     done
-    die "所有公共 iperf3 对端均不可用、过慢、路径不干净或测量不稳定；请稍后重试或使用自有 iperf3 服务器"
-    return 1
+    printf '\n公共测速失败\n\n'
+    printf '%-20s %s\n' Candidates "$count" 'Candidates tried' "$attempted/$count" Unavailable "$unavailable" \
+        Busy "$busy" 'Dirty path' "$dirty" Unstable "$unstable" 'Successful sweep' 0 \
+        'Traffic used' "$(human_bytes "${TEST_TX_BYTES_USED:-0}") TX" \
+        Rollback 'temporary qdisc complete; outer transaction will restore' 'Persistent changes' none
+    printf '\n建议:\n  1. 稍后重试\n  2. 使用自有 iperf3 服务端\n  3. 运行 bbr doctor 查看诊断\n'
+    log ERR "所有公共 iperf3 对端均不可用、过慢、路径不干净或测量不稳定"
+    return "$last_rc"
 }
 
 auto_verify_with_peer_failover() {
@@ -626,7 +723,7 @@ auto_tune_execute() {
         log INFO "扫描未发现可信拐点（NO_KNEE=${no_knee:-1}），保持 BBR + FQ，不启用 HTB"
     fi
     verify_runtime_tuning "$iface" || return 1
-    if auto_verify_with_peer_failover "$iface" 6 "$expected_rate" "$min_efficiency" "$clean_reference_loss"; then
+    if auto_verify_with_peer_failover "$iface" "$(measurement_profile_verify_duration 6)" "$expected_rate" "$min_efficiency" "$clean_reference_loss"; then
         verify_summary="$MEASURE_RUN_DIR/summary.tsv"
         verify_path_fingerprint=$(summary_value "$verify_summary" PATH_ROUTE_FINGERPRINT)
         [[ "$verify_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
@@ -690,19 +787,61 @@ auto_tune_execute() {
     log INFO "扫描记录: $summary"
 }
 
+auto_first_sample_budget_prepare() {
+    local mode="$1" nominal="$2" cap="$3" base_duration="$4" plan
+    plan=$(measurement_first_sample_plan "$mode" "$nominal" "$cap" "$base_duration") || return 1
+    IFS=$'\t' read -r AUTO_FIRST_SAMPLE_STAGE AUTO_FIRST_SAMPLE_RATE AUTO_FIRST_SAMPLE_DURATION \
+        _ _ AUTO_FIRST_SAMPLE_RESERVED_BYTES AUTO_FIRST_SAMPLE_RESERVED_SECONDS <<< "$plan"
+}
+
+auto_first_sample_budget_gate() {
+    local max_bytes="$1" max_duration="$2" mode="$3" nominal="$4" cap="$5" base_duration="$6" rc=0
+    auto_first_sample_budget_prepare "$mode" "$nominal" "$cap" "$base_duration" || return 1
+    [[ "$AUTO_FIRST_SAMPLE_STAGE" == NONE ]] && return 0
+    if measurement_first_sample_budget_check "$max_bytes" "$max_duration" "$mode" "$nominal" "$cap" "$base_duration"; then
+        return 0
+    else
+        rc=$?
+    fi
+    (( rc == MEASURE_BUDGET_RC )) || return "$rc"
+    printf '\n执行摘要\n'
+    printf '  硬流量预算      %s TX\n' "$(human_bytes "$max_bytes")"
+    printf '  首样本安全预留  %s TX（%s %s Mbit/s × %ss）\n' \
+        "$(human_bytes "$AUTO_FIRST_SAMPLE_RESERVED_BYTES")" "$AUTO_FIRST_SAMPLE_STAGE" \
+        "$AUTO_FIRST_SAMPLE_RATE" "$AUTO_FIRST_SAMPLE_DURATION"
+    printf '  首样本时间预留  %ss / hard limit %ss\n' "$AUTO_FIRST_SAMPLE_RESERVED_SECONDS" "$max_duration"
+    log ERR "MEASUREMENT_BUDGET_EXCEEDED：当前预算不足以安全启动第一次吞吐采样"
+    log INFO "请提高 --max-test-gib（必须大于首样本安全预留）；不要降低安全余量"
+    log INFO "未创建调优 transaction、未写入 baseline、未修改 sysctl/qdisc，也未启动 iperf"
+    return "$MEASURE_BUDGET_RC"
+}
+
 auto_tune_run_transaction() {
-    local iface="$1" rc rollback_rc=0
+    local iface="$1" nominal="$4" rc rollback_rc=0 failure_dir="" measurement_mode=none
+    if [[ -n "${WIZARD_PEER:-}" ]]; then
+        if (( nominal > 0 )); then measurement_mode=known; else measurement_mode=auto; fi
+    fi
+    if auto_first_sample_budget_gate "${AUTO_MAX_TX_BYTES:-6442450944}" "${AUTO_MAX_DURATION_SECONDS:-900}" \
+        "$measurement_mode" "$nominal" "${WIZARD_SCAN_CAP:-5000}" "${WIZARD_SAMPLE_DURATION:-5}"; then :
+    else
+        rc=$?; return "$rc"
+    fi
     action_transaction_begin_multi "$iface" || return 1
     action_transaction_mark_mutated || { action_transaction_discard_snapshot || true; return 1; }
     if auto_tune_execute "$@"; then
         action_transaction_commit
         return
     else
-        rc=$?
+        rc=$?; failure_dir="${MEASURE_RUN_DIR:-}"
     fi
     log WARN "自动调优未完成，正在恢复开始前状态"
     action_transaction_rollback || rollback_rc=$?
-    (( rollback_rc == 0 )) || return "$rollback_rc"
+    if [[ -n "$failure_dir" && -f "$failure_dir/summary.tsv" ]] && declare -F failure_finalize_outer_rollback >/dev/null; then
+        failure_finalize_outer_rollback "$failure_dir/summary.tsv" "$rc" "$rollback_rc" || \
+            log WARN "最终 failure summary 原子更新失败；保留原始 history 与事务证据"
+        failure_summary_print "$failure_dir/summary.tsv" 1 || true
+    fi
+    (( rollback_rc == 0 )) || return "$ROLLBACK_FAILURE_RC"
     return "$rc"
 }
 
@@ -712,23 +851,38 @@ auto_tune_wizard() {
     require_systemd_runtime || return 1
     [[ -t 0 ]] || { die "auto 向导需要交互终端"; return 1; }
     local bandwidth_input nominal=0 role_choice role=mixed peer_rtt=0 tuning_rtt=0 profile=balanced estimate="动态估算" iface
+    local measurement_profile="${AUTO_MEASUREMENT_PROFILE:-standard}" max_tx_bytes="${AUTO_MAX_TX_BYTES:-6442450944}"
+    local max_duration="${AUTO_MAX_DURATION_SECONDS:-900}" requested="${AUTO_REQUESTED_INTERFACE:-auto}" estimate_bytes=0
+    local measurement_mode=auto
     local backup_count=0 candidate_index candidate tmp_iface
     WIZARD_PEER=""; WIZARD_PORT=5201; WIZARD_PUBLIC_PEER=0; WIZARD_PUBLIC_INDEX=0; WIZARD_PEER_RTT=0; WIZARD_FAILOVERS=0; WIZARD_ROUTE_GUARD_ACTIVE=0
     WIZARD_PEER_ADDRESS=""; WIZARD_PEER_FAMILY=""; WIZARD_PEER_SOURCE=""; WIZARD_PEER_IFACE=""
     nic_auto_policy_reset
     WIZARD_SWEEP_PEER=""; WIZARD_SWEEP_PORT=0; WIZARD_SWEEP_ADDRESS=""; WIZARD_SWEEP_FAMILY=""; WIZARD_SWEEP_SOURCE=""; WIZARD_SWEEP_IFACE=""
     WIZARD_SCAN_CAP=5000; WIZARD_SAMPLE_DURATION=5
+    measurement_profile_configure "$measurement_profile" || return 1
     printf '\n%s v%s 自动调优\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
     printf '首次修改前会保存不可覆盖的基线：%s\n' "$BASELINE_DIR"
     printf '包含本工具涉及的 sysctl、配置/服务、qdisc/class，以及 IPv4/IPv6 路由快照。\n\n'
-    ensure_interactive_measure_dependencies || return 1
-
     read -r -p '标称带宽 Mbit/s（a=自动测量，0=仅安装 BBR+FQ）[a]: ' bandwidth_input || return 1
     bandwidth_input="${bandwidth_input:-a}"
     if [[ "$bandwidth_input" != a && "$bandwidth_input" != auto ]]; then
         is_uint "$bandwidth_input" && (( bandwidth_input <= 1000000 )) || { die "带宽必须是非负整数或 a"; return 1; }
         nominal="$bandwidth_input"
     fi
+    if [[ "$bandwidth_input" == a || "$bandwidth_input" == auto ]]; then measurement_mode=auto
+    elif (( nominal > 0 )); then measurement_mode=known
+    else measurement_mode=none
+    fi
+    iface=$(detect_interface "$requested") || return 1
+    WIZARD_SCAN_CAP=$(recommended_scan_cap "$iface" "$nominal") || return 1
+    WIZARD_SAMPLE_DURATION=$(recommended_measure_duration "$iface" "$nominal") || return 1
+    if auto_first_sample_budget_gate "$max_tx_bytes" "$max_duration" "$measurement_mode" "$nominal" \
+        "$WIZARD_SCAN_CAP" "$WIZARD_SAMPLE_DURATION"; then :
+    else
+        return $?
+    fi
+    ensure_interactive_measure_dependencies || return 1
 
     if [[ "$nominal" != 0 || "$bandwidth_input" == a || "$bandwidth_input" == auto ]]; then
         interactive_select_peer || return 1
@@ -744,15 +898,22 @@ auto_tune_wizard() {
     case "${role_choice:-1}" in 1) role=mixed ;; 2) role=proxy ;; 3) role=bulk ;; *) die "无效用途"; return 1 ;; esac
     tuning_rtt=$(recommended_tuning_rtt "$role" "$peer_rtt") || return 1
     iface="${WIZARD_PEER_IFACE:-}"
-    [[ -n "$iface" ]] || iface=$(detect_interface auto) || return 1
+    [[ -n "$iface" ]] || iface=$(detect_interface "$requested") || return 1
+    WIZARD_SCAN_CAP=$(recommended_scan_cap "$iface" "$nominal") || return 1
+    WIZARD_SAMPLE_DURATION=$(recommended_measure_duration "$iface" "$nominal") || return 1
+    if auto_first_sample_budget_gate "$max_tx_bytes" "$max_duration" "$measurement_mode" "$nominal" \
+        "$WIZARD_SCAN_CAP" "$WIZARD_SAMPLE_DURATION"; then :
+    else
+        return $?
+    fi
     auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-}" || return 1
     shaping_target_preflight "$iface" auto auto || return 1
     WIZARD_ROUTE_GUARD_ACTIVE=1
-    WIZARD_SCAN_CAP=$(recommended_scan_cap "$iface" "$nominal") || return 1
-    WIZARD_SAMPLE_DURATION=$(recommended_measure_duration "$iface" "$nominal") || return 1
     if (( nominal > 0 && tuning_rtt > 0 )); then
         profile=adaptive
-        estimate="约 $(human_bytes "$(estimate_sweep_bytes "$((nominal * 13 / 10))" "$WIZARD_SAMPLE_DURATION" 20)") 上行"
+        estimate_bytes=$(estimate_measurement_plan_bytes "$((nominal * 40 / 100))" "$WIZARD_SAMPLE_DURATION" "$nominal" "$WIZARD_SAMPLE_DURATION" "$((nominal * 13 / 10))" "$WIZARD_SAMPLE_DURATION" "$((WIZARD_SAMPLE_DURATION+2))" 0)
+        (( estimate_bytes > max_tx_bytes )) && estimate_bytes="$max_tx_bytes"
+        estimate="≤ $(human_bytes "$estimate_bytes") 上行（正常上界；peer failure retries 仍计入硬预算）"
     elif [[ -n "${WIZARD_PEER:-}" ]]; then
         estimate="将按实测带宽动态计算，扫描上限 ${WIZARD_SCAN_CAP} Mbit/s"
     else
@@ -765,6 +926,7 @@ auto_tune_wizard() {
     printf '  硬件模型        %s / %s CPU / %s MiB / RX:TX %s:%s\n' "$HARDWARE_CLASS" "$HARDWARE_CPU_COUNT" "$HARDWARE_MEMORY_MB" "$HARDWARE_RX_QUEUES" "$HARDWARE_TX_QUEUES"
     printf '  链路/采样       %s Mbit（%s）/ %ss\n' "$HARDWARE_LINK_MBIT" "$HARDWARE_LINK_TRUST" "$WIZARD_SAMPLE_DURATION"
     printf '  扫描策略        初始上限 %s Mbit；自动测量后可按基准扩展\n' "$WIZARD_SCAN_CAP"
+    printf '  测量深度        %s\n' "$measurement_profile"
     printf '  标称带宽        %s\n' "$([[ "$bandwidth_input" == a || "$bandwidth_input" == auto ]] && echo 自动测量 || echo "${nominal} Mbit/s")"
     if [[ -n "${WIZARD_PEER:-}" ]]; then
         printf '  iperf3 对端     %s:%s（测速 RTT %sms）\n' "$WIZARD_PEER" "$WIZARD_PORT" "${peer_rtt:-unknown}"
@@ -781,9 +943,19 @@ auto_tune_wizard() {
         printf '  缓冲区调优 RTT  %sms（按用途下限与测速 RTT 取较大值）\n' "$tuning_rtt"
     fi
     printf '  预计时间/流量   约 3–8 分钟 / %s\n' "$estimate"
+    printf '  硬流量预算      %s TX\n' "$(human_bytes "$max_tx_bytes")"
+    if [[ "$AUTO_FIRST_SAMPLE_STAGE" == NONE ]]; then
+        printf '  首样本安全预留  不运行测速\n'
+    else
+        printf '  首样本安全预留  %s TX（%s %s Mbit/s × %ss）\n' \
+            "$(human_bytes "$AUTO_FIRST_SAMPLE_RESERVED_BYTES")" "$AUTO_FIRST_SAMPLE_STAGE" \
+            "$AUTO_FIRST_SAMPLE_RATE" "$AUTO_FIRST_SAMPLE_DURATION"
+    fi
+    printf '  时间预算        %ss\n' "$max_duration"
     printf '  持久化位置      %s + %s\n' "$CONFIG_FILE" "$SERVICE_FILE"
     confirm "确认开始？" || { log INFO "已取消，未修改系统"; return 0; }
 
+    measurement_budget_configure "$max_tx_bytes" "$max_duration" || return 1
     qdisc_guard "$iface" || return 1
     BANDWIDTH_MBIT="$nominal"; network_tuning_preflight "$iface" 1 || return 1
     auto_tune_run_transaction "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" "$peer_rtt"
@@ -854,6 +1026,27 @@ measurement_menu() {
         read -r -p '选择: ' choice || return 0
         case "$choice" in
             1|2|3|4|5) submenu_run measurement_action "$choice" || return 90 ;;
+            0) return 0 ;;
+            *) invalid_menu_choice ;;
+        esac
+    done
+}
+
+diagnostics_menu() {
+    local choice id
+    while true; do
+        ui_clear
+        printf '%s\n' '状态 / 诊断' '1) 完整状态与一致性验证' '2) Doctor（只读）' \
+            '3) 测量历史' '4) 查看公共 peer 健康' '5) 导出脱敏诊断包' '6) 清理旧测量历史' '7) 重置 peer 健康缓存' '0) 返回主菜单'
+        read -r -p '选择: ' choice || return 0
+        case "$choice" in
+            1) submenu_run status_and_verify_action ;;
+            2) submenu_run doctor_report ;;
+            3) submenu_run history_list ;;
+            4) submenu_run peers_show ;;
+            5) submenu_run doctor_export 0 ;;
+            6) if confirm '仅保留最近的测量历史？'; then submenu_run history_prune; else log INFO "已取消"; ui_pause; fi ;;
+            7) if confirm '仅重置本机 peer health cache？'; then submenu_run peers_reset; else log INFO "已取消"; ui_pause; fi ;;
             0) return 0 ;;
             *) invalid_menu_choice ;;
         esac
@@ -981,14 +1174,14 @@ interactive_menu() {
         ui_clear
         printf '\n%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
         printf '%s\n' '1) 自动调优（推荐）' '2) 安装/刷新 BBR + FQ' '3) 测量与复验' '4) 多网卡 / TC 管理' \
-            '5) 完整状态与一致性验证' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复/更新/卸载' '0) 退出'
+            '5) 状态 / 诊断' '6) XanMod 内核管理' '7) DNS 管理' '8) IPv6 管理' '9) 恢复/更新/卸载' '0) 退出'
         read -r -p '选择: ' choice || return 0
         case "$choice" in
             1) submenu_run auto_tune_wizard ;;
             2) submenu_run cmd_install ;;
             3) if ! menu_run measurement_menu; then return 0; fi ;;
             4) if ! menu_run tc_menu; then return 0; fi ;;
-            5) submenu_run status_and_verify_action ;;
+            5) if ! menu_run diagnostics_menu; then return 0; fi ;;
             6) if ! menu_run kernel_menu; then return 0; fi ;;
             7) if ! menu_run dns_menu; then return 0; fi ;;
             8) if ! menu_run ipv6_menu; then return 0; fi ;;
@@ -1007,7 +1200,7 @@ main() {
         return
     fi
     case "$command" in
-        auto) require_no_arguments "auto" "$@" || return 1; auto_tune_wizard ;;
+        auto) cmd_auto "$@" ;;
         detect) cmd_detect "$@" ;;
         install) cmd_install "$@" ;;
         explain) cmd_explain "$@" ;;
@@ -1015,6 +1208,9 @@ main() {
         tc) cmd_tc "$@" ;;
         nic) cmd_nic "$@" ;;
         measure) cmd_measure "$@" ;;
+        peers) cmd_peers "$@" ;;
+        history) cmd_history "$@" ;;
+        doctor) cmd_doctor "$@" ;;
         kernel) cmd_kernel "$@" ;;
         dns) cmd_dns "$@" ;;
         ipv6) cmd_ipv6 "$@" ;;

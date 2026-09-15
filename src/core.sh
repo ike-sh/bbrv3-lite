@@ -7,6 +7,7 @@ STATE_DIR="${BBRV3_STATE_DIR:-/var/lib/bbrv3-lite}"
 BASELINE_DIR="${BBRV3_BASELINE_DIR:-${STATE_DIR}/baseline}"
 LEGACY_BACKUP_DIR="${BBRV3_LEGACY_BACKUP_DIR:-${STATE_DIR}/original}"
 HISTORY_DIR="${BBRV3_HISTORY_DIR:-${STATE_DIR}/history}"
+PEER_HEALTH_DIR="${BBRV3_PEER_HEALTH_DIR:-${STATE_DIR}/peer-health}"
 PERSIST_DIR="${BBRV3_PERSIST_DIR:-/usr/local/lib/bbrv3-lite}"
 PERSIST_SCRIPT="${BBRV3_PERSIST_SCRIPT:-${PERSIST_DIR}/net-tcp-tune.sh}"
 SERVICE_NAME="bbrv3-lite.service"
@@ -20,6 +21,8 @@ IPV6_BACKUP_DIR="${BBRV3_IPV6_BACKUP_DIR:-${STATE_DIR}/ipv6}"
 STANDARD_NIC_POLICY_DIR="/etc/bbrv3-lite/interfaces.d"
 NIC_POLICY_DIR="${BBRV3_NIC_POLICY_DIR:-$STANDARD_NIC_POLICY_DIR}"
 NIC_STATE_DIR="${BBRV3_NIC_STATE_DIR:-${STATE_DIR}/interfaces}"
+DIAGNOSTIC_TEMP_DIR=""
+DIAGNOSTIC_TEMP_ARCHIVE=""
 
 COLOR_ENABLED=0
 if [[ -t 1 && "${NO_COLOR:-}" == "" ]]; then COLOR_ENABLED=1; fi
@@ -170,6 +173,16 @@ cleanup_core() {
     if [[ -n "${ACTION_TRANSACTION_DIR:-}" ]] && declare -F action_transaction_rollback >/dev/null; then
         log WARN "进程退出时仍有未提交事务，正在恢复操作前状态"
         action_transaction_rollback || cleanup_rc=1
+    fi
+    if [[ -n "${DIAGNOSTIC_TEMP_DIR:-}" && -d "$DIAGNOSTIC_TEMP_DIR" ]] &&
+       [[ "$DIAGNOSTIC_TEMP_DIR" == /tmp/.bbrv3-lite-diagnostic.* ]]; then
+        rm -rf -- "$DIAGNOSTIC_TEMP_DIR" || cleanup_rc=1
+        DIAGNOSTIC_TEMP_DIR=""
+    fi
+    if [[ -n "${DIAGNOSTIC_TEMP_ARCHIVE:-}" ]] &&
+       [[ "$DIAGNOSTIC_TEMP_ARCHIVE" == /tmp/.bbrv3-lite-diagnostic-archive.* ]]; then
+        rm -f -- "$DIAGNOSTIC_TEMP_ARCHIVE" || cleanup_rc=1
+        DIAGNOSTIC_TEMP_ARCHIVE=""
     fi
     release_lock || cleanup_rc=1
     (( rc != 0 )) && return "$rc"

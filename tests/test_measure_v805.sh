@@ -80,7 +80,9 @@ test_real_200m_regression() (
     assert_between "$(summary_value "$summary" SCAN_HIGH_MBIT)" 220 260 "200M scan high"
     assert_between "$(summary_value "$summary" KNEE_MBIT)" 208 211 "200M knee"
     assert_between "$(summary_value "$summary" RECOMMEND)" 199 206 "200M recommendation"
-    assert_between "$(summary_value "$summary" PLANNED_SAMPLE_UPPER_BOUND)" 1 32 "200M sample bound"
+    # v8.0.6 expands only the estimate to include the mandatory single/multi
+    # final verify; the frozen v8.0.5 sweep state machine itself is unchanged.
+    assert_between "$(summary_value "$summary" PLANNED_SAMPLE_UPPER_BOUND)" 1 38 "200M sample bound including final verify"
     assert_between "$(summary_value "$summary" ESTIMATED_TRAFFIC_BYTES_UPPER_BOUND)" 1 5000000000 "200M traffic bound"
 )
 

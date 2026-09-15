@@ -12,7 +12,7 @@ for file in src/*.sh scripts/*.sh tests/*.sh install-alias.sh; do bash -n "$file
 bash -n net-tcp-tune.sh
 
 echo "==> Generated artifact markers"
-grep -Fq 'SCRIPT_VERSION="8.0.5"' net-tcp-tune.sh
+grep -Fq 'SCRIPT_VERSION="8.0.6"' net-tcp-tune.sh
 grep -Fq 'Configuration is data and is never sourced' net-tcp-tune.sh
 grep -Fq 'MEASURE_PEER_PORT=""' net-tcp-tune.sh
 grep -Fq 'LOCKED_PORT' net-tcp-tune.sh
@@ -59,6 +59,17 @@ grep -Fq 'nic_restore_runtime_snapshot' net-tcp-tune.sh
 grep -Fq 'action_transaction_discard_snapshot' net-tcp-tune.sh
 grep -Fq 'root_qdisc_snapshot_matches' net-tcp-tune.sh
 grep -Fq 'qdisc_filter_guard' net-tcp-tune.sh
+grep -Fq 'peer_health_score' net-tcp-tune.sh
+grep -Fq 'measurement_budget_check' net-tcp-tune.sh
+grep -Fq 'measurement_budget_reserve_sample' net-tcp-tune.sh
+grep -Fq 'measurement_first_sample_budget_check' net-tcp-tune.sh
+grep -Fq 'Minimum first-sample budget' net-tcp-tune.sh
+grep -Fq 'MEASUREMENT_PROFILE="standard"' net-tcp-tune.sh
+grep -Fq 'measurement_environment_preflight' net-tcp-tune.sh
+grep -Fq 'failure_pending_write' net-tcp-tune.sh
+grep -Fq 'history_prune_internal' net-tcp-tune.sh
+grep -Fq 'doctor_export' net-tcp-tune.sh
+grep -Fq 'auto_dry_run' net-tcp-tune.sh
 grep -Fq 'mq_snapshot_queue_preflight' net-tcp-tune.sh
 grep -Fq 'mq_class_rows_validate' net-tcp-tune.sh
 grep -Fq 'managed_htb_topology_from_stream' net-tcp-tune.sh

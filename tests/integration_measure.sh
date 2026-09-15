@@ -52,7 +52,7 @@ aggregate=$(sample_repeated 127.0.0.1 5209 3 1 2 integration)
 [[ "$(cut -f13 <<< "$aggregate")" == 2 ]] || { echo "FAIL: repeated sample count mismatch" >&2; exit 1; }
 [[ "$(wc -l < "$MEASURE_RESULT_FILE")" == 3 ]] || { echo "FAIL: measurement history row count mismatch" >&2; exit 1; }
 grep -Fq $'SENDER_MBIT\tRECEIVER_MBIT\tRETRANSMITS\tSENDER_BYTES\tRECEIVER_BYTES\tRETRANS_RATIO_EST_PERCENT\tRETRANS_PER_GIB\tRECEIVER_FALLBACK' "$MEASURE_RESULT_FILE" || {
-    echo "FAIL: v8.0.5 sender/receiver measurement history columns missing" >&2
+    echo "FAIL: v8.0.6 sender/receiver measurement history columns missing" >&2
     exit 1
 }
 

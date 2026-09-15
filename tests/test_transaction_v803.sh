@@ -114,7 +114,7 @@ test_auto_tune_transaction_control_flow() {
     run_auto_helper_case execute-fail 7 "begin:eth0|mark|$execute|rollback"
     run_auto_helper_case begin-fail 1 'begin:eth0'
     run_auto_helper_case mark-fail 1 'begin:eth0|mark|discard'
-    run_auto_helper_case rollback-fail 23 "begin:eth0|mark|$execute|rollback"
+    run_auto_helper_case rollback-fail "$ROLLBACK_FAILURE_RC" "begin:eth0|mark|$execute|rollback"
 }
 
 write_minimal_transaction_metadata() {
@@ -231,7 +231,7 @@ test_rollback_failure_retains_mutated_evidence() (
     auto_tune_execute() { ((body_calls+=1)); return 7; }
 
     if auto_tune_run_transaction eth0 balanced mixed 0 100 0 >/dev/null 2>&1; then rc=0; else rc=$?; fi
-    [[ "$rc" == 1 ]] || fail "rollback validation failure returned $rc instead of rollback rc 1"
+    [[ "$rc" == "$ROLLBACK_FAILURE_RC" ]] || fail "rollback validation failure returned $rc instead of standardized rollback rc $ROLLBACK_FAILURE_RC"
     [[ "$body_calls" == 1 ]] || fail 'rollback evidence test did not execute the body once'
     [[ "$ACTION_TRANSACTION_DIR" == "$dir" && -d "$dir" ]] || fail 'rollback validation failure deleted evidence'
     [[ $(<"$dir/transaction.meta") == $'CREATED_AT\t2026-08-29T06:00:00Z' ]] || fail 'rollback validation failure lost transaction.meta'
@@ -287,10 +287,10 @@ test_failed_explicit_rollback_is_not_retried_by_exit_cleanup() (
         child_rc=$?
     fi
 
-    [[ "$child_rc" == 1 ]] || fail "latched rollback child returned $child_rc instead of 1"
+    [[ "$child_rc" == "$ROLLBACK_FAILURE_RC" ]] || fail "latched rollback child returned $child_rc instead of $ROLLBACK_FAILURE_RC"
     count=$(<"$validation_calls")
     [[ "$count" == 2 ]] || fail "EXIT cleanup retried failed rollback validation (calls=$count, expected 2 total/1 failure)"
-    grep -Fxq $'helper-rc\t1' "$result" || fail 'explicit rollback did not return its rollback failure'
+    grep -Fxq $'helper-rc\t'"$ROLLBACK_FAILURE_RC" "$result" || fail 'explicit rollback did not return its standardized rollback failure'
     grep -Fxq $'latch-before-exit\t1' "$result" || fail 'explicit rollback failure was not latched before EXIT'
     grep -Fxq $'latch-after-exit-cleanup\t1' "$result" || fail 'EXIT cleanup cleared the rollback failure latch'
     [[ -d "$dir" ]] || fail 'EXIT cleanup deleted the latched transaction directory'

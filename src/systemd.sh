@@ -1536,7 +1536,7 @@ verify_persistence_artifacts() {
 show_status() {
     local iface="" cc available profile_state service_state service_active shaping=off config_state baseline_state buffer_state="unavailable" script_state
     local hardware_state="unavailable" queue_state="unavailable" backlog_state="unavailable" scaling_state="unavailable" path_state="none"
-    local nic_policy_state=single status_rc=0 tuning_model
+    local nic_policy_state=single status_rc=0 tuning_model persistence_version=absent persistence_sync=OUT_OF_SYNC
     load_config || return 1
     if (( MULTI_NIC_ENABLED == 1 )); then
         nic_policy_state=valid
@@ -1563,13 +1563,20 @@ show_status() {
         scaling_state=$(hardware_scaling_note)
     fi
     script_state=$(persistence_script_state)
+    if [[ -f "$PERSIST_SCRIPT" && ! -L "$PERSIST_SCRIPT" ]]; then
+        persistence_version=$(awk -F'"' '$1=="SCRIPT_VERSION=" {print $2; exit}' "$PERSIST_SCRIPT" 2>/dev/null)
+        [[ "$persistence_version" == "$SCRIPT_VERSION" && "$script_state" != *differs* && "$script_state" != *foreign* && "$script_state" != *not\ executable* ]] && persistence_sync=SYNCED
+    fi
     path_state=$(latest_path_brief 2>/dev/null || printf 'none\n')
     if (( BANDWIDTH_MBIT == 0 && RTT_MS == 0 )); then
-        tuning_model="$ROLE / defaults only (no measurement-derived bandwidth or RTT)"
+        tuning_model="defaults-only / $SYSCTL_PROFILE"
     else
         tuning_model="$ROLE / ${BANDWIDTH_MBIT} Mbit / ${RTT_MS} ms"
     fi
     printf '%-20s %s\n' "Version" "v${SCRIPT_VERSION}"
+    printf '%-20s %s\n' "CLI script" "v${SCRIPT_VERSION}"
+    printf '%-20s %s\n' "Persistence copy" "v${persistence_version:-unknown}"
+    printf '%-20s %s\n' "Persistence sync" "$persistence_sync"
     printf '%-20s %s\n' "Kernel" "$(uname -r)"
     printf '%-20s %s\n' "Congestion control" "$cc (available: $available)"
     printf '%-20s %s\n' "BBR generation" "$(bbr_generation_status "$cc")"
@@ -1588,6 +1595,7 @@ show_status() {
     printf '%-20s %s\n' "Config" "$config_state ($CONFIG_FILE)"
     printf '%-20s %s\n' "Baseline" "$baseline_state"
     printf '%-20s %s\n' "Path consistency" "$path_state"
+    if declare -F status_measurement_details >/dev/null; then status_measurement_details; fi
     if (( MULTI_NIC_ENABLED == 1 )); then
         printf '%-20s %s\n' "NIC policy mode" "multi / $nic_policy_state / $(nic_policy_interface_list 2>/dev/null | grep -c . || true) managed"
         nic_inventory || status_rc=1
@@ -1625,7 +1633,10 @@ verify_system_state() {
         systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未启用"; rc=1; }
         systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未运行"; rc=1; }
         nic_verify_runtime_policies || rc=1
-        if (( rc == 0 )); then log OK "全部网卡运行时与持久化状态一致"; else die "多网卡验证发现不一致"; fi
+        if (( rc == 0 )); then log OK "全部网卡运行时与持久化状态一致"; else
+            declare -F failure_set >/dev/null && failure_set RUNTIME_VERIFY runtime-verify-failed "multi-NIC runtime/persistence drift" || true
+            die "多网卡验证发现不一致"
+        fi
         return "$rc"
     fi
     if (( TC_ENABLED == 1 )) && [[ "$TC_INTERFACE" == auto ]]; then
@@ -1638,7 +1649,18 @@ verify_system_state() {
     systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未启用"; rc=1; }
     systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null || { log ERR "持久化服务未运行"; rc=1; }
     if (( TC_ENABLED )); then verify_shaping "$iface" "$TC_RATE_MBIT" || rc=1
-    else [[ "$(root_qdisc_kind "$iface")" == fq ]] || { log ERR "root qdisc 不是 fq"; rc=1; }
+    else
+        local actual_qdisc
+        actual_qdisc=$(root_qdisc_kind "$iface" 2>/dev/null || printf unreadable)
+        if [[ "$actual_qdisc" != fq ]]; then
+            log ERR "$iface qdisc drift"
+            log ERR "expected: fq"
+            log ERR "actual:   $actual_qdisc"
+            rc=1
+        fi
     fi
-    if (( rc == 0 )); then log OK "运行时与持久化状态一致"; else die "验证发现不一致"; fi
+    if (( rc == 0 )); then log OK "运行时与持久化状态一致"; else
+        declare -F failure_set >/dev/null && failure_set RUNTIME_VERIFY runtime-verify-failed "$iface runtime/persistence drift" || true
+        die "验证发现不一致"
+    fi
 }

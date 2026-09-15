@@ -2,7 +2,7 @@
 
 BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-当前版本：v8.0.5
+当前版本：v8.0.6
 
 项目不追求“sysctl 越多越好”。默认配置保持克制。命令行 `measure` 只给出结果；交互式 `auto` 会在一次总确认后完成测量、决策、应用和复验，未发现可信拐点时保持纯 FQ。
 
@@ -26,6 +26,7 @@ BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原
 - v8.0.3 发布前修复：真实 Debian/systemd 首次安装可安全处理尚不存在的 service；schema-3 TCP 基线显式绑定 sysctl schema/key 集并兼容真实 v8.0.2 基线；事务诊断与失败证据保留更清晰，永久禁用 IPv6 时会提示对未来新接口的影响。
 - v8.0.4 nexthop 与公共测速可靠性修复：支持解析普通单路径 nexthop object；高重传 baseline 改为 inconclusive 并切换候选，不再冒充 clean NO_KNEE；纯 BBR+FQ 的 clean NO_KNEE 在最终 peer 仅 unavailable 时可经过严格本地 runtime、路径指纹和连通性降级复验提交，有 HTB 推荐时仍严格失败并回滚。
 - v8.0.5 测量实验重写：低速 Path Quality Control、不限速 saturation/capacity probe 与 shaped sweep 成为三个独立阶段；只有低速 control 能判定 `PATH_DIRTY`，干净 control 加高重传 saturation 会标记疑似 policer 并在同一 peer/path 完成扫描。所有容量、区间、拐点与最终验证决策使用 receiver delivered rate，sender 仅作诊断。
+- v8.0.6 Reliability / Diagnostics / Peer Intelligence：公共 endpoint 使用仅存于本机、可解释且自动过期的健康评分辅助排序；测量增加真实接口 TX/耗时硬预算、quick/standard/strict 深度、环境预检、结构化失败历史、`peers/history/doctor` 与只读 dry-run。IPv6 路径身份使用 resolved nexthop leaf，不把 RA lifetime 或等价 leaf 的 `nhid` 数字重分配误判为换路。
 - 全局 TCP sysctl 与逐网卡 qdisc 明确分层：Linux TCP 缓冲区是全局资源，脚本按全部策略聚合出一个安全上界；qdisc、速率、原始队列基线和恢复则逐网卡独立处理，不再把“多网卡检测”误称为“多网卡管理”。
 - 全局 `flock`，防止两个进程同时修改 sysctl、qdisc 或配置。
 - 严格 `KEY=VALUE` 白名单解析，配置文件从不被 shell `source`。
@@ -107,7 +108,12 @@ sudo ./net-tcp-tune.sh status
 ```bash
 sudo bbr auto
 # 或直接运行 sudo bbr 选择 1
+
+# 只读规划：不测速、不创建 baseline/history/cache、不改 qdisc/sysctl/config/service
+sudo bbr auto --dry-run --measurement-profile standard --max-test-gib 6 --max-duration 900
 ```
+
+dry-run 会同时列出调优用的 planning bandwidth、首个吞吐样本的 reservation ceiling 和 minimum first-sample budget。未知/虚拟链路的 `1000 Mbit/s` 只是 sysctl/缓冲区规划 fallback，不是无限速 iperf 的物理上界；自动模式仍以当前冻结模型的 `5000 Mbit/s` scan ceiling 为首次 SATURATION 做保守硬预算预留。SATURATION 本身不按 5000M 限速，因此该值不是未知物理链路速率的可证明上界。
 
 向导只集中询问三类信息：标称带宽（可自动测量或选择仅安装 BBR+FQ）、iperf3 对端（公共节点或自有服务器）和业务用途。确认后依次执行：
 
@@ -178,6 +184,13 @@ sudo bbr measure deps
 
 自动向导可在用户明确选择后，从 Leaseweb、OVH、Clouvider 的公共测速节点中筛选 120ms 内的对端，并对公开端口执行 1 秒、1 Mbit/s 的真实 iperf3 预检，不再把“TCP 端口已打开”误判为“测速服务可用”。对主机名会先枚举 A/AAAA，再按 IPv4 优先、IPv6 回退的顺序，对每个具体地址执行路由/FIB、来源地址绑定、TCP 端口和同地址族 iperf3 核验；显式 IPv4 或 IPv6 地址不会静默切换地址族。它会预留最多 4 个候选，优先保留不同主机，并在可用时为首选主机预留一个备用端口。预检一旦通过，就冻结 `hostname + literal IP + family + source + interface + port`；正式 path check、sweep 和 verify 直接复用该元组，不重新解析主机名。未选中的不可用 AAAA/A、没有 IPv6 默认路由或另一地址族走另一网卡，不会阻断已证明安全的端点；选中端点的 ECMP、来源地址或路径指纹漂移仍会失败关闭。正式样本连续 3 次遇到 busy、超时或连接类临时故障时，先恢复本轮 qdisc，再从备用对端重新开始完整 sweep。最终复验只允许切换扫描主机同一 literal/source/interface 上的备用端口；该端点全部不可用时会执行总事务回滚，不会拿另一条路径验证旧基线。JSON/本地执行、TC、sysctl、路由漂移等错误不会触发误切换。整个测速选择过程只读取 IPv6 状态，从不写 `disable_ipv6`；无需为了 iperf3 手工关闭 IPv6。公共节点仍可能限速或路径不稳定；自有、同机房或低 RTT 的 iperf3 服务器始终是推荐方案。测量结果代表 VPS 到该端点路径，不代表所有业务目的地。
 
+v8.0.6 会在 `/var/lib/bbrv3-lite/peer-health/` 以严格 TSV 保存有限窗口和累计小计。评分明确组合即时 RTT、近期成功、干净 control、busy/reset/slow/unstable 与临时 penalty；同 host 的端口分别记账，连续 host/address reset 才产生轻量 host 级降权。busy/reset/timeout/path-dirty/protocol penalty 分别在数分钟到 30 分钟内自动过期，旧事件按有限窗口/时间衰减，一周无观测回归 neutral。`measurement-inconclusive` 与 `knee-not-located` 不会增加 `path-dirty`；历史 receiver capacity 只在本轮候选之间作相对同分排序，不使用固定低速阈值。DNS 换到另一 literal address、IPv4/IPv6 或端口时使用新的 endpoint fingerprint，不继承不匹配记录。历史只优化候选顺序，不是安全证明；正式测试仍重新 precheck 并执行 route/path safety。数据不上传、不含本机公网 source 或 hostname：
+
+```bash
+bbr peers
+sudo bbr peers reset   # 只删 peer cache，不碰 baseline/history/config/network
+```
+
 ### 5. 网络路径画像
 
 在不运行 iperf3、不修改 qdisc 和路由的情况下检查某个业务目标：
@@ -205,6 +218,10 @@ sudo bbr measure probe --peer 192.0.2.10 --port 5201 --duration 10 --parallel 4
 
 ```bash
 sudo bbr measure sweep --peer 192.0.2.10 --nominal 500
+
+# 测试深度与硬预算；默认仍为 standard / 6 GiB / 900 秒
+sudo bbr measure sweep --peer 192.0.2.10 --nominal 500 \
+  --measurement-profile strict --max-test-gib 6 --max-duration 900
 ```
 
 也可以控制扫描区间：
@@ -229,9 +246,20 @@ sudo bbr measure sweep \
 6. `PRE_SCAN`、`SPIKE_RECHECK`、`BETWEEN_LEVEL` 和 `PRE_VERIFY` 使用不同冷却预算；粗扫较短，尖峰确认和最终候选较长。摘要记录样本数与流量上界，超过污染、CPU 或稳定性门槛时停止并恢复。
 7. 最后干净档位按 `--margin` 退让并再次确认。最终 verify 同样使用 receiver 和低速干净参考；任何端点/来源/出口/路由/FIB/MTU 指纹漂移仍会使结果失效。
 
-核心状态只有四类：`CLEAN_NO_POLICER`、`CLEAN_POLICER_FOUND`、`PATH_DIRTY`、`MEASUREMENT_UNSTABLE`。公共 peer 只有在低速 control 脏、对端不可用或过慢、服务繁忙、测量持续不稳定或路径漂移时才切换；“干净 control + lossy saturation”不会触发中途换 peer。
+核心状态为 `CLEAN_NO_POLICER`、`CLEAN_POLICER_FOUND`、`PATH_DIRTY`、`MEASUREMENT_UNSTABLE`，预算耗尽另记 `MEASUREMENT_BUDGET_EXCEEDED`。公共 peer 只有在低速 control 脏、对端不可用或过慢、服务繁忙、测量持续不稳定或路径漂移时才切换；“干净 control + lossy saturation”不会触发中途换 peer。
 
-结果保存在 `/var/lib/bbrv3-lite/history/`。`samples.tsv` 显式记录 `SENDER_MBIT`、`RECEIVER_MBIT`、双方字节、重传、receiver fallback、持续时间、流数、RTT/bufferbloat、后台 TX 和 CPU 污染。摘要记录 `PATH_CONTROL_*`、`SATURATION_*`、`CAPACITY_DISCOVERY_MODE`、`POLICER_SUSPECTED`、`SCAN_LOW/HIGH/STEP_MBIT`、`CLEAN_REFERENCE_*`、`KNEE_MBIT`、`RECOMMEND`、`SCAN_DECISION` 及 sample/decision confidence。兼容字段 `UNSHAPED_MBIT` 仍保留，但其语义明确为 saturation probe 的 receiver-delivered rate，而不是线路质量基线。
+`quick` 缩短 coarse 样本并减少干净样本，`standard` 保持 v8.0.5 的采样次数、持续时间和冷却行为，`strict` 增加 control/capacity/candidate/final-verify 样本并延长冷却。三种深度都保留路径指纹、2/3 spike confirmation、candidate confirmation、最终单双流 verify 和外层事务。
+
+每次正式测量前会用 1–3 秒观察 CPU busy/steal、load、可用内存、磁盘、现有接口 TX/RX 与连接数量；轻微背景流量告警，超过硬门槛时在产生 GiB 级流量前拒绝推荐，不会 kill 进程。向导在安装测量依赖、创建 transaction、写 baseline 或临时修改 sysctl/qdisc 之前，先纯计算第一个 throughput sample 的安全预留；显式预算连首样本都放不下时直接以 RC 70 fail fast，并明确不启动 iperf。硬预算在一次顶层 `auto`/`measure` operation 开始时只初始化一次；切换 peer、host、address、port、sweep 或 final verify 都不重置 ledger。正式 endpoint precheck、失败 retry、same-host alternate-port verify 以及所有实际接口 TX/RX 都计入同一 operation；每个高流量样本在启动 `iperf3` 前按 aggregate planning rate、duration、近期重传/背景遥测、协议余量和固定控制流量余量做 reservation，预计触顶就不启动；多 flow 不会把 aggregate rate 重复相乘。不限速 saturation 的首样本使用硬件上界或 scan ceiling；同一 peer/path 获得首个有效 sender/retrans/background 遥测后，后续不限速 repeat 改用新证据加安全余量，不把首样本估算永久扣成 reservation balance。每个 iperf stage 前后从 `/sys/class/net/DEV/statistics/{tx,rx}_bytes` 和单调向前的 wall clock 更新实际用量，最终摘要始终以接口 counter 为准。达到流量或时间边界会立即停止后续 iperf、清空未验证 recommendation、恢复临时 qdisc，并触发外层网络事务 rollback，绝不持久化参数。
+
+结果保存在 `/var/lib/bbrv3-lite/history/`。`samples.tsv` 显式记录 `SENDER_MBIT`、`RECEIVER_MBIT`、双方字节、重传、receiver fallback、持续时间、流数、RTT/bufferbloat、后台 TX 和 CPU 污染。摘要记录 `PATH_CONTROL_*`、`SATURATION_*`、`CAPACITY_DISCOVERY_MODE`、`POLICER_SUSPECTED`、`SCAN_LOW/HIGH/STEP_MBIT`、`CLEAN_REFERENCE_*`、`KNEE_MBIT`、`RECOMMEND`、`SCAN_DECISION` 及 sample/decision confidence。兼容字段 `UNSHAPED_MBIT` 仍保留，但其语义明确为 saturation probe 的 receiver-delivered rate，而不是线路质量基线。失败另有 `failure.tsv`，使用 machine-readable stage/reason、中文解释、RC、rollback 与建议动作；外层 rollback 完成后才原子定稿 `ROLLBACK_RESULT` 与 `PERSISTENT_CHANGES`。若 rollback 本身失败，最终主 reason 为 `rollback-failed`，同时保留 original failure。默认自动保留最近 20 次，只允许清理合法 measurement history 目录：
+
+```bash
+bbr history
+bbr history latest
+bbr history show 20260915T010000Z-sweep
+sudo bbr history prune
+```
 
 这里显示的 `RETRANS_RATIO_EST_PERCENT` 是“iperf3 retransmits / 按 1448 字节估算的 TCP 段数”，用于寻找相对跳变，不是抓包意义上的真实丢包率。`RETRANS_PER_GIB` 则把重传次数按发送 1 GiB 归一化，适合比较不同持续时间和吞吐的样本，但同样不等同于丢包率。
 
@@ -373,9 +401,17 @@ RTT_MS=180
 
 Linux 的 TCP 缓冲区、拥塞控制和 backlog 是全局资源，不能真的按网卡设置。v8 因此采用可审计聚合规则：只要任一接口要求 `adaptive`，全局即使用 adaptive；最大 `bandwidth × RTT` 的 adaptive 策略提供带宽、RTT 和硬件代表接口；业务角色取全部策略中资源需求最高的 `bulk > mixed > proxy`。全部为 balanced 时选择声明带宽最高的代表接口。qdisc 与整形速率始终逐网卡独立，不受这项全局聚合影响。
 
-`status` 会显示聚合调优模型、缓冲区上限、systemd 脚本同步状态和完整网卡策略清单；`verify` 会同时核对全部受管 sysctl、策略集合与 MAC 身份、孤立 HTB、每张网卡的 root qdisc/速率、持久化 sysctl、配置、unit `ExecStart` 及脚本版本/内容，避免“现在正常、重启后失效”。
+`status` 会显示聚合调优模型、缓冲区上限、CLI/persistence 明确版本与同步状态、最近测量时间/年龄/决策、delivered capacity 和 shaping rate，以及完整网卡策略清单；旧记录的接口、source、resolved leaf、policy table 或 PMTU 明显变化时显示 stale，不会自动复用推荐。RA lifetime、等价 nhid 数字重分配或格式变化不会误报 stale。没有正式测量时明确显示 `Delivered capacity: not measured` 与 `Shaping rate: none`，不会再显示误导性的 `mixed / 0 Mbit / 0 ms`。`verify` 会同时核对全部受管 sysctl、策略集合与 MAC 身份、孤立 HTB、每张网卡的 root qdisc/速率、持久化 sysctl、配置、unit `ExecStart` 及脚本版本/内容，并显示 expected/actual drift。`status`、`verify`、`doctor`、`history` 和 `peers` 只读取本地状态，不进行 DNS、ping、TCP、iperf 或 GitHub 访问。
 
-自更新会原子替换当前命令和独立的 systemd 副本；任何一处失败都会把当前命令恢复到更新前版本，成功时保留 `.previous`：
+`bbr doctor` 是只读汇总，不主动连接测速服务器，也不修复系统。它覆盖 OS/kernel/virtualization/BBR、配置、baseline、service、持久化副本、接口/队列/offload、IPv4/IPv6 默认路由、policy rule/nexthop、qdisc 所有权和最近成功/失败测量。`bbr doctor --export` 先把 history 复制成诊断目录内的原子 snapshot；与 `history prune` 并发时只会得到完整记录或明确空记录，不会打包半个 TSV/断链。最终在 `/tmp` 原子生成权限 `0600` 的纯文本 tar.gz。默认移除 hostname、IPv4/IPv6、MAC、machine-id、boot-id、DMI/cloud identity、SSH host key，以及包含 token/password/secret/psk/authorization/credential 的整行；同一地址在包内使用稳定的 `ADDR#...` 假名，以保留跨文件诊断关联。显式 `--include-addresses` 只取消网络地址脱敏；hostname、MAC、机器身份和 secret deny-list 仍然生效。同包从不自动上传：
+
+```bash
+bbr doctor
+bbr doctor --export
+bbr doctor --export --include-addresses  # 明确包含完整网络地址
+```
+
+自更新会原子替换当前命令和独立的 systemd 副本；任何一处失败都会把两者恢复到更新前版本，成功时保留 `.previous`。替换后自动复验 `bash -n`、版本、下载 SHA256 与持久化副本内容同步；不会自动重新 apply 网络：
 
 ```bash
 sudo bbr update
@@ -465,6 +501,8 @@ sudo bbr ipv6 apply native
 `ipv6 disable temporary|permanent` 和 `ipv6 restore` 仍分别映射到上述规范策略，供旧自动化兼容。旧版会写 `all/default/lo` 的永久文件会被识别为 `legacy-disabled-*`，但不会就地自动迁移；必须先显式应用 `native` 恢复可信基线，再选择新的逐接口策略，避免在迁移过程中把已禁用的 `lo/::1` 当作新基线。
 
 IPv6 新基线逐一记录 `/proc/sys/net/ipv6/conf/*/disable_ipv6`，包括 VLAN 等含点号的接口、`default`、`lo`，并把 `all` 明确标记为只读观测值。禁用时只修改 `default` 与快照中的非回环接口，始终保留 `lo/::1`；恢复从不写 `all`，只恢复 `default` 和逐接口 flag，避免一次聚合写触发器清除新出现接口的地址。地址与路由快照只用于判断风险和审计，脚本不会伪装能够重建 SLAAC、DHCPv6、RA、策略路由或业务地址。新建永久策略使用 slash 形式的 sysctl 路径，避免把 `eth0.100` 误解析成层级。
+
+测速路径支持 IPv6-only、自有 IPv6 iperf、双栈明确 `-6`、link-local gateway、RA 单 leaf `nhid`、来源地址选择、policy table 与 PMTU。每次捕获仍解析 nexthop object，并对 group/weight、ECMP、gateway/dev/family/source/table/PMTU 变化 fail closed；数字 `nhid` 本身、RA `expires`、cache、proto/metric 展示不属于最终路径身份，因此“ID 变化但 resolved leaf 等价”不会制造假 drift。
 
 因此，禁用只允许在明确的 IPv4-only 管理场景继续：必须有 IPv4 默认出口、没有 IPv6 默认路由、没有非回环 global/ULA 地址、没有 IPv6 业务路由、当前 SSH 不是 IPv6，并且不存在 `ipv6.disable=1` 或内核模块级启动禁用。显式恢复遇接口集合变化会在任何写入前停止；本次操作失败后的自动回滚若发现接口增删，会先恢复持久策略、`default` 和仍存在的旧接口，保留新增接口当前值，随后返回非零并保留事务快照供人工审计。旧版只记录 `all/default/lo` 的不可覆盖基线继续显示为 `legacy/partial-best-effort`，不会伪称完整还原；损坏基线也不会被删除后静默重建。`disabled-temporary` 会移除本项目的永久策略，确保重启后不再由该文件继续禁用 IPv6；`disabled-persistent` 还会核对持久文件中的接口集合，网卡增删/重命名会显示为 drift 并要求重新规划。
 
@@ -688,6 +726,16 @@ tag 推送会触发 Release 工作流，验证 tag 与脚本版本一致，并�
 - **Bounded experiments**：粗扫约 8 点，细扫最多约 8 点；control、saturation、coarse、confirmation 使用不同持续时间和阶段冷却。summary 写入最大样本数和估算流量上界。
 - **Safety**：保留 v8.0.4 的 nexthop/ECMP/来源绑定、双路径指纹、PMTU/MTU、qdisc 所有权、MQ 精确恢复、多网卡事务和最终持久化门禁。高重传 saturation 不会放宽任何这些保护。
 - **Regression fixture**：200M 夹具覆盖 control 80/0%、saturation receiver 192/8.7621%、receiver-based 180–220+ 扫描、2/3 尖峰确认、约 210M knee 和 203M 推荐；auto nominal=0 以同一高重传 saturation 推导 86M control 后也完成全扫描。另含 sender/receiver 分歧、dirty path、无 policer、慢对端拒绝、浅 policer、瞬时公共竞争、receiver verify、容量模式和流量边界。
+
+## v8.0.6 Reliability / Diagnostics / Peer Intelligence
+
+- **Peer intelligence**：公共 `host/family/address/port` endpoint 使用 schema-1 严格 TSV、本地有限窗口、可解释 0–100 分与分钟级自动过期 penalty；host/address reset 只提供有界提示，历史从不替代实时 precheck、route guard 或 path fingerprint。
+- **Budgets and profiles**：新增 6 GiB/900 秒默认硬预算以及 `quick/standard/strict`；真实接口 TX 包含失败测试，正常上界估算包含 recheck/candidate/final verify，耗尽后进入 `MEASUREMENT_BUDGET_EXCEEDED` 并安全恢复。v8.0.6 RC3 进一步在 transaction 前检查首样本可行性：未知链路以当前冻结模型的 5000M scan ceiling 做保守 reservation，1000M planning fallback 不冒充物理上界；首样本后按同路径实测遥测收敛后续 reservation。
+- **Preflight and failure records**：正式流量前观察 CPU、steal、load、内存、磁盘和背景流量；`summary.tsv`/`failure.tsv` 统一记录 stage、reason、用量、rollback 与建议。history 自动保留最近 20 次，可只读查询和显式 prune。
+- **Doctor and privacy**：新增只读 `doctor`、默认脱敏且不上传的 `doctor --export`、显式完整地址模式，以及 CLI/persistence version sync、qdisc expected/actual 和最近测量 freshness 诊断。
+- **IPv6 and scale coverage**：route identity 改为 resolved leaf semantics，忽略 RA lifetime 和等价 leaf 的 nhid ID churn，继续拒绝 nexthop group/ECMP；确定性矩阵覆盖 100M/20ms 到 10G/250ms、single-flow limited/aggregate discovery、CPU/steal/background contamination 和 v8.0.5 真实 200M regression fixture。
+- **Update/dry-run**：更新后复验语法、版本、checksum 和 systemd 副本同步但不 apply 网络；`auto --dry-run` 只做本地检测、依赖/路径说明与预算规划，显式 `--peer` 时可进行 DNS/route discovery，但不 ping、不做 TCP precheck、不运行 iperf，也不创建项目状态。输出明确说明没有系统修改、没有吞吐测量；它不是“完全离线”模式。
+- **Repair**：v8.0.6 未提供自动 `repair`。未知拓扑和第三方 TC 仍坚持 diagnose/explain/fail safe；用户可依据 `verify`/`doctor` 的具体差异显式重新安装或重新调优。
 
 ## v8 与旧版的差异
 

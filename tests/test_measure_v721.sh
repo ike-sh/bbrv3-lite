@@ -84,6 +84,7 @@ test_hostname_is_resolved_once_and_iperf_is_bound() {
             printf 'rtt min/avg/max/mdev = 1.000/1.000/1.000/0.000 ms\n'
         }
         peer_port_open() { :; }
+        iperf_peer_usable() { :; }
         iperf3() {
             printf '%s\n' "$*" >> "$iperf_args_file"
             printf 'after\n' > "$dns_state_file"
@@ -127,6 +128,7 @@ test_ipv6_literal_and_source_are_bound() {
         command_exists() { [[ "$1" != ping ]]; }
         timeout() { shift; "$@"; }
         peer_port_open() { :; }
+        iperf_peer_usable() { :; }
         iperf3() {
             printf '%s\n' "$*" >> "$iperf_args_file"
             printf '%s\n' '{"end":{"sum_sent":{"bits_per_second":100000000,"bytes":1000000,"retransmits":0}}}'
