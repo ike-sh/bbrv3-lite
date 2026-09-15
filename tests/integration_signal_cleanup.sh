@@ -82,7 +82,9 @@ run_persisted_action_signal_case() {
     ! grep -Eq '^(commit|continued-after-signal)$' "$events" || fail "persisted action SIG$signal continued or committed"
     if [[ "$rollback_mode" == success ]]; then
         [[ ! -e "$dir" ]] || fail "successful signal rollback retained transaction evidence: SIG$signal"
-        [[ $(grep -c '^restore-path:' "$events") == 6 ]] || fail "successful signal rollback did not execute all path restores: SIG$signal"
+        # v8.0.7 adds the final path profile to the six pre-existing managed
+        # paths, so emergency rollback must restore all seven transactionally.
+        [[ $(grep -c '^restore-path:' "$events") == 7 ]] || fail "successful signal rollback did not execute all path restores: SIG$signal"
         grep -Fxq 'cleanup-latch:0' "$events" || fail "successful signal rollback left its failure latch set: SIG$signal"
     else
         [[ -d "$dir" ]] || fail 'failed signal rollback deleted its transaction directory'
