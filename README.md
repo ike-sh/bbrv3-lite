@@ -2,7 +2,7 @@
 
 BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-当前版本：v8.0.6
+当前开发版本：v8.0.7
 
 项目不追求“sysctl 越多越好”。默认配置保持克制。命令行 `measure` 只给出结果；交互式 `auto` 会在一次总确认后完成测量、决策、应用和复验，未发现可信拐点时保持纯 FQ。
 
@@ -26,6 +26,7 @@ BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原
 - v8.0.3 发布前修复：真实 Debian/systemd 首次安装可安全处理尚不存在的 service；schema-3 TCP 基线显式绑定 sysctl schema/key 集并兼容真实 v8.0.2 基线；事务诊断与失败证据保留更清晰，永久禁用 IPv6 时会提示对未来新接口的影响。
 - v8.0.4 nexthop 与公共测速可靠性修复：支持解析普通单路径 nexthop object；高重传 baseline 改为 inconclusive 并切换候选，不再冒充 clean NO_KNEE；纯 BBR+FQ 的 clean NO_KNEE 在最终 peer 仅 unavailable 时可经过严格本地 runtime、路径指纹和连通性降级复验提交，有 HTB 推荐时仍严格失败并回滚。
 - v8.0.5 测量实验重写：低速 Path Quality Control、不限速 saturation/capacity probe 与 shaped sweep 成为三个独立阶段；只有低速 control 能判定 `PATH_DIRTY`，干净 control 加高重传 saturation 会标记疑似 policer 并在同一 peer/path 完成扫描。所有容量、区间、拐点与最终验证决策使用 receiver delivered rate，sender 仅作诊断。
+- v8.0.7 PMTU Evidence / Final Path Provenance：PMTU 探测把 DF/IPv6 probe 结果分为成功、明确 MTU-too-large 与歧义三类，以 2/3 小样本确认抵抗单次 ICMP 丢包；成功工作流把同 endpoint、同 route 且 trusted 的完整 final-verify path capture 原子保存为状态依据，不拼接不同阶段字段，也不改写历史 capture。
 - v8.0.6 Reliability / Diagnostics / Peer Intelligence：公共 endpoint 使用仅存于本机、可解释且自动过期的健康评分辅助排序；测量增加真实接口 TX/耗时硬预算、quick/standard/strict 深度、环境预检、结构化失败历史、`peers/history/doctor` 与只读 dry-run。IPv6 路径身份使用 resolved nexthop leaf，不把 RA lifetime 或等价 leaf 的 `nhid` 数字重分配误判为换路。
 - 全局 TCP sysctl 与逐网卡 qdisc 明确分层：Linux TCP 缓冲区是全局资源，脚本按全部策略聚合出一个安全上界；qdisc、速率、原始队列基线和恢复则逐网卡独立处理，不再把“多网卡检测”误称为“多网卡管理”。
 - 全局 `flock`，防止两个进程同时修改 sysctl、qdisc 或配置。
@@ -200,11 +201,11 @@ sudo bbr measure path --peer 192.0.2.10 --samples 7
 sudo bbr measure path --peer example.com --interface eth0 --no-pmtu
 ```
 
-画像会把主机名解析并冻结为经过 `route get`、`fibmatch` 和 source-bound 再核验的具体地址，然后输出网卡、源地址、网关、路由表、路径指纹、RTT 分布、抖动、ICMP 丢包、接口 MTU、探测 PMTU/MSS、路径类别和调优决策。PMTU 使用带 DF/禁止分片语义的有限二分 ICMP 探测，默认最多探测到 9000 字节；不响应 ICMP时记为 `unknown`，不会伪造接口 MTU就是端到端 PMTU。`--no-pmtu` 可关闭这部分探测。
+画像会把主机名解析并冻结为经过 `route get`、`fibmatch` 和 source-bound 再核验的具体地址，然后输出网卡、源地址、网关、路由表、路径指纹、RTT 分布、抖动、ICMP 丢包、接口 MTU、探测 PMTU/MSS、路径类别和调优决策。PMTU 先以 IPv4 28-byte 或 IPv6 48-byte ICMP overhead 测试 route/interface ceiling，再按需二分；每个候选最多 3 次、需 2 次同类证据确认。成功只提升 lower bound，只有 `EMSGSIZE`/`message too long`/`Frag needed`/`Packet Too Big` 等明确 MTU 语义才降低 upper bound；timeout、generic unreachable 和 ICMP rate limiting 均为歧义，最终记为 `PMTU unknown / probe inconclusive`，不会制造看似精确的低值。默认最多探测到 9000 字节，`--no-pmtu` 可关闭这部分探测。
 
 `trusted/limited/unsafe` 是“这条测试路径能否支撑自动调优结论”，不是线路运营商评级。ICMP 完全不可用时通常降级为 `limited`，仍可通过 iperf3 测量；路由/FIB/源地址/网关/路由表/MTU 指纹在样本前后变化会直接终止。明显高丢包或高尾部抖动的 `unsafe` 路径不会自动生成和持久化整形建议；人工 `measure sweep --force-scan` 只能绕过质量门槛，不能绕过路由唯一性和指纹漂移保护。
 
-每次 probe/sweep/verify/compare 都会自动附带路径画像。自动调优用路径 RTT p95 与业务用途下限的较大值计算缓冲区 RTT，并要求 sweep 与最终 verify 的远端端点指纹、出口路径指纹同时一致。`bbr status` 显示最近一次路径画像摘要，完整数据保存在历史目录的 `summary.tsv` 和 `path-rtt.tsv`。
+每次 probe/sweep/verify/compare 都会自动附带路径画像。自动调优用路径 RTT p95 与业务用途下限的较大值计算缓冲区 RTT，并要求 sweep 与最终 verify 的远端端点指纹、出口路径指纹同时一致。成功 verify 的完整、trusted path capture 会另存为 `${STATE_DIR}/final-path-profile.tsv`，并带 sweep/source history ID；失败、跨 endpoint/route 或不可信 verify 不会覆盖它。`bbr status` 的 `Path consistency` 显示这份 persisted-final capture 及其 `source`，没有该文件时才回退到最近成功 sweep；历史目录的 `summary.tsv` 和 `path-rtt.tsv` 保持各次真实 capture。
 
 ### 6. 探测与扫描
 
@@ -736,6 +737,15 @@ tag 推送会触发 Release 工作流，验证 tag 与脚本版本一致，并�
 - **IPv6 and scale coverage**：route identity 改为 resolved leaf semantics，忽略 RA lifetime 和等价 leaf 的 nhid ID churn，继续拒绝 nexthop group/ECMP；确定性矩阵覆盖 100M/20ms 到 10G/250ms、single-flow limited/aggregate discovery、CPU/steal/background contamination 和 v8.0.5 真实 200M regression fixture。
 - **Update/dry-run**：更新后复验语法、版本、checksum 和 systemd 副本同步但不 apply 网络；`auto --dry-run` 只做本地检测、依赖/路径说明与预算规划，显式 `--peer` 时可进行 DNS/route discovery，但不 ping、不做 TCP precheck、不运行 iperf，也不创建项目状态。输出明确说明没有系统修改、没有吞吐测量；它不是“完全离线”模式。
 - **Repair**：v8.0.6 未提供自动 `repair`。未知拓扑和第三方 TC 仍坚持 diagnose/explain/fail safe；用户可依据 `verify`/`doctor` 的具体差异显式重新安装或重新调优。
+
+## v8.0.7 PMTU Evidence / Final Path Provenance
+
+- **Root cause**：旧 PMTU 二分把一次 `ping -M do` 的任意非零退出都当作 MTU-too-large，timeout、临时丢包或 ICMP 限速因此会错误缩小上界，并生成 977/1491 这类没有 MTU 证据的精确低值。
+- **Probe semantics**：先确认 route/interface ceiling；每个候选最多 3 次并要求 2 次同类结果。成功证明 fits；只有 EMSGSIZE、message-too-long、Frag Needed 或 Packet Too Big 降低上界；其余失败为 ambiguous，输出 `PMTU unknown / inconclusive`。
+- **IPv4/IPv6**：IPv4 ceiling 1500 使用 1472-byte payload，IPv6 使用 48-byte ICMPv6 overhead；MSS 继续分别按 PMTU−40/−60 计算。`reduced-pmtu` 仍要求经证据确认的 PMTU 严格小于接口 MTU，不增加容差掩盖探测错误。
+- **Final provenance**：successful/accepted/trusted verify 只有在 peer、literal address、source、family、interface、gateway/table、route/endpoint fingerprint 和 MTU 身份均与 sweep 一致时，才把该次完整 capture 原子保存到 `final-path-profile.tsv`。不可信 verify 保留完整 sweep capture；失败或身份不一致不会覆盖。状态不再按易受后续 summary 写入影响的 mtime 盲取任意记录。
+- **Scope**：SATURATION、PATH_CONTROL、receiver-driven sweep、2/3 retrans spike、knee、margin、final throughput verify、hard budget 和 peer-health 评分未改变。
+- **Tests**：新增 full-MTU、单次 timeout 恢复、明确 too-large、全歧义 inconclusive、IPv6 PTB/overhead、Tokyo 977 复现，以及 same/different/failed/untrusted verify、整画像来源和历史不可变回归。
 
 ## v8 与旧版的差异
 

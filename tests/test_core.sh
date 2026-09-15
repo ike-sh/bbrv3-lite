@@ -1262,9 +1262,9 @@ test_self_update_rolls_back_split_install() {
         local update_root="$TEST_ROOT/self-update" installed_path candidate valid_candidate output_path="" url="" update_output="" fail_persist=1
         mkdir -p "$update_root"
         installed_path="$update_root/bbr"; candidate="$update_root/new.sh"; valid_candidate="$update_root/new.valid.sh"; PERSIST_SCRIPT="$update_root/persist.sh"
-        sed 's/^SCRIPT_VERSION="8.0.6"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
+        sed 's/^SCRIPT_VERSION="8.0.7"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
         cp "$installed_path" "$PERSIST_SCRIPT"; chmod 0755 "$installed_path" "$PERSIST_SCRIPT"
-        sed 's/^SCRIPT_VERSION="8.0.6"$/SCRIPT_VERSION="8.0.7"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
+        sed 's/^SCRIPT_VERSION="8.0.7"$/SCRIPT_VERSION="8.0.8"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
         cp "$candidate" "$valid_candidate"
         require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
         current_script_path() { printf '%s\n' "$installed_path"; }
@@ -1279,7 +1279,7 @@ test_self_update_rolls_back_split_install() {
                 esac
             done
             case "$url" in
-                */releases/latest) printf '{"tag_name":"v8.0.7"}\n' ;;
+                */releases/latest) printf '{"tag_name":"v8.0.8"}\n' ;;
                 */net-tcp-tune.sh) cp "$candidate" "$output_path" ;;
                 */SHA256SUMS)
                     printf '%s  net-tcp-tune.sh\n' "$(sha256sum "$candidate" | awk '{print $1}')" > "$output_path"
@@ -1292,7 +1292,7 @@ test_self_update_rolls_back_split_install() {
             [[ "$target" != "$PERSIST_SCRIPT" || "$fail_persist" == 0 ]] || return 9
             cp "$source" "$target"; chmod 0755 "$target"
         }
-        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.7"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
+        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.8"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
         if self_update >/dev/null 2>&1; then fail "checksum-matching false-marker update was accepted"; fi
         grep -Fq 'SCRIPT_VERSION="8.0.1"' "$installed_path" || fail "rejected false-marker update changed current command"
         cp "$valid_candidate" "$candidate"
@@ -1303,8 +1303,8 @@ test_self_update_rolls_back_split_install() {
 
         fail_persist=0
         self_update >/dev/null
-        grep -Fq 'SCRIPT_VERSION="8.0.7"' "$installed_path" || fail "successful update did not replace current command"
-        grep -Fq 'SCRIPT_VERSION="8.0.7"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
+        grep -Fq 'SCRIPT_VERSION="8.0.8"' "$installed_path" || fail "successful update did not replace current command"
+        grep -Fq 'SCRIPT_VERSION="8.0.8"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
     )
 }
 
@@ -2628,7 +2628,7 @@ test_route_window_dynamic_attrs_do_not_trigger_drift() (
 
 test_action_transaction_rolls_back_failed_step() {
     local events="" config_before='config-before' sysctl_before='sysctl-before' legacy_sysctl_before='legacy-sysctl-before'
-    local service_before='service-before' persist_before='persist-before'
+    local service_before='service-before' persist_before='persist-before' final_path_before='final-path-before'
     local verb unit
     declare -A unit_enabled=(
         [bbrv3-lite.service]=enabled
@@ -2646,6 +2646,7 @@ test_action_transaction_rolls_back_failed_step() {
     printf '%s\n' "$legacy_sysctl_before" > "$LEGACY_SYSCTL_FILE"
     printf '%s\n' "$service_before" > "$SERVICE_FILE"
     printf '%s\n' "$persist_before" > "$PERSIST_SCRIPT"
+    printf '%s\n' "$final_path_before" > "$FINAL_PATH_PROFILE_FILE"
     ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_ROLLING_BACK=0; LOCK_HELD=1
     MULTI_NIC_ENABLED=0; TC_INTERFACE=auto
     action_qdisc_snapshot() {
@@ -2693,6 +2694,7 @@ test_action_transaction_rolls_back_failed_step() {
         rm -f -- "$LEGACY_SYSCTL_FILE"
         printf 'changed\n' > "$SERVICE_FILE"
         printf 'changed\n' > "$PERSIST_SCRIPT"
+        printf 'changed\n' > "$FINAL_PATH_PROFILE_FILE"
         return 7
     }
     if run_action_transaction_multi eth0 transaction_failure; then fail "failed transaction reported success"; fi
@@ -2701,6 +2703,7 @@ test_action_transaction_rolls_back_failed_step() {
     assert_eq "$legacy_sysctl_before" "$(<"$LEGACY_SYSCTL_FILE")" "transaction legacy sysctl restore"
     assert_eq "$service_before" "$(<"$SERVICE_FILE")" "transaction service restore"
     assert_eq "$persist_before" "$(<"$PERSIST_SCRIPT")" "transaction persistent script restore"
+    assert_eq "$final_path_before" "$(<"$FINAL_PATH_PROFILE_FILE")" "transaction final path profile restore"
     [[ "$events" == *'sysctl:net.core.somaxconn=4096'* && "$events" == *'qdisc:eth0'* && "$events" == *'systemctl:start bbrv3-lite.service'* ]] ||
         fail "transaction runtime/service restore events missing: $events"
     assert_eq '' "$ACTION_TRANSACTION_DIR" "transaction snapshot cleanup"
@@ -2809,6 +2812,7 @@ test_auto_tune_commits_only_after_final_verify() {
         fi
     }
     persist_current_tuning() { events+=" persist"; }
+    path_profile_persist_final() { events+=" path-profile"; }
     show_status() { :; }
 
     WIZARD_PEER=""
@@ -2821,7 +2825,7 @@ test_auto_tune_commits_only_after_final_verify() {
 
     events=""; candidate_rejected=0
     auto_tune_execute eth0 balanced mixed 0 150 1
-    assert_eq ' prepare sweep sysctl shape runtime verify persist' "$events" "auto commit order"
+    assert_eq ' prepare sweep sysctl shape runtime verify path-profile persist' "$events" "auto commit order"
     assert_eq 100 "$RTT_MS" "path-aware auto tuning RTT"
     assert_eq 1 "$(summary_value "$summary_dir/summary.tsv" PEER_RTT_MS)" "auto peer RTT history"
     assert_eq 100 "$(summary_value "$summary_dir/summary.tsv" TUNING_RTT_MS)" "auto tuning RTT history"

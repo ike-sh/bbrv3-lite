@@ -405,7 +405,7 @@ history_latest_type_result() {
 }
 
 status_measurement_details() {
-    local file completed age decision delivered shaping stored_fp family address source iface current current_fp state=unknown
+    local file profile completed age decision delivered shaping stored_fp family address source iface current current_fp state=unknown
     file=$(history_latest_type_result sweep SUCCESS 2>/dev/null || true)
     if [[ -z "$file" ]]; then
         printf '%-20s %s\n' 'Last measurement' none 'Measurement age' n/a Measurement none Decision none \
@@ -418,9 +418,10 @@ status_measurement_details() {
     delivered=$(history_field "$file" CAPACITY_RECEIVER_MBIT)
     [[ -n "$delivered" ]] || delivered=$(history_field "$file" SATURATION_RECEIVER_MBIT)
     shaping=$(history_field "$file" RECOMMEND)
-    stored_fp=$(history_field "$file" PATH_ROUTE_FINGERPRINT); family=$(history_field "$file" LOCKED_FAMILY)
-    address=$(history_field "$file" LOCKED_ADDRESS); source=$(history_field "$file" LOCKED_SOURCE)
-    iface=$(history_field "$file" LOCKED_INTERFACE)
+    profile=$(path_profile_for_sweep "$file")
+    stored_fp=$(path_summary_value "$profile" PATH_ROUTE_FINGERPRINT); family=$(path_summary_value "$profile" LOCKED_FAMILY)
+    address=$(path_summary_value "$profile" LOCKED_ADDRESS); source=$(path_summary_value "$profile" LOCKED_SOURCE)
+    iface=$(path_summary_value "$profile" LOCKED_INTERFACE)
     if [[ "$stored_fp" =~ ^[0-9a-f]{64}$ && ( "$family" == 4 || "$family" == 6 ) && -n "$address" && -n "$source" && -n "$iface" ]]; then
         current=$(path_capture_route_identity "$family" "$address" "$source" "$iface" 2>/dev/null || true)
         current_fp="${current%%$'\t'*}"

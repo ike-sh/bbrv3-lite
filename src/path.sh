@@ -13,6 +13,7 @@ PATH_ROUTE_MTU="unknown"
 PATH_PMTU="unknown"
 PATH_MSS="unknown"
 PATH_PMTU_PROBE_CAPPED=0
+PATH_PMTU_EVIDENCE="unavailable"
 PATH_PING_SENT=0
 PATH_PING_RECEIVED=0
 PATH_LOSS_PERCENT="na"
@@ -31,7 +32,7 @@ PATH_RISK_FLAGS="unavailable"
 PATH_CAPTURED_AT=""
 
 path_profile_reset_metrics() {
-    PATH_PMTU="unknown"; PATH_MSS="unknown"; PATH_PMTU_PROBE_CAPPED=0
+    PATH_PMTU="unknown"; PATH_MSS="unknown"; PATH_PMTU_PROBE_CAPPED=0; PATH_PMTU_EVIDENCE="unavailable"
     PATH_PING_SENT=0; PATH_PING_RECEIVED=0; PATH_LOSS_PERCENT="na"
     PATH_RTT_MIN_MS="na"; PATH_RTT_MEDIAN_MS="na"; PATH_RTT_P95_MS="na"; PATH_RTT_MAX_MS="na"
     PATH_RTT_JITTER_P95_MS="na"; PATH_GATEWAY_RTT_MS="na"
@@ -193,39 +194,106 @@ path_ping_command() {
         -n -i 0.2 -W 1 -c "$count" -- "$target"
 }
 
+# Classify one DF/IPv6-do-not-fragment probe.  A successful echo proves that
+# the candidate fits.  Only errors with explicit MTU semantics prove that it
+# does not; loss, timeout and generic unreachable results remain ambiguous.
+path_pmtu_probe_once() {
+    local family="$1" payload="$2" output rc lower
+    output=$(LC_ALL=C ping "-$family" -I "$MEASURE_PEER_IFACE" -I "$MEASURE_PEER_SOURCE" -M "do" \
+        -n -W 1 -c 1 -s "$payload" -- "$MEASURE_PEER_ADDRESS" 2>&1) && rc=0 || rc=$?
+    if (( rc == 0 )); then
+        printf 'fits\n'
+        return 0
+    fi
+    lower=$(LC_ALL=C tr '[:upper:]' '[:lower:]' <<< "$output")
+    case "$lower" in
+        *'emsgsize'*|*'message too long'*|*'frag needed'*|*'packet too big'*|*'packet needs to be fragmented'*|*'fragmentation needed'*)
+            printf 'too-large\n'
+            ;;
+        *)  printf 'ambiguous\n' ;;
+    esac
+}
+
+# Two matching observations out of at most three are the smallest quorum that
+# survives one dropped echo or one anomalous diagnostic without high traffic.
+path_pmtu_probe_candidate() {
+    local family="$1" payload="$2" result fits=0 too_large=0
+    for _ in 1 2 3; do
+        result=$(path_pmtu_probe_once "$family" "$payload") || result=ambiguous
+        case "$result" in
+            fits) ((fits+=1)) ;;
+            too-large) ((too_large+=1)) ;;
+            *) ;;
+        esac
+        if (( fits >= 2 )); then printf 'fits\n'; return 0; fi
+        if (( too_large >= 2 )); then printf 'too-large\n'; return 0; fi
+    done
+    printf 'ambiguous\n'
+}
+
 path_probe_pmtu() {
-    local enabled="$1" family="$MEASURE_PEER_FAMILY" interface_mtu="$PATH_INTERFACE_MTU"
-    local icmp_overhead tcp_overhead minimum high low mid payload best=0 probe_cap="${BBRV3_PATH_PMTU_CAP:-9000}"
-    (( enabled == 1 )) || { printf 'disabled\tunknown\t0\n'; return 0; }
-    is_uint "$interface_mtu" && (( interface_mtu >= 576 )) || { printf 'unknown\tunknown\t0\n'; return 0; }
+    local enabled="$1" family="$MEASURE_PEER_FAMILY" interface_mtu="$PATH_INTERFACE_MTU" route_mtu="$PATH_ROUTE_MTU"
+    local icmp_overhead tcp_overhead minimum high low mid payload best=0 result capped=0
+    local probe_cap="${BBRV3_PATH_PMTU_CAP:-9000}"
+    (( enabled == 1 )) || { printf 'disabled\tunknown\t0\tdisabled\n'; return 0; }
+    is_uint "$interface_mtu" && (( interface_mtu >= 576 )) || { printf 'unknown\tunknown\t0\tunavailable\n'; return 0; }
     is_uint "$probe_cap" && (( probe_cap >= 1280 && probe_cap <= 65535 )) || probe_cap=9000
     if [[ "$family" == 6 ]]; then
         icmp_overhead=48; tcp_overhead=60; minimum=1280
     else
         icmp_overhead=28; tcp_overhead=40; minimum=576
     fi
-    high="$interface_mtu"; PATH_PMTU_PROBE_CAPPED=0
-    if (( high > probe_cap )); then high="$probe_cap"; PATH_PMTU_PROBE_CAPPED=1; fi
-    (( high >= minimum )) || { printf '%s\tunknown\t%s\n' "$high" "$PATH_PMTU_PROBE_CAPPED"; return 0; }
-    payload=$((minimum - icmp_overhead)); (( payload >= 0 )) || return 1
-    if ! ping "-$family" -I "$MEASURE_PEER_IFACE" -I "$MEASURE_PEER_SOURCE" -M "do" \
-            -n -W 1 -c 1 -s "$payload" -- "$MEASURE_PEER_ADDRESS" >/dev/null 2>&1; then
-        printf 'unknown\tunknown\t%s\n' "$PATH_PMTU_PROBE_CAPPED"
-        return 0
-    fi
-    low="$minimum"; best="$minimum"
+    high="$interface_mtu"
+    if is_uint "$route_mtu" && (( route_mtu < high )); then high="$route_mtu"; fi
+    if (( high > probe_cap )); then high="$probe_cap"; capped=1; fi
+    (( high >= minimum )) || { printf 'unknown\tunknown\t%s\tbelow-family-minimum\n' "$capped"; return 0; }
+
+    # Fast path: the route/interface ceiling is the most useful candidate and
+    # a confirmed success proves the full PMTU without binary search.
+    payload=$((high - icmp_overhead)); (( payload >= 0 )) || return 1
+    result=$(path_pmtu_probe_candidate "$family" "$payload") || result=ambiguous
+    case "$result" in
+        fits)
+            if (( capped )); then
+                printf '%s\t%s\t%s\tcapped-lower-bound\n' "$high" "$((high-tcp_overhead))" "$capped"
+            else
+                printf '%s\t%s\t%s\tfull-mtu-confirmed\n' "$high" "$((high-tcp_overhead))" "$capped"
+            fi
+            return 0
+            ;;
+        ambiguous)
+            printf 'unknown\tunknown\t%s\tinconclusive\n' "$capped"
+            return 0
+            ;;
+        too-large) ;;
+        *) return 1 ;;
+    esac
+
+    # A lower bound is useful only when confirmed.  Every subsequent upper
+    # bound reduction likewise requires a confirmed MTU-specific failure.
+    payload=$((minimum - icmp_overhead))
+    result=$(path_pmtu_probe_candidate "$family" "$payload") || result=ambiguous
+    case "$result" in
+        fits) low=$((minimum + 1)); best="$minimum" ;;
+        *) printf 'unknown\tunknown\t%s\tinconclusive\n' "$capped"; return 0 ;;
+    esac
+    high=$((high - 1))
     while (( low <= high )); do
         mid=$(((low + high) / 2)); payload=$((mid - icmp_overhead))
-        if ping "-$family" -I "$MEASURE_PEER_IFACE" -I "$MEASURE_PEER_SOURCE" -M "do" \
-                -n -W 1 -c 1 -s "$payload" -- "$MEASURE_PEER_ADDRESS" >/dev/null 2>&1; then
-            best="$mid"; low=$((mid + 1))
-        else
-            high=$((mid - 1))
-        fi
+        result=$(path_pmtu_probe_candidate "$family" "$payload") || result=ambiguous
+        case "$result" in
+            fits) best="$mid"; low=$((mid + 1)) ;;
+            too-large) high=$((mid - 1)) ;;
+            ambiguous)
+                printf 'unknown\tunknown\t%s\tinconclusive\n' "$capped"
+                return 0
+                ;;
+            *) return 1 ;;
+        esac
     done
     # PMTU probing uses ICMP payload size, but the reported MSS is a TCP
     # quantity: PMTU minus IP and TCP headers (40 bytes for IPv4, 60 for IPv6).
-    printf '%s\t%s\t%s\n' "$best" "$((best-tcp_overhead))" "$PATH_PMTU_PROBE_CAPPED"
+    printf '%s\t%s\t%s\treduced-mtu-confirmed\n' "$best" "$((best-tcp_overhead))" "$capped"
 }
 
 path_latency_class() {
@@ -263,7 +331,10 @@ path_profile_classify() {
         fi
     fi
     if ! is_uint "$PATH_PMTU"; then
-        score=$((score - 5)); risks+=(pmtu-unavailable)
+        score=$((score - 5))
+        if [[ "$PATH_PMTU_EVIDENCE" == inconclusive ]]; then risks+=(pmtu-probe-inconclusive)
+        else risks+=(pmtu-unavailable)
+        fi
     elif (( PATH_PMTU < minimum_mtu )); then
         decision=unsafe; score=$((score - 50)); risks+=(pmtu-below-family-minimum)
     elif is_uint "$PATH_INTERFACE_MTU" && (( PATH_PMTU < PATH_INTERFACE_MTU )) && (( PATH_PMTU_PROBE_CAPPED == 0 )); then
@@ -311,7 +382,7 @@ path_profile_capture() {
         [[ -n "$PATH_GATEWAY_RTT_MS" ]] || PATH_GATEWAY_RTT_MS=na
     fi
     pmtu_state=$(path_probe_pmtu "$pmtu_enabled") || { rm -f -- "$output_file" "$values_file"; return 1; }
-    IFS=$'\t' read -r PATH_PMTU PATH_MSS PATH_PMTU_PROBE_CAPPED <<< "$pmtu_state"
+    IFS=$'\t' read -r PATH_PMTU PATH_MSS PATH_PMTU_PROBE_CAPPED PATH_PMTU_EVIDENCE <<< "$pmtu_state"
     path_verify_route_identity || { rm -f -- "$output_file" "$values_file"; return 1; }
     path_profile_classify
     if [[ -n "${MEASURE_RUN_DIR:-}" && -d "$MEASURE_RUN_DIR" ]]; then
@@ -354,10 +425,10 @@ path_safe_summary_value() {
 path_profile_append_summary() {
     local file="$1"
     [[ -f "$file" && ! -L "$file" ]] || return 1
-    printf 'PATH_PROFILE_SCHEMA\t%s\nPATH_CAPTURED_AT\t%s\nPATH_ROUTE_FINGERPRINT\t%s\nPATH_ENDPOINT_FINGERPRINT\t%s\nPATH_GATEWAY\t%s\nPATH_TABLE\t%s\nPATH_INTERFACE_MTU\t%s\nPATH_ROUTE_MTU\t%s\nPATH_PMTU\t%s\nPATH_MSS\t%s\nPATH_PMTU_PROBE_CAPPED\t%s\nPATH_PING_SENT\t%s\nPATH_PING_RECEIVED\t%s\nPATH_LOSS_PERCENT\t%s\nPATH_RTT_MIN_MS\t%s\nPATH_RTT_MEDIAN_MS\t%s\nPATH_RTT_P95_MS\t%s\nPATH_RTT_MAX_MS\t%s\nPATH_RTT_JITTER_P95_MS\t%s\nPATH_GATEWAY_RTT_MS\t%s\nPATH_LATENCY_CLASS\t%s\nPATH_STABILITY\t%s\nPATH_PROFILE_SCORE\t%s\nPATH_PROFILE_GRADE\t%s\nPATH_DECISION\t%s\nPATH_RISK_FLAGS\t%s\n' \
+    printf 'PATH_PROFILE_SCHEMA\t%s\nPATH_CAPTURED_AT\t%s\nPATH_ROUTE_FINGERPRINT\t%s\nPATH_ENDPOINT_FINGERPRINT\t%s\nPATH_GATEWAY\t%s\nPATH_TABLE\t%s\nPATH_INTERFACE_MTU\t%s\nPATH_ROUTE_MTU\t%s\nPATH_PMTU\t%s\nPATH_MSS\t%s\nPATH_PMTU_PROBE_CAPPED\t%s\nPATH_PMTU_EVIDENCE\t%s\nPATH_PING_SENT\t%s\nPATH_PING_RECEIVED\t%s\nPATH_LOSS_PERCENT\t%s\nPATH_RTT_MIN_MS\t%s\nPATH_RTT_MEDIAN_MS\t%s\nPATH_RTT_P95_MS\t%s\nPATH_RTT_MAX_MS\t%s\nPATH_RTT_JITTER_P95_MS\t%s\nPATH_GATEWAY_RTT_MS\t%s\nPATH_LATENCY_CLASS\t%s\nPATH_STABILITY\t%s\nPATH_PROFILE_SCORE\t%s\nPATH_PROFILE_GRADE\t%s\nPATH_DECISION\t%s\nPATH_RISK_FLAGS\t%s\n' \
         "$PATH_PROFILE_SCHEMA" "$PATH_CAPTURED_AT" "$PATH_ROUTE_FINGERPRINT" "$PATH_ENDPOINT_FINGERPRINT" \
         "$(path_safe_summary_value "$PATH_GATEWAY")" "$(path_safe_summary_value "$PATH_TABLE")" \
-        "$PATH_INTERFACE_MTU" "$PATH_ROUTE_MTU" "$PATH_PMTU" "$PATH_MSS" "$PATH_PMTU_PROBE_CAPPED" \
+        "$PATH_INTERFACE_MTU" "$PATH_ROUTE_MTU" "$PATH_PMTU" "$PATH_MSS" "$PATH_PMTU_PROBE_CAPPED" "$PATH_PMTU_EVIDENCE" \
         "$PATH_PING_SENT" "$PATH_PING_RECEIVED" "$PATH_LOSS_PERCENT" "$PATH_RTT_MIN_MS" "$PATH_RTT_MEDIAN_MS" \
         "$PATH_RTT_P95_MS" "$PATH_RTT_MAX_MS" "$PATH_RTT_JITTER_P95_MS" "$PATH_GATEWAY_RTT_MS" \
         "$PATH_LATENCY_CLASS" "$PATH_STABILITY" "$PATH_PROFILE_SCORE" "$PATH_PROFILE_GRADE" "$PATH_DECISION" \
@@ -373,6 +444,7 @@ path_profile_report() {
     printf '%-22s %s\n' 'Jitter / ICMP loss' "$PATH_RTT_JITTER_P95_MS ms / $PATH_LOSS_PERCENT% ($PATH_PING_RECEIVED/$PATH_PING_SENT)"
     printf '%-22s %s\n' 'Gateway RTT' "$PATH_GATEWAY_RTT_MS ms"
     printf '%-22s %s\n' 'MTU / PMTU / MSS' "$PATH_INTERFACE_MTU / $PATH_PMTU / $PATH_MSS"
+    printf '%-22s %s\n' 'PMTU evidence' "$PATH_PMTU_EVIDENCE"
     printf '%-22s %s\n' 'Path class' "$PATH_LATENCY_CLASS / $PATH_STABILITY"
     printf '%-22s %s\n' 'Path confidence' "$PATH_PROFILE_GRADE ($PATH_PROFILE_SCORE/100)"
     printf '%-22s %s\n' 'Tuning decision' "$PATH_DECISION ($PATH_RISK_FLAGS)"
@@ -383,12 +455,182 @@ path_summary_value() {
     awk -F'\t' -v key="$key" '$1==key {print $2; exit}' "$file" 2>/dev/null
 }
 
+path_profile_required_keys() {
+    printf '%s\n' \
+        PATH_PROFILE_SCHEMA PATH_CAPTURED_AT PATH_ROUTE_FINGERPRINT PATH_ENDPOINT_FINGERPRINT \
+        PATH_GATEWAY PATH_TABLE PATH_INTERFACE_MTU PATH_ROUTE_MTU PATH_PMTU PATH_MSS \
+        PATH_PMTU_PROBE_CAPPED PATH_PMTU_EVIDENCE PATH_PING_SENT PATH_PING_RECEIVED \
+        PATH_LOSS_PERCENT PATH_RTT_MIN_MS PATH_RTT_MEDIAN_MS PATH_RTT_P95_MS PATH_RTT_MAX_MS \
+        PATH_RTT_JITTER_P95_MS PATH_GATEWAY_RTT_MS PATH_LATENCY_CLASS PATH_STABILITY \
+        PATH_PROFILE_SCORE PATH_PROFILE_GRADE PATH_DECISION PATH_RISK_FLAGS
+}
+
+path_profile_summary_complete() {
+    local file="$1" key value count family pmtu mss evidence score sent received
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    for key in PEER PORT LOCKED_ADDRESS LOCKED_SOURCE LOCKED_INTERFACE LOCKED_FAMILY; do
+        count=$(awk -F'\t' -v key="$key" '$1==key {n++} END {print n+0}' "$file" 2>/dev/null)
+        (( count == 1 )) || return 1
+    done
+    while IFS= read -r key; do
+        count=$(awk -F'\t' -v key="$key" '$1==key {n++} END {print n+0}' "$file" 2>/dev/null)
+        (( count == 1 )) || return 1
+        value=$(path_summary_value "$file" "$key")
+        [[ -n "$value" ]] || return 1
+    done < <(path_profile_required_keys)
+    [[ "$(path_summary_value "$file" PATH_PROFILE_SCHEMA)" == "$PATH_PROFILE_SCHEMA" ]] || return 1
+    [[ "$(path_summary_value "$file" PATH_ROUTE_FINGERPRINT)" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$(path_summary_value "$file" PATH_ENDPOINT_FINGERPRINT)" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$(path_summary_value "$file" PATH_CAPTURED_AT)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+    family=$(path_summary_value "$file" LOCKED_FAMILY); [[ "$family" == 4 || "$family" == 6 ]] || return 1
+    is_uint "$(path_summary_value "$file" PATH_INTERFACE_MTU)" || return 1
+    is_uint "$(path_summary_value "$file" PATH_ROUTE_MTU)" || return 1
+    sent=$(path_summary_value "$file" PATH_PING_SENT); received=$(path_summary_value "$file" PATH_PING_RECEIVED)
+    is_uint "$sent" && is_uint "$received" && (( received <= sent )) || return 1
+    score=$(path_summary_value "$file" PATH_PROFILE_SCORE); is_uint "$score" && (( score <= 100 )) || return 1
+    [[ "$(path_summary_value "$file" PATH_PMTU_PROBE_CAPPED)" == 0 || "$(path_summary_value "$file" PATH_PMTU_PROBE_CAPPED)" == 1 ]] || return 1
+    evidence=$(path_summary_value "$file" PATH_PMTU_EVIDENCE)
+    case "$evidence" in
+        full-mtu-confirmed|reduced-mtu-confirmed|capped-lower-bound)
+            pmtu=$(path_summary_value "$file" PATH_PMTU); mss=$(path_summary_value "$file" PATH_MSS)
+            is_uint "$pmtu" && is_uint "$mss" || return 1
+            ;;
+        inconclusive|unavailable|below-family-minimum)
+            [[ "$(path_summary_value "$file" PATH_PMTU)" == unknown && "$(path_summary_value "$file" PATH_MSS)" == unknown ]] || return 1
+            ;;
+        disabled)
+            [[ "$(path_summary_value "$file" PATH_PMTU)" == disabled && "$(path_summary_value "$file" PATH_MSS)" == unknown ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    case "$(path_summary_value "$file" PATH_DECISION)" in trusted|limited|unsafe) ;; *) return 1 ;; esac
+}
+
+# Read legacy and standalone path captures without weakening final-profile
+# promotion.  v8.0.6 summaries have no PATH_PMTU_EVIDENCE, and standalone
+# `measure path` history did not require a transport PORT field.
+path_profile_summary_readable() {
+    local file="$1" key value count
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    for key in PEER LOCKED_ADDRESS LOCKED_SOURCE LOCKED_INTERFACE LOCKED_FAMILY; do
+        [[ -n "$(path_summary_value "$file" "$key")" ]] || return 1
+    done
+    while IFS= read -r key; do
+        [[ "$key" != PATH_PMTU_EVIDENCE ]] || continue
+        count=$(awk -F'\t' -v key="$key" '$1==key {n++} END {print n+0}' "$file" 2>/dev/null)
+        (( count == 1 )) || return 1
+        value=$(path_summary_value "$file" "$key"); [[ -n "$value" ]] || return 1
+    done < <(path_profile_required_keys)
+    [[ "$(path_summary_value "$file" PATH_PROFILE_SCHEMA)" == "$PATH_PROFILE_SCHEMA" ]] || return 1
+    [[ "$(path_summary_value "$file" PATH_ROUTE_FINGERPRINT)" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$(path_summary_value "$file" PATH_ENDPOINT_FINGERPRINT)" =~ ^[0-9a-f]{64}$ ]] || return 1
+}
+
+path_profile_history_id() {
+    local file="$1" id
+    [[ "$file" == "$HISTORY_DIR/"*/summary.tsv ]] || return 1
+    id="${file%/summary.tsv}"; id="${id##*/}"
+    [[ "$id" =~ ^[0-9]{8}T[0-9]{6}Z-(path|path-check|probe|sweep|verify|compare)(-[0-9]+)?$ ]] || return 1
+    printf '%s\n' "$id"
+}
+
+path_profiles_same_identity() {
+    local sweep="$1" candidate="$2" key
+    for key in PEER LOCKED_ADDRESS LOCKED_SOURCE LOCKED_INTERFACE LOCKED_FAMILY \
+        PATH_ROUTE_FINGERPRINT PATH_ENDPOINT_FINGERPRINT PATH_GATEWAY PATH_TABLE \
+        PATH_INTERFACE_MTU PATH_ROUTE_MTU; do
+        [[ "$(path_summary_value "$sweep" "$key")" == "$(path_summary_value "$candidate" "$key")" ]] || return 1
+    done
+}
+
+# Persist one complete, real capture as the authority for status.  The source
+# history files are read-only here: the final profile is a separate atomic
+# artifact with explicit sweep/verify provenance.
+path_profile_persist_final() {
+    local sweep="$1" candidate="$2" source="$3" sweep_id source_id temp key value
+    path_profile_summary_complete "$sweep" || { die "sweep path profile 不完整；不会持久化最终画像"; return 1; }
+    path_profile_summary_complete "$candidate" || { die "final path profile 不完整；不会持久化"; return 1; }
+    sweep_id=$(path_profile_history_id "$sweep") || return 1
+    source_id=$(path_profile_history_id "$candidate") || return 1
+    [[ "$(path_summary_value "$sweep" TYPE)" == sweep && "$(path_summary_value "$sweep" RESULT)" == SUCCESS ]] || return 1
+    path_profiles_same_identity "$sweep" "$candidate" || {
+        die "sweep 与 final path profile 身份不一致；不会持久化"
+        return 1
+    }
+    case "$source" in
+        verify)
+            [[ "$(path_summary_value "$candidate" TYPE)" == verify && \
+               "$(path_summary_value "$candidate" RESULT)" == SUCCESS && \
+               "$(path_summary_value "$candidate" ACCEPTED)" == 1 && \
+               "$(path_summary_value "$candidate" PATH_DECISION)" == trusted ]] || {
+                die "最终 verify path profile 未同时满足 success/accepted/trusted；不会持久化"
+                return 1
+            }
+            ;;
+        sweep-local-fallback|sweep-untrusted-verify)
+            [[ "$candidate" == "$sweep" && "$(path_summary_value "$candidate" PATH_DECISION)" != unsafe ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+
+    ensure_state_layout || return 1
+    temp=$(mktemp "${STATE_DIR}/.final-path-profile.XXXXXX") || return 1
+    if ! printf 'FINAL_PATH_PROFILE_SCHEMA\t1\nFINAL_PATH_PROFILE_SOURCE\t%s\nFINAL_PATH_SWEEP_HISTORY_ID\t%s\nFINAL_PATH_SOURCE_HISTORY_ID\t%s\nFINAL_PATH_PERSISTED_AT\t%s\n' \
+        "$source" "$sweep_id" "$source_id" "$(utc_now)" > "$temp"; then
+        rm -f -- "$temp"; return 1
+    fi
+    for key in PEER PORT INTERFACE LOCKED_ADDRESS LOCKED_SOURCE LOCKED_INTERFACE LOCKED_FAMILY LOCKED_PORT; do
+        value=$(path_summary_value "$candidate" "$key")
+        printf '%s\t%s\n' "$key" "$(path_safe_summary_value "$value")" >> "$temp" || { rm -f -- "$temp"; return 1; }
+    done
+    while IFS= read -r key; do
+        value=$(path_summary_value "$candidate" "$key")
+        printf '%s\t%s\n' "$key" "$(path_safe_summary_value "$value")" >> "$temp" || { rm -f -- "$temp"; return 1; }
+    done < <(path_profile_required_keys)
+    atomic_install "$temp" "$FINAL_PATH_PROFILE_FILE" 0600 || { rm -f -- "$temp"; return 1; }
+    rm -f -- "$temp"
+}
+
+path_final_profile_valid() {
+    local file="${1:-$FINAL_PATH_PROFILE_FILE}" source
+    [[ "$(path_summary_value "$file" FINAL_PATH_PROFILE_SCHEMA)" == 1 ]] || return 1
+    source=$(path_summary_value "$file" FINAL_PATH_PROFILE_SOURCE)
+    [[ "$source" == verify || "$source" == sweep-local-fallback || "$source" == sweep-untrusted-verify ]] || return 1
+    [[ "$(path_summary_value "$file" FINAL_PATH_SWEEP_HISTORY_ID)" =~ ^[0-9]{8}T[0-9]{6}Z-sweep(-[0-9]+)?$ ]] || return 1
+    [[ "$(path_summary_value "$file" FINAL_PATH_SOURCE_HISTORY_ID)" =~ ^[0-9]{8}T[0-9]{6}Z-(sweep|verify)(-[0-9]+)?$ ]] || return 1
+    path_profile_summary_complete "$file"
+}
+
+path_profile_for_sweep() {
+    local sweep="$1" sweep_id
+    sweep_id=$(path_profile_history_id "$sweep") || { printf '%s\n' "$sweep"; return 0; }
+    if path_final_profile_valid "$FINAL_PATH_PROFILE_FILE" &&
+       [[ "$(path_summary_value "$FINAL_PATH_PROFILE_FILE" FINAL_PATH_SWEEP_HISTORY_ID)" == "$sweep_id" ]]; then
+        printf '%s\n' "$FINAL_PATH_PROFILE_FILE"
+    else
+        printf '%s\n' "$sweep"
+    fi
+}
+
 latest_path_summary() {
     local file
+    if path_final_profile_valid "$FINAL_PATH_PROFILE_FILE"; then
+        printf '%s\n' "$FINAL_PATH_PROFILE_FILE"
+        return 0
+    fi
     [[ -d "$HISTORY_DIR" && ! -L "$HISTORY_DIR" ]] || return 1
+    # A failed or unrelated verify must never displace the last successful
+    # sweep.  The separate final profile above is the only promoted authority.
     while IFS= read -r file; do
         [[ -f "$file" && ! -L "$file" ]] || continue
-        [[ "$(path_summary_value "$file" PATH_PROFILE_SCHEMA)" == "$PATH_PROFILE_SCHEMA" ]] || continue
+        [[ "$(path_summary_value "$file" TYPE)" == sweep && "$(path_summary_value "$file" RESULT)" == SUCCESS ]] || continue
+        path_profile_summary_readable "$file" || continue
+        printf '%s\n' "$file"
+        return 0
+    done < <(find "$HISTORY_DIR" -mindepth 2 -maxdepth 2 -type f -name summary.tsv -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-)
+    while IFS= read -r file; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        path_profile_summary_readable "$file" || continue
         printf '%s\n' "$file"
         return 0
     done < <(find "$HISTORY_DIR" -mindepth 2 -maxdepth 2 -type f -name summary.tsv -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-)
@@ -396,12 +638,14 @@ latest_path_summary() {
 }
 
 latest_path_brief() {
-    local file peer iface family latency stability pmtu score
+    local file peer iface family latency stability pmtu score source
     file=$(latest_path_summary 2>/dev/null) || { printf 'none\n'; return 0; }
     peer=$(path_summary_value "$file" PEER); iface=$(path_summary_value "$file" LOCKED_INTERFACE)
     family=$(path_summary_value "$file" LOCKED_FAMILY); latency=$(path_summary_value "$file" PATH_LATENCY_CLASS)
     stability=$(path_summary_value "$file" PATH_STABILITY); pmtu=$(path_summary_value "$file" PATH_PMTU)
     score=$(path_summary_value "$file" PATH_PROFILE_SCORE)
-    printf '%s / %s / IPv%s / %s / %s / PMTU %s / %s/100\n' \
-        "${peer:-unknown}" "${iface:-unknown}" "${family:-?}" "${latency:-unknown}" "${stability:-unknown}" "${pmtu:-unknown}" "${score:-0}"
+    source=$(path_summary_value "$file" FINAL_PATH_PROFILE_SOURCE)
+    [[ -n "$source" ]] || source=$(path_summary_value "$file" TYPE)
+    printf '%s / %s / IPv%s / %s / %s / PMTU %s / %s/100 / source %s\n' \
+        "${peer:-unknown}" "${iface:-unknown}" "${family:-?}" "${latency:-unknown}" "${stability:-unknown}" "${pmtu:-unknown}" "${score:-0}" "${source:-capture}"
 }

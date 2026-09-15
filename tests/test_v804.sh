@@ -252,6 +252,7 @@ run_final_verify_case() (
         (( local_rc == 0 )) || return "$local_rc"
         printf '%s\t%s\n' "$path_fp" "$endpoint_fp"
     }
+    path_profile_persist_final() { :; }
     persist_current_tuning() { events+=' persist'; }
     show_status() { :; }
     if auto_tune_run_transaction eth0 balanced mixed 0 100 1 >/dev/null 2>&1; then rc=0; else rc=$?; fi

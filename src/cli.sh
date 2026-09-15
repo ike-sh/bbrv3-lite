@@ -644,7 +644,8 @@ auto_tune_execute() {
     local iface="$1" profile="$2" role="$3" nominal="$4" tuning_rtt="$5" peer_rtt="${6:-0}"
     local summary recommend knee measured no_knee confirmed reject_reason min_efficiency clean_reference_loss expected_rate=0
     local path_control_quality measurement_state scan_decision verify_rc local_verify_state final_verify_mode=iperf final_verify_degraded=0 final_verify_reason=none
-    local role_floor rtt_source verify_summary verify_confidence_score verify_confidence_grade verify_confidence_reasons
+    local role_floor rtt_source verify_summary verify_confidence_score verify_confidence_grade verify_confidence_reasons verify_path_decision
+    local final_path_profile_summary final_path_profile_source
     local sweep_path_fingerprint verify_path_fingerprint sweep_endpoint_fingerprint verify_endpoint_fingerprint path_rtt
     prepare_auto_tuning_runtime "$iface" "$iface" "$profile" "$role" "$nominal" "$tuning_rtt" || return 1
     if [[ -z "${WIZARD_PEER:-}" ]]; then
@@ -756,6 +757,16 @@ auto_tune_execute() {
             else verify_confidence_reasons="${verify_confidence_reasons},peer-failover"
             fi
         fi
+        verify_path_decision=$(summary_value "$verify_summary" PATH_DECISION)
+        if [[ "$verify_path_decision" == trusted ]]; then
+            final_path_profile_summary="$verify_summary"; final_path_profile_source="verify"
+        else
+            # The throughput verdict keeps its existing semantics.  An
+            # incomplete final path capture simply cannot replace the intact
+            # sweep capture used by the workflow.
+            final_path_profile_summary="$summary"; final_path_profile_source="sweep-untrusted-verify"
+            log WARN "最终 verify path profile 不是 trusted（${verify_path_decision:-missing}）；保留完整 sweep path profile 作为状态依据"
+        fi
     else
         verify_rc=$?
         if (( verify_rc == IPERF_UNAVAILABLE_RC && expected_rate == 0 && TC_ENABLED == 0 && TC_RATE_MBIT == 0 )) &&
@@ -767,6 +778,7 @@ auto_tune_execute() {
             IFS=$'\t' read -r verify_path_fingerprint verify_endpoint_fingerprint <<< "$local_verify_state"
             final_verify_mode="local-fallback"; final_verify_degraded=1; final_verify_reason="peer-unavailable"
             verify_confidence_score=0; verify_confidence_grade=degraded; verify_confidence_reasons="peer-unavailable-local-runtime-fallback"
+            final_path_profile_summary="$summary"; final_path_profile_source="sweep-local-fallback"
             log OK "BBR + FQ 最终验证通过"
         else
             return "$verify_rc"
@@ -774,6 +786,7 @@ auto_tune_execute() {
     fi
     printf 'FINAL_VERIFY_MODE\t%s\nFINAL_VERIFY_DEGRADED\t%s\nFINAL_VERIFY_REASON\t%s\nFINAL_VERIFY_PEER\t%s\nFINAL_VERIFY_PORT\t%s\nTOTAL_PUBLIC_PEER_FAILOVERS\t%s\nFINAL_VERIFY_CONFIDENCE_SCORE\t%s\nFINAL_VERIFY_CONFIDENCE_GRADE\t%s\nFINAL_VERIFY_CONFIDENCE_REASONS\t%s\nFINAL_VERIFY_PATH_FINGERPRINT\t%s\nFINAL_VERIFY_ENDPOINT_FINGERPRINT\t%s\n' \
         "$final_verify_mode" "$final_verify_degraded" "$final_verify_reason" "$WIZARD_PEER" "$WIZARD_PORT" "${WIZARD_FAILOVERS:-0}" "$verify_confidence_score" "$verify_confidence_grade" "$verify_confidence_reasons" "$verify_path_fingerprint" "$verify_endpoint_fingerprint" >> "$summary" || return 1
+    path_profile_persist_final "$summary" "$final_path_profile_summary" "$final_path_profile_source" || return 1
     if (( ${WIZARD_ROUTE_GUARD_ACTIVE:-0} )); then
         auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-$WIZARD_PEER}" || return 1
     fi

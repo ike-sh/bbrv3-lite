@@ -639,6 +639,7 @@ action_transaction_snapshot_validate() {
     action_transaction_path_snapshot_validate service || return 1
     action_transaction_path_snapshot_validate legacy-service || return 1
     action_transaction_path_snapshot_validate persist-script || return 1
+    action_transaction_path_snapshot_validate final-path-profile || return 1
     action_transaction_path_snapshot_validate nic-policy-dir tree || return 1
     unit_state_snapshot_validate "$dir/service.unit" || return 1
     unit_state_snapshot_validate "$dir/legacy-service.unit" || return 1
@@ -745,6 +746,7 @@ action_transaction_begin() {
        ! action_transaction_snapshot_path "$SERVICE_FILE" service ||
        ! action_transaction_snapshot_path "$LEGACY_SERVICE_FILE" legacy-service ||
        ! action_transaction_snapshot_path "$PERSIST_SCRIPT" persist-script ||
+       ! action_transaction_snapshot_path "$FINAL_PATH_PROFILE_FILE" final-path-profile ||
        ! action_transaction_snapshot_tree "$NIC_POLICY_DIR" nic-policy-dir; then
         remove_tree_within "$dir" "$STATE_DIR" || true
         ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_INTERFACES=""; ACTION_TRANSACTION_READY=0; ACTION_TRANSACTION_MUTATED=0
@@ -989,6 +991,7 @@ action_transaction_rollback() {
     action_transaction_restore_path "$SERVICE_FILE" service || rc=1
     action_transaction_restore_path "$LEGACY_SERVICE_FILE" legacy-service || rc=1
     action_transaction_restore_path "$PERSIST_SCRIPT" persist-script || rc=1
+    action_transaction_restore_path "$FINAL_PATH_PROFILE_FILE" final-path-profile || rc=1
     action_transaction_restore_tree "$NIC_POLICY_DIR" nic-policy-dir || rc=1
     rmdir "$PERSIST_DIR" 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1 || rc=1

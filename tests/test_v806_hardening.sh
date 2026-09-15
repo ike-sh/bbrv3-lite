@@ -516,6 +516,7 @@ test_production_peer_churn_operation() (
     }
     prepare_auto_tuning_runtime() { :; }; verify_runtime_tuning() { :; }
     nic_stage_candidate_global_model() { :; }; apply_sysctl_profile() { :; }; apply_shaping() { :; }; apply_fq() { :; }
+    path_profile_persist_final() { :; }
     recommended_verify_flows() { printf '4\n'; }; persist_current_tuning() { : > "$committed"; }; show_status() { :; }
     auto_tune_execute eth0 balanced mixed 0 100 12 >/dev/null
     measurement_usage_update; total="$TEST_TX_BYTES_USED"

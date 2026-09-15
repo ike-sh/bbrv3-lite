@@ -53,6 +53,7 @@ grep -Eq $'^PATH_ROUTE_FINGERPRINT\t[0-9a-f]{64}$' "$summary" || fail "route fin
 grep -Eq $'^PATH_ENDPOINT_FINGERPRINT\t[0-9a-f]{64}$' "$summary" || fail "endpoint fingerprint is missing"
 grep -Eq $'^PATH_PMTU\t1500$' "$summary" || fail "real PMTU probe did not find 1500"
 grep -Eq $'^PATH_MSS\t1460$' "$summary" || fail "real IPv4 TCP MSS calculation is wrong"
+grep -Eq $'^PATH_PMTU_EVIDENCE\tfull-mtu-confirmed$' "$summary" || fail "real full-MTU evidence was not recorded"
 grep -Eq $'^PATH_DECISION\ttrusted$' "$summary" || fail "stable local path was not trusted"
 grep -Eq $'^PATH_PING_RECEIVED\t3$' "$summary" || fail "real RTT samples were not recorded"
 
@@ -71,6 +72,7 @@ no_pmtu_summary=$(find "$NO_PMTU_STATE/history" -type f -name summary.tsv -print
 grep -Eq $'^PATH_PING_RECEIVED\t4$' "$no_pmtu_summary" || fail "--samples was not propagated"
 grep -Eq $'^PATH_PMTU\tdisabled$' "$no_pmtu_summary" || fail "--no-pmtu was not propagated"
 grep -Eq $'^PATH_MSS\tunknown$' "$no_pmtu_summary" || fail "disabled PMTU reported an MSS"
+grep -Eq $'^PATH_PMTU_EVIDENCE\tdisabled$' "$no_pmtu_summary" || fail "disabled PMTU evidence was not recorded"
 
 # Lock the same route, then alter only its route-level MTU. The endpoint still
 # responds, but the forwarding identity must be treated as changed.

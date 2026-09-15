@@ -65,8 +65,9 @@ install_path_mocks() {
         if [[ " $* " == *' -M do '* ]]; then
             [[ -n "$payload" ]] || return 1
             [[ " $* " != *' -6 '* ]] || icmp_overhead=48
-            (( payload + icmp_overhead <= MOCK_PMTU ))
-            return
+            if (( payload + icmp_overhead <= MOCK_PMTU )); then return 0; fi
+            printf 'ping: local error: message too long, mtu=%s\n' "$MOCK_PMTU" >&2
+            return 1
         fi
         if [[ "$target" == "$ROUTE_GATEWAY" ]]; then
             printf '%s\n' \
@@ -160,10 +161,11 @@ test_ipv6_tcp_mss_math() {
         PATH_INTERFACE_MTU=1500
         MOCK_PMTU=1280
         state=$(path_probe_pmtu 1)
-        IFS=$'\t' read -r pmtu mss capped <<< "$state"
+        IFS=$'\t' read -r pmtu mss capped evidence <<< "$state"
         assert_eq 1280 "$pmtu" "IPv6 PMTU"
         assert_eq 1220 "$mss" "IPv6 TCP MSS"
         assert_eq 0 "$capped" "IPv6 PMTU cap flag"
+        assert_eq reduced-mtu-confirmed "$evidence" "IPv6 PMTU evidence"
     )
 }
 
