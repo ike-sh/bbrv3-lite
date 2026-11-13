@@ -100,6 +100,8 @@ export BBRV3_MAX_CPU_BUSY_PERCENT=100
 
 # shellcheck source=../net-tcp-tune.sh
 source "$ROOT_DIR/net-tcp-tune.sh"
+# shellcheck source=helpers/iperf-server.sh
+source "$ROOT_DIR/tests/helpers/iperf-server.sh"
 
 # Use a deterministic dual-stack resolver record while exercising real Linux
 # routes, source binding, TCP sockets and iperf3. AAAA is deliberately first.
@@ -119,11 +121,7 @@ resolve_route_target_addresses() {
 # Endpoint selection must skip the unusable AAAA without changing IPv6 state.
 ip netns exec "$NS_NAME" iperf3 -s -4 -B "$V4_PEER" -p "$V4_PORT" > "$TEST_ROOT/iperf4.log" 2>&1 &
 SERVER_PID=$!
-for _ in 1 2 3 4 5; do
-    if timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$V4_PEER" "$V4_PORT" >/dev/null 2>&1; then break; fi
-    sleep 1
-done
-timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$V4_PEER" "$V4_PORT" >/dev/null 2>&1 || fail "IPv4 iperf3 server did not start"
+integration_wait_for_iperf_server "$V4_PEER" "$V4_PORT" 4 "$V4_LOCAL" "$TEST_ROOT/iperf4.log"
 
 measure_lock_peer dualstack.integration "$HOST_IF" "$V4_PORT"
 [[ "$MEASURE_PEER_FAMILY" == 4 ]] || fail "v4-only service locked IPv${MEASURE_PEER_FAMILY:-unknown}"
@@ -142,11 +140,7 @@ MEASURE_IFACE=""
 # must be selected after the IPv4 endpoint fails its real transport preflight.
 ip netns exec "$NS_NAME" iperf3 -s -6 -B "$V6_PEER" -p "$V6_PORT" > "$TEST_ROOT/iperf6.log" 2>&1 &
 SERVER_PID=$!
-for _ in 1 2 3 4 5; do
-    if timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$V6_PEER" "$V6_PORT" >/dev/null 2>&1; then break; fi
-    sleep 1
-done
-timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$V6_PEER" "$V6_PORT" >/dev/null 2>&1 || fail "IPv6 iperf3 server did not start"
+integration_wait_for_iperf_server "$V6_PEER" "$V6_PORT" 6 "$V6_LOCAL" "$TEST_ROOT/iperf6.log"
 
 measure_lock_peer dualstack.integration "$HOST_IF" "$V6_PORT"
 [[ "$MEASURE_PEER_FAMILY" == 6 ]] || fail "IPv6-only service did not trigger IPv6 fallback"
@@ -197,12 +191,7 @@ fib_output=$(ip -6 route get fibmatch "$V6_POLICY_PEER" from "$V6_POLICY_SOURCE"
 
 ip netns exec "$NS_NAME" iperf3 -s -6 -B "$V6_POLICY_PEER" -p "$V6_POLICY_PORT" > "$TEST_ROOT/iperf6-policy.log" 2>&1 &
 SERVER_PID=$!
-for _ in 1 2 3 4 5; do
-    if timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$V6_POLICY_PEER" "$V6_POLICY_PORT" >/dev/null 2>&1; then break; fi
-    sleep 1
-done
-timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$V6_POLICY_PEER" "$V6_POLICY_PORT" >/dev/null 2>&1 ||
-    fail "policy-routed IPv6 iperf3 server did not start"
+integration_wait_for_iperf_server "$V6_POLICY_PEER" "$V6_POLICY_PORT" 6 "$V6_POLICY_SOURCE" "$TEST_ROOT/iperf6-policy.log"
 
 export BBRV3_PATH_PMTU_CAP=1500
 measure_lock_peer "$V6_POLICY_PEER" "$HOST_IF" "$V6_POLICY_PORT" "" "$V6_POLICY_SOURCE"

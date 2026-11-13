@@ -36,6 +36,8 @@ Usage:
                          [--margin 3] [--loss-threshold 0.1] [--cap MBIT] [--force-scan]
                  Measurement commands accept --measurement-profile quick|standard|strict,
                  --max-test-gib GIB and --max-duration SEC.
+                 RC70 / budget-exceeded is retained; history reports the budget subtype:
+                 exhausted, insufficient-reservation, feasibility-rejected, or unknown (legacy).
   ${0##*/} peers [reset]
   ${0##*/} history [latest|show ID|prune]
   ${0##*/} doctor [--export [--include-addresses]]
@@ -658,6 +660,7 @@ auto_tune_execute() {
     fi
     auto_measure_with_peer_failover "$iface" "$nominal" || return $?
     summary="$MEASURE_RUN_DIR/summary.tsv"
+    AUTO_SWEEP_SUMMARY="$summary"
     sweep_path_fingerprint=$(summary_value "$summary" PATH_ROUTE_FINGERPRINT)
     [[ "$sweep_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
         die "扫描结果缺少合法网络路径指纹；不会持久化"
@@ -791,6 +794,9 @@ auto_tune_execute() {
         auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-$WIZARD_PEER}" || return 1
     fi
     persist_current_tuning || return 1
+    if declare -F measurement_history_complete_decision >/dev/null; then
+        measurement_history_complete_decision "$summary" "$verify_confidence_score" "$verify_confidence_reasons" || return 1
+    fi
     printf '\n'
     if (( final_verify_degraded )); then log OK "自动调优完成（degraded peer verification）"
     else log OK "自动调优、复验和持久化提交完成"
@@ -823,6 +829,7 @@ auto_first_sample_budget_gate() {
         "$(human_bytes "$AUTO_FIRST_SAMPLE_RESERVED_BYTES")" "$AUTO_FIRST_SAMPLE_STAGE" \
         "$AUTO_FIRST_SAMPLE_RATE" "$AUTO_FIRST_SAMPLE_DURATION"
     printf '  首样本时间预留  %ss / hard limit %ss\n' "$AUTO_FIRST_SAMPLE_RESERVED_SECONDS" "$max_duration"
+    printf '  Budget subtype insufficient-reservation\n'
     log ERR "MEASUREMENT_BUDGET_EXCEEDED：当前预算不足以安全启动第一次吞吐采样"
     log INFO "请提高 --max-test-gib（必须大于首样本安全预留）；不要降低安全余量"
     log INFO "未创建调优 transaction、未写入 baseline、未修改 sysctl/qdisc，也未启动 iperf"
@@ -831,6 +838,7 @@ auto_first_sample_budget_gate() {
 
 auto_tune_run_transaction() {
     local iface="$1" nominal="$4" rc rollback_rc=0 failure_dir="" measurement_mode=none
+    AUTO_SWEEP_SUMMARY=""
     if [[ -n "${WIZARD_PEER:-}" ]]; then
         if (( nominal > 0 )); then measurement_mode=known; else measurement_mode=auto; fi
     fi
@@ -849,6 +857,9 @@ auto_tune_run_transaction() {
     fi
     log WARN "自动调优未完成，正在恢复开始前状态"
     action_transaction_rollback || rollback_rc=$?
+    if [[ -n "$AUTO_SWEEP_SUMMARY" && -f "$AUTO_SWEEP_SUMMARY" ]] && declare -F measurement_history_invalidate_decision >/dev/null; then
+        measurement_history_invalidate_decision "$AUTO_SWEEP_SUMMARY" "operation-incomplete-rc-${rc}" || log WARN "sweep decision confidence finalization failed"
+    fi
     if [[ -n "$failure_dir" && -f "$failure_dir/summary.tsv" ]] && declare -F failure_finalize_outer_rollback >/dev/null; then
         failure_finalize_outer_rollback "$failure_dir/summary.tsv" "$rc" "$rollback_rc" || \
             log WARN "最终 failure summary 原子更新失败；保留原始 history 与事务证据"
@@ -925,7 +936,6 @@ auto_tune_wizard() {
     if (( nominal > 0 && tuning_rtt > 0 )); then
         profile=adaptive
         estimate_bytes=$(estimate_measurement_plan_bytes "$((nominal * 40 / 100))" "$WIZARD_SAMPLE_DURATION" "$nominal" "$WIZARD_SAMPLE_DURATION" "$((nominal * 13 / 10))" "$WIZARD_SAMPLE_DURATION" "$((WIZARD_SAMPLE_DURATION+2))" 0)
-        (( estimate_bytes > max_tx_bytes )) && estimate_bytes="$max_tx_bytes"
         estimate="≤ $(human_bytes "$estimate_bytes") 上行（正常上界；peer failure retries 仍计入硬预算）"
     elif [[ -n "${WIZARD_PEER:-}" ]]; then
         estimate="将按实测带宽动态计算，扫描上限 ${WIZARD_SCAN_CAP} Mbit/s"
@@ -955,7 +965,8 @@ auto_tune_wizard() {
         fi
         printf '  缓冲区调优 RTT  %sms（按用途下限与测速 RTT 取较大值）\n' "$tuning_rtt"
     fi
-    printf '  预计时间/流量   约 3–8 分钟 / %s\n' "$estimate"
+    printf '  时间/流量估算   %s；取得容量/路径遥测后评估剩余工作\n' "$estimate"
+    printf '  可完成性        当前预算不保证完成；动态评估不足时可明确改选 quick、提高预算或取消 rollback\n'
     printf '  硬流量预算      %s TX\n' "$(human_bytes "$max_tx_bytes")"
     if [[ "$AUTO_FIRST_SAMPLE_STAGE" == NONE ]]; then
         printf '  首样本安全预留  不运行测速\n'

@@ -1,0 +1,10 @@
+Historical failed readiness check, before protocol-aware test readiness; not the final result.
+[+] IPv6 native 策略验证通过
+integration IPv6 policy tests passed
+==> tests/integration_measure.sh
+iperf3: error - unable to receive parameters from client: 
+-----------------------------------------------------------
+Server listening on 5209 (test #1)
+-----------------------------------------------------------
+WARNING:  Size of data read does not correspond to offered length
+FAIL: local iperf3 server did not start

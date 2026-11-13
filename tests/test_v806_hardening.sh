@@ -496,7 +496,10 @@ test_production_peer_churn_operation() (
                 consume "$((2136746229))"; new_fixture_history sweep
                 printf 'HISTORY_SCHEMA\t1\nTYPE\tsweep\nRESULT\tSUCCESS\nPATH_CONTROL_QUALITY\tclean\nMEASUREMENT_STATE\tCLEAN_POLICER_FOUND\nSCAN_DECISION\trecommend\nSATURATION_RECEIVER_MBIT\t191.38\nCAPACITY_RECEIVER_MBIT\t191.38\nRECOMMEND\t202\nKNEE_MBIT\t209\nBROKE_AT\t210\nNO_KNEE\t0\nCONFIRMED\t1\nREJECT_REASON\t\nMIN_EFFICIENCY_RATIO\t0.90\nCLEAN_REFERENCE_RETRANS_EST_PERCENT\t0.0036\nPATH_ROUTE_FINGERPRINT\t%s\nPATH_ENDPOINT_FINGERPRINT\t%s\nPATH_RTT_P95_MS\t12\n' "$fp" "$ep" > "$MEASURE_RUN_DIR/summary.tsv"
                 measurement_finalize_run sweep "$1" "$2" eth0 0 complete
-                peer_health_record "$1" 4 203.0.113.10 "$2" success none 12 191.38 clean
+                # This mock bypasses iperf_sample. Record its represented
+                # successful sample separately from operation completion.
+                peer_health_record_sample_success "$1" 4 203.0.113.10 "$2" 12 191.38
+                peer_health_record "$1" 4 203.0.113.10 "$2" success none 12 191.38 clean sweep
                 return 0
                 ;;
         esac
@@ -512,6 +515,8 @@ test_production_peer_churn_operation() (
         consume "$((548*mib))"; new_fixture_history verify
         printf 'HISTORY_SCHEMA\t1\nTYPE\tverify\nRESULT\tSUCCESS\nSINGLE_RECEIVER_MBIT\t187.25\nMULTI_RECEIVER_MBIT\t188.49\nCONFIDENCE_SCORE\t95\nCONFIDENCE_GRADE\thigh\nCONFIDENCE_REASONS\tclean\nPATH_ROUTE_FINGERPRINT\t%s\nPATH_ENDPOINT_FINGERPRINT\t%s\n' "$fp" "$ep" > "$MEASURE_RUN_DIR/summary.tsv"
         measurement_finalize_run verify "$1" "$2" eth0 0 complete
+        peer_health_record_sample_success "$1" 4 203.0.113.10 "$2" 12 187.25
+        peer_health_record_sample_success "$1" 4 203.0.113.10 "$2" 12 188.49
         peer_health_record "$1" 4 203.0.113.10 "$2" success none 12 188.49 clean
     }
     prepare_auto_tuning_runtime() { :; }; verify_runtime_tuning() { :; }

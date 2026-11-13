@@ -1,0 +1,9 @@
+Public iperf peer health
+
+Endpoint                                    RTT      Score  Sample success  Completed sweeps Completed ops    Busy attempts Reset attempts Timeout attempts Last result
+speedtest.hkg12.hk.leaseweb.net:5201/IPv4   1ms      71     13              0                0                4             0              0                sample-success
+
+Units: Sample success = completed valid iperf sessions (including samples in incomplete sweeps); Completed sweeps = successful sweep operations; Completed ops = legacy successful probe/sweep/verify operations.
+Sample/sweep counters start when each endpoint migrates to v8.0.8; earlier events are not backfilled. Busy/reset/timeout count failed iperf attempts.
+Score uses the recent iperf-attempt availability window plus expiring path/peer hints; legacy history is a fallback prior.
+Health is a local ordering hint; every formal test still performs live precheck and route/path validation.

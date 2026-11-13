@@ -1,0 +1,21 @@
+SCHEMA	1
+STAGE	BUDGET_FEASIBILITY
+REASON	budget-exceeded
+EXPLANATION	当前 profile 的剩余测量计划预计无法在指定 TX 或时间预算内完成
+DETAIL	expected-remaining=14640332764; remaining=3880344551; expected-duration=184; profile=standard; no next scan sample spawned
+RC	70
+ROLLBACK	complete
+PERSISTENT_CHANGES	none
+SUGGESTION	重新执行并明确选择 --measurement-profile quick 或提高 --max-test-gib；时间不足时同时提高 --max-duration；不会复用未验证候选。
+BUDGET_FAILURE_SUBTYPE	feasibility-rejected
+BUDGET_LIMIT_BYTES	6442450944
+BUDGET_USED_BYTES	2562106393
+BUDGET_REMAINING_BYTES	3880344551
+BUDGET_REQUIRED_RESERVATION_BYTES	14640332764
+BUDGET_LIMIT_SECONDS	900
+BUDGET_USED_SECONDS	49
+BUDGET_REMAINING_SECONDS	851
+BUDGET_REQUIRED_RESERVATION_SECONDS	135
+BUDGET_FEASIBILITY_REASON	expected-remaining-tx-not-safe
+BUDGET_RESERVATION_SEMANTICS	expected-remaining-plan
+BUDGET_PROFILE	standard

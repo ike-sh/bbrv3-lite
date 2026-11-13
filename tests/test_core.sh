@@ -1262,9 +1262,9 @@ test_self_update_rolls_back_split_install() {
         local update_root="$TEST_ROOT/self-update" installed_path candidate valid_candidate output_path="" url="" update_output="" fail_persist=1
         mkdir -p "$update_root"
         installed_path="$update_root/bbr"; candidate="$update_root/new.sh"; valid_candidate="$update_root/new.valid.sh"; PERSIST_SCRIPT="$update_root/persist.sh"
-        sed 's/^SCRIPT_VERSION="8.0.7"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
+        sed 's/^SCRIPT_VERSION="8.0.8"$/SCRIPT_VERSION="8.0.1"/' "$ROOT_DIR/net-tcp-tune.sh" > "$installed_path"
         cp "$installed_path" "$PERSIST_SCRIPT"; chmod 0755 "$installed_path" "$PERSIST_SCRIPT"
-        sed 's/^SCRIPT_VERSION="8.0.7"$/SCRIPT_VERSION="8.0.8"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
+        sed 's/^SCRIPT_VERSION="8.0.8"$/SCRIPT_VERSION="8.0.9"/' "$ROOT_DIR/net-tcp-tune.sh" > "$candidate"
         cp "$candidate" "$valid_candidate"
         require_root() { :; }; acquire_lock() { :; }; require_commands() { :; }
         current_script_path() { printf '%s\n' "$installed_path"; }
@@ -1279,7 +1279,7 @@ test_self_update_rolls_back_split_install() {
                 esac
             done
             case "$url" in
-                */releases/latest) printf '{"tag_name":"v8.0.8"}\n' ;;
+                */releases/latest) printf '{"tag_name":"v8.0.9"}\n' ;;
                 */net-tcp-tune.sh) cp "$candidate" "$output_path" ;;
                 */SHA256SUMS)
                     printf '%s  net-tcp-tune.sh\n' "$(sha256sum "$candidate" | awk '{print $1}')" > "$output_path"
@@ -1292,7 +1292,7 @@ test_self_update_rolls_back_split_install() {
             [[ "$target" != "$PERSIST_SCRIPT" || "$fail_persist" == 0 ]] || return 9
             cp "$source" "$target"; chmod 0755 "$target"
         }
-        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.8"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
+        printf '#!/usr/bin/env bash\nSCRIPT_VERSION="8.0.9"\nSCRIPT_NAME="bbrv3-lite"\necho forged\n' > "$candidate"
         if self_update >/dev/null 2>&1; then fail "checksum-matching false-marker update was accepted"; fi
         grep -Fq 'SCRIPT_VERSION="8.0.1"' "$installed_path" || fail "rejected false-marker update changed current command"
         cp "$valid_candidate" "$candidate"
@@ -1303,8 +1303,8 @@ test_self_update_rolls_back_split_install() {
 
         fail_persist=0
         self_update >/dev/null
-        grep -Fq 'SCRIPT_VERSION="8.0.8"' "$installed_path" || fail "successful update did not replace current command"
-        grep -Fq 'SCRIPT_VERSION="8.0.8"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
+        grep -Fq 'SCRIPT_VERSION="8.0.9"' "$installed_path" || fail "successful update did not replace current command"
+        grep -Fq 'SCRIPT_VERSION="8.0.9"' "$PERSIST_SCRIPT" || fail "successful update did not synchronize persistent copy"
     )
 }
 
@@ -2271,7 +2271,7 @@ test_sweep_without_knee_does_not_recommend_ceiling() {
 }
 
 test_refine_preserves_throughput_stall_and_confirmation_gate() {
-    local summary
+    local summary rc=0
     MOCK_CONFIRM_FAIL=0
     sample_repeated() {
         local label="$6" rate goodput loss=0
@@ -2297,7 +2297,8 @@ test_refine_preserves_throughput_stall_and_confirmation_gate() {
     assert_eq 1 "$(summary_value "$summary" CONFIRMED)" "confirmation marker"
 
     MOCK_CONFIRM_FAIL=1
-    measure_sweep example.com 5201 auto 300 240 360 15 3 1 3 0.1 0 5000
+    measure_sweep example.com 5201 auto 300 240 360 15 3 1 3 0.1 0 5000 || rc=$?
+    assert_eq 2 "$rc" "failed confirmation is inconclusive"
     summary="$MEASURE_RUN_DIR/summary.tsv"
     assert_eq '' "$(summary_value "$summary" RECOMMEND)" "failed confirmation recommendation"
     assert_eq 0 "$(summary_value "$summary" CONFIRMED)" "failed confirmation marker"
@@ -2775,7 +2776,7 @@ test_action_transaction_rejects_late_filter_before_rollback_writes() (
 )
 
 test_auto_tune_commits_only_after_final_verify() {
-    local events="" verify_fail=0 verify_path_drift=0 verify_endpoint_drift=0 candidate_rejected=0 summary_dir="$TEST_ROOT/auto-summary"
+    local events="" verify_fail=0 verify_path_drift=0 verify_endpoint_drift=0 candidate_rejected=0 summary_dir="$HISTORY_DIR/20260101T000000Z-sweep"
     local path_fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     local endpoint_fp=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
     mkdir -p "$summary_dir"

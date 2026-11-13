@@ -1,0 +1,53 @@
+BRANCH codex/v8.0.8-high-bandwidth-reliability
+HEAD 0f6f686598f1a31df1f78bebb9942a6171113f6c
+v8.0.7^{} 0f6f686598f1a31df1f78bebb9942a6171113f6c
+No commit, tag, push or GitHub Release created.
+Pre-existing untracked dist/ preserved.
+
+ M README.md
+ M SHA256SUMS
+ M net-tcp-tune.sh
+ M scripts/validate.sh
+ M src/00-header.sh
+ M src/cli.sh
+ M src/diagnostics.sh
+ M src/measure.sh
+ M src/peer-health.sh
+ M tests/integration_iperf_family.sh
+ M tests/integration_measure.sh
+ M tests/test_core.sh
+ M tests/test_installer.sh
+ M tests/test_measure_v805.sh
+ M tests/test_v806.sh
+ M tests/test_v806_hardening.sh
+?? docs/v8.0.8-high-bandwidth-reliability-report.md
+?? docs/validation/v8.0.8/README.md
+?? docs/validation/v8.0.8/docker-debian12.log
+?? docs/validation/v8.0.8/docker-debian13.log
+?? docs/validation/v8.0.8/docker-ubuntu2204.log
+?? docs/validation/v8.0.8/docker-ubuntu2404.log
+?? docs/validation/v8.0.8/early-budget-plan.tsv
+?? docs/validation/v8.0.8/early-budget-summary.tsv
+?? docs/validation/v8.0.8/git-state.txt
+?? docs/validation/v8.0.8/local-release.log
+?? docs/validation/v8.0.8/local-validate.log
+?? docs/validation/v8.0.8/production-replay-events.tsv
+?? docs/validation/v8.0.8/production-replay-failure.tsv
+?? docs/validation/v8.0.8/production-replay-history.txt
+?? docs/validation/v8.0.8/production-replay-peers.txt
+?? docs/validation/v8.0.8/production-replay-samples.tsv
+?? docs/validation/v8.0.8/production-replay-summary.tsv
+?? docs/validation/v8.0.8/replay-metadata.tsv
+?? docs/validation/v8.0.8/startup-probe-before-fix.txt
+?? docs/validation/v8.0.8/validation-summary.tsv
+?? tests/fixtures/v808-high-bandwidth/README.md
+?? tests/fixtures/v808-high-bandwidth/context.tsv
+?? tests/fixtures/v808-high-bandwidth/samples.tsv
+?? tests/helpers/iperf-server.sh
+?? tests/helpers/v808-fixture.sh
+?? tests/test_v808_budget_feasibility.sh
+?? tests/test_v808_decision_confidence.sh
+?? tests/test_v808_history_tsv_integrity.sh
+?? tests/test_v808_incomplete_knee.sh
+?? tests/test_v808_peer_health_semantics.sh
+?? tests/test_v808_reference_representativeness.sh

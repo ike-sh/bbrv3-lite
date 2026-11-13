@@ -3,7 +3,7 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="8.0.7"
+SCRIPT_VERSION="8.0.8"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
@@ -18,7 +18,7 @@ IPERF_CONTAMINATED_RC=66         # locally contaminated sample (peer failover al
 IPERF_UNSTABLE_RC=67             # unstable repeated samples (peer failover allowed)
 MEASURE_PATH_QUALITY_RC=68       # dirty PATH_CONTROL (peer failover allowed)
 MEASURE_ROUTE_MISMATCH_RC=69     # frozen route/path changed (peer failover allowed)
-MEASURE_BUDGET_RC=70             # top-level operation traffic/time budget exhausted
+MEASURE_BUDGET_RC=70             # operation cannot continue/complete within TX/time budget
 MEASUREMENT_PREFLIGHT_RC=71      # local environment rejected high-volume measurement
 DIAGNOSTIC_EXPORT_RC=72          # diagnostic bundle could not be produced safely
 ROLLBACK_FAILURE_RC=73           # restoration failed; highest-priority user failure

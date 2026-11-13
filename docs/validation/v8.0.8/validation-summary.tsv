@@ -1,0 +1,43 @@
+CHECK	STATUS	DETAIL
+tests/test_baseline_v803.sh	PASS	local + all four privileged images
+tests/test_core.sh	PASS	local + all four privileged images
+tests/test_dns_policy_v740.sh	PASS	local + all four privileged images
+tests/test_dns_v721.sh	PASS	local + all four privileged images
+tests/test_installer.sh	PASS	local + all four privileged images
+tests/test_iperf_family_v801.sh	PASS	local + all four privileged images
+tests/test_ipv6_policy_v740.sh	PASS	local + all four privileged images
+tests/test_ipv6_v721.sh	PASS	local + all four privileged images
+tests/test_ipv6_warning_v803.sh	PASS	local + all four privileged images
+tests/test_measure_v721.sh	PASS	local + all four privileged images
+tests/test_measure_v805.sh	PASS	local + all four privileged images
+tests/test_network_v721.sh	PASS	local + all four privileged images
+tests/test_nic_v800.sh	PASS	local + all four privileged images
+tests/test_path_v730.sh	PASS	local + all four privileged images
+tests/test_sysctl_provider_v803.sh	PASS	local + all four privileged images
+tests/test_systemd_v803.sh	PASS	local + all four privileged images
+tests/test_tc_v721.sh	PASS	local + all four privileged images
+tests/test_transaction_v803.sh	PASS	local + all four privileged images
+tests/test_v804.sh	PASS	local + all four privileged images
+tests/test_v806.sh	PASS	local + all four privileged images
+tests/test_v806_budget_guard.sh	PASS	local + all four privileged images
+tests/test_v806_hardening.sh	PASS	local + all four privileged images
+tests/test_v807_pmtu.sh	PASS	local + all four privileged images
+tests/test_v808_budget_feasibility.sh	PASS	local + all four privileged images
+tests/test_v808_decision_confidence.sh	PASS	local + all four privileged images
+tests/test_v808_history_tsv_integrity.sh	PASS	local + all four privileged images
+tests/test_v808_incomplete_knee.sh	PASS	local + all four privileged images
+tests/test_v808_peer_health_semantics.sh	PASS	local + all four privileged images
+tests/test_v808_reference_representativeness.sh	PASS	local + all four privileged images
+build	PASS	final workspace
+bash syntax	PASS	final workspace
+scripts/release.sh	PASS	final workspace
+scripts/validate.sh	PASS	final workspace
+ShellCheck	PASS	final workspace
+SHA256	PASS	final workspace
+docker:debian12	PASS	29 test scripts + 9 integration scripts; exit 0
+docker:debian13	PASS	29 test scripts + 9 integration scripts; exit 0
+docker:ubuntu2204	PASS	29 test scripts + 9 integration scripts; exit 0
+docker:ubuntu2404	PASS	29 test scripts + 9 integration scripts; exit 0
+real-systemd-PID1	PASS	Debian 12: DNS/resolved and unit-state
+production-raw-TSV	NOT RUN	original file not supplied
+production-VPS-full-auto	NOT RUN	outside this review phase

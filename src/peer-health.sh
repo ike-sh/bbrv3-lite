@@ -3,7 +3,7 @@
 # Health affects candidate ordering only; every endpoint is still prechecked.
 # -----------------------------------------------------------------------------
 
-PEER_HEALTH_SCHEMA="1"
+PEER_HEALTH_SCHEMA="2"
 PEER_HEALTH_WINDOW_SIZE=12
 
 peer_health_reset_values() {
@@ -14,6 +14,7 @@ peer_health_reset_values() {
     PH_LAST_RTT_MS=na; PH_LAST_RECEIVER_MBIT=na; PH_LAST_PATH_CONTROL_QUALITY=unknown
     PH_LAST_FAILURE_REASON=none; PH_TEMPORARY_PENALTY_UNTIL=0; PH_RECENT_WINDOW=""
     PH_LAST_RESULT=unknown; PH_UPDATED_AT=0
+    PH_SAMPLE_SUCCESS_COUNT=0; PH_COMPLETED_SWEEP_COUNT=0; PH_SAMPLE_RECENT_WINDOW=""; PH_SAMPLE_COUNTERS_SINCE=0
 }
 
 peer_health_is_public_host() {
@@ -66,7 +67,11 @@ peer_health_load() {
         [[ -z "${seen[$key]+x}" ]] || return 1
         seen[$key]=1
         case "$key" in
-            SCHEMA) schema="$value" ;;
+            SCHEMA)
+                schema="$value"; is_uint "$schema" || return 1
+                # Refuse a future format before encountering its unknown keys.
+                if (( 10#$schema > PEER_HEALTH_SCHEMA )); then return 2; fi
+                ;;
             HOST) PH_HOST="$value" ;;
             FAMILY) PH_FAMILY="$value" ;;
             ADDRESS) PH_ADDRESS="$value" ;;
@@ -89,6 +94,10 @@ peer_health_load() {
             RECENT_WINDOW) PH_RECENT_WINDOW="$value" ;;
             LAST_RESULT) PH_LAST_RESULT="$value" ;;
             UPDATED_AT) PH_UPDATED_AT="$value" ;;
+            SAMPLE_SUCCESS_COUNT) PH_SAMPLE_SUCCESS_COUNT="$value" ;;
+            COMPLETED_SWEEP_COUNT) PH_COMPLETED_SWEEP_COUNT="$value" ;;
+            SAMPLE_RECENT_WINDOW) PH_SAMPLE_RECENT_WINDOW="$value" ;;
+            SAMPLE_COUNTERS_SINCE) PH_SAMPLE_COUNTERS_SINCE="$value" ;;
             *) return 1 ;;
         esac
     done < "$file"
@@ -100,15 +109,21 @@ peer_health_load() {
     done
     is_uint "$schema" || return 1
     (( 10#$schema <= PEER_HEALTH_SCHEMA )) || return 2
-    [[ "$schema" == "$PEER_HEALTH_SCHEMA" ]] || return 1
+    [[ "$schema" == 1 || "$schema" == "$PEER_HEALTH_SCHEMA" ]] || return 1
+    if [[ "$schema" == 2 ]]; then
+        for required in SAMPLE_SUCCESS_COUNT COMPLETED_SWEEP_COUNT SAMPLE_RECENT_WINDOW SAMPLE_COUNTERS_SINCE; do
+            [[ -n "${seen[$required]+x}" ]] || return 1
+        done
+    fi
     validate_peer "$PH_HOST" "$PH_PORT" 2>/dev/null || return 1
     [[ "$PH_FAMILY" == 4 || "$PH_FAMILY" == 6 ]] || return 1
     measure_source_address_is_valid "$PH_FAMILY" "$PH_ADDRESS" || return 1
     for value in "$PH_SUCCESS_COUNT" "$PH_FAILURE_COUNT" "$PH_BUSY_COUNT" "$PH_RESET_COUNT" \
-        "$PH_TIMEOUT_COUNT" "$PH_PATH_DIRTY_COUNT" "$PH_SLOW_PEER_COUNT" "$PH_UNSTABLE_COUNT"; do
+        "$PH_TIMEOUT_COUNT" "$PH_PATH_DIRTY_COUNT" "$PH_SLOW_PEER_COUNT" "$PH_UNSTABLE_COUNT" \
+        "$PH_SAMPLE_SUCCESS_COUNT" "$PH_COMPLETED_SWEEP_COUNT"; do
         peer_health_counter_valid "$value" || return 1
     done
-    for value in "$PH_LAST_SUCCESS" "$PH_LAST_FAILURE" "$PH_TEMPORARY_PENALTY_UNTIL" "$PH_UPDATED_AT"; do
+    for value in "$PH_LAST_SUCCESS" "$PH_LAST_FAILURE" "$PH_TEMPORARY_PENALTY_UNTIL" "$PH_UPDATED_AT" "$PH_SAMPLE_COUNTERS_SINCE"; do
         peer_health_timestamp_valid "$value" || return 1
     done
     [[ "$PH_LAST_RTT_MS" == na ]] || is_decimal "$PH_LAST_RTT_MS" || return 1
@@ -116,6 +131,7 @@ peer_health_load() {
     [[ "$PH_LAST_PATH_CONTROL_QUALITY" =~ ^(unknown|clean|good|dirty|slow-peer)$ ]] || return 1
     [[ "$PH_LAST_FAILURE_REASON" =~ ^[a-z0-9-]{1,64}$ ]] || return 1
     [[ "$PH_RECENT_WINDOW" =~ ^[SBRDTLUFIK]{0,12}$ ]] || return 1
+    [[ "$PH_SAMPLE_RECENT_WINDOW" =~ ^[SBRT]{0,12}$ ]] || return 1
     [[ "$PH_LAST_RESULT" =~ ^[a-z0-9-]{1,64}$ ]] || return 1
 }
 
@@ -133,6 +149,10 @@ peer_health_write() {
         "$PH_SLOW_PEER_COUNT" "$PH_UNSTABLE_COUNT" "$PH_LAST_RTT_MS" "$PH_LAST_RECEIVER_MBIT" \
         "$PH_LAST_PATH_CONTROL_QUALITY" "$PH_LAST_FAILURE_REASON" "$PH_TEMPORARY_PENALTY_UNTIL" \
         "$PH_RECENT_WINDOW" "$PH_LAST_RESULT" "$PH_UPDATED_AT" > "$temp"; then
+        rm -f -- "$temp"; return 1
+    fi
+    if ! printf 'SAMPLE_SUCCESS_COUNT\t%s\nCOMPLETED_SWEEP_COUNT\t%s\nSAMPLE_RECENT_WINDOW\t%s\nSAMPLE_COUNTERS_SINCE\t%s\n' \
+        "$PH_SAMPLE_SUCCESS_COUNT" "$PH_COMPLETED_SWEEP_COUNT" "$PH_SAMPLE_RECENT_WINDOW" "$PH_SAMPLE_COUNTERS_SINCE" >> "$temp"; then
         rm -f -- "$temp"; return 1
     fi
     chmod 0600 "$temp" || { rm -f -- "$temp"; return 1; }
@@ -168,7 +188,7 @@ peer_health_window_code() {
 
 peer_health_record() {
     local host="$1" family="$2" address="$3" port="$4" outcome="$5" reason="${6:-none}"
-    local rtt="${7:-na}" receiver="${8:-na}" quality="${9:-unknown}" file rc now penalty code
+    local rtt="${7:-na}" receiver="${8:-na}" quality="${9:-unknown}" kind="${10:-operation}" file rc now penalty code
     peer_health_is_public_host "$host" || return 0
     validate_peer "$host" "$port" || return 1
     [[ "$family" == 4 || "$family" == 6 ]] && measure_source_address_is_valid "$family" "$address" || return 1
@@ -190,9 +210,30 @@ peer_health_record() {
     [[ "$rtt" == na ]] || is_decimal "$rtt" || rtt=na
     [[ "$receiver" == na ]] || is_decimal "$receiver" || receiver=na
     [[ "$quality" =~ ^(unknown|clean|good|dirty|slow-peer)$ ]] || quality=unknown
-    PH_LAST_RTT_MS="$rtt"; PH_LAST_RECEIVER_MBIT="$receiver"; PH_LAST_PATH_CONTROL_QUALITY="$quality"
+    # A failed attempt has no new RTT/capacity fact. Do not erase valid prior
+    # telemetry, or the path quality, when recording transport-only events.
+    [[ "$rtt" == na ]] || PH_LAST_RTT_MS="$rtt"
+    [[ "$receiver" == na ]] || PH_LAST_RECEIVER_MBIT="$receiver"
+    [[ "$quality" == unknown ]] || PH_LAST_PATH_CONTROL_QUALITY="$quality"
+    (( PH_SAMPLE_COUNTERS_SINCE > 0 )) || PH_SAMPLE_COUNTERS_SINCE="$now"
+    if [[ "$outcome" == sample-success ]]; then
+        ((PH_SAMPLE_SUCCESS_COUNT+=1))
+        PH_SAMPLE_RECENT_WINDOW="${PH_SAMPLE_RECENT_WINDOW}S"
+        if (( ${#PH_SAMPLE_RECENT_WINDOW} > PEER_HEALTH_WINDOW_SIZE )); then
+            PH_SAMPLE_RECENT_WINDOW="${PH_SAMPLE_RECENT_WINDOW: -$PEER_HEALTH_WINDOW_SIZE}"
+        fi
+        case "$PH_LAST_RESULT" in
+            peer-busy|peer-reset|peer-timeout|peer-unavailable)
+                PH_TEMPORARY_PENALTY_UNTIL=0; PH_LAST_RESULT=sample-success ;;
+        esac
+        peer_health_write "$file"
+        return
+    fi
     if [[ "$outcome" == success ]]; then
+        # SUCCESS_COUNT remains the legacy completed-operation counter. Its
+        # denominator was mixed with failed attempts; never present that ratio.
         ((PH_SUCCESS_COUNT+=1)); PH_LAST_SUCCESS="$now"; PH_LAST_RESULT=clean
+        if [[ "$kind" == sweep ]]; then ((PH_COMPLETED_SWEEP_COUNT+=1)); fi
         PH_TEMPORARY_PENALTY_UNTIL=0
     elif [[ "$outcome" == inconclusive ]]; then
         [[ "$reason" == measurement-inconclusive || "$reason" == knee-not-located ]] || reason=measurement-inconclusive
@@ -212,6 +253,13 @@ peer_health_record() {
             peer-too-slow) ((PH_SLOW_PEER_COUNT+=1)) ;;
             measurement-unstable|sample-contaminated) ((PH_UNSTABLE_COUNT+=1)) ;;
         esac
+        case "$reason" in
+            peer-busy|peer-reset|peer-timeout|peer-unavailable)
+                PH_SAMPLE_RECENT_WINDOW="${PH_SAMPLE_RECENT_WINDOW}$(peer_health_window_code "$reason")"
+                if (( ${#PH_SAMPLE_RECENT_WINDOW} > PEER_HEALTH_WINDOW_SIZE )); then
+                    PH_SAMPLE_RECENT_WINDOW="${PH_SAMPLE_RECENT_WINDOW: -$PEER_HEALTH_WINDOW_SIZE}"
+                fi ;;
+        esac
         penalty=$(peer_health_penalty_seconds "$reason")
         PH_TEMPORARY_PENALTY_UNTIL=$((now + penalty))
     fi
@@ -221,6 +269,10 @@ peer_health_record() {
         PH_RECENT_WINDOW="${PH_RECENT_WINDOW:$((${#PH_RECENT_WINDOW}-PEER_HEALTH_WINDOW_SIZE))}"
     fi
     peer_health_write "$file"
+}
+
+peer_health_record_sample_success() {
+    peer_health_record "$1" "$2" "$3" "$4" sample-success none "${5:-na}" "${6:-na}" unknown
 }
 
 peer_health_reason_from_text() {
@@ -250,7 +302,7 @@ peer_health_host_reset_count() {
 
 peer_health_score() {
     local host="$1" family="$2" address="$3" port="$4" rtt="${5:-9999}" file score=35 rtt_score=0 success_score=10
-    local now total host_resets=0 reason="no-history" age=0 history_weight=100 delta=0 recent_success recent_failure
+    local now total host_resets=0 reason="no-history" age=0 history_weight=100 delta=0 recent_success recent_failure availability_window
     if is_decimal "$rtt"; then
         if awk -v v="$rtt" 'BEGIN {exit !(v<=30)}'; then rtt_score=25
         elif awk -v v="$rtt" 'BEGIN {exit !(v<=60)}'; then rtt_score=20
@@ -272,14 +324,17 @@ peer_health_score() {
             return
         fi
         (( age < 86400 )) || history_weight=50
-        recent_success=$(tr -cd 'S' <<< "$PH_RECENT_WINDOW" | wc -c)
-        recent_failure=$(tr -cd 'BRDTLUF' <<< "$PH_RECENT_WINDOW" | wc -c)
+        # The new availability window contains only iperf attempts. Completed
+        # operations never inflate it. Old files keep their original prior.
+        availability_window="${PH_SAMPLE_RECENT_WINDOW:-$PH_RECENT_WINDOW}"
+        recent_success=$(tr -cd 'S' <<< "$availability_window" | wc -c)
+        recent_failure=$(tr -cd 'BRDTLUF' <<< "$availability_window" | wc -c)
         total=$((recent_success + recent_failure)); reason="history"
         if (( total > 0 )); then success_score=$((recent_success * 20 / total)); fi
         delta=$success_score
         [[ "$PH_LAST_PATH_CONTROL_QUALITY" != clean && "$PH_LAST_PATH_CONTROL_QUALITY" != good ]] || delta=$((delta+10))
-        [[ "$PH_RECENT_WINDOW" != *B* ]] || delta=$((delta-5))
-        [[ "$PH_RECENT_WINDOW" != *R* ]] || delta=$((delta-10))
+        [[ "$availability_window" != *B* ]] || delta=$((delta-5))
+        [[ "$availability_window" != *R* ]] || delta=$((delta-10))
         [[ "$PH_RECENT_WINDOW" != *D* ]] || delta=$((delta-8))
         [[ "$PH_RECENT_WINDOW" != *L* ]] || delta=$((delta-8))
         [[ "$PH_RECENT_WINDOW" != *U* ]] || delta=$((delta-8))
@@ -311,9 +366,10 @@ peer_health_rank_candidates() {
 }
 
 peers_show() {
-    local file score reason success total now penalty
+    local file score reason now penalty rtt samples sweeps
     printf 'Public iperf peer health\n\n'
-    printf '%-43s %-5s %-7s %-9s %-6s %-6s %s\n' 'Endpoint' 'RTT' 'Score' 'Success' 'Busy' 'Reset' 'Last result'
+    printf '%-43s %-8s %-6s %-15s %-16s %-16s %-13s %-14s %-16s %s\n' \
+        Endpoint RTT Score 'Sample success' 'Completed sweeps' 'Completed ops' 'Busy attempts' 'Reset attempts' 'Timeout attempts' 'Last result'
     if [[ ! -d "$PEER_HEALTH_DIR" || -L "$PEER_HEALTH_DIR" ]]; then
         printf '%s\n' '(no local peer health history)'
         return 0
@@ -325,14 +381,19 @@ peers_show() {
             continue
         fi
         IFS=$'\t' read -r score reason <<< "$(peer_health_score "$PH_HOST" "$PH_FAMILY" "$PH_ADDRESS" "$PH_PORT" "$PH_LAST_RTT_MS")"
-        total=$((PH_SUCCESS_COUNT + PH_FAILURE_COUNT)); success="${PH_SUCCESS_COUNT}/${total}"
+        samples="$PH_SAMPLE_SUCCESS_COUNT"; sweeps="$PH_COMPLETED_SWEEP_COUNT"
+        if (( PH_SAMPLE_COUNTERS_SINCE == 0 )); then samples=n/a; sweeps=n/a; fi
+        if is_decimal "$PH_LAST_RTT_MS"; then rtt="${PH_LAST_RTT_MS}ms"; else rtt=n/a; fi
         now=$(date +%s); penalty=""
         if (( PH_TEMPORARY_PENALTY_UNTIL > now )); then penalty=" (penalty $((PH_TEMPORARY_PENALTY_UNTIL-now))s)"; fi
-        printf '%-43s %-5s %-7s %-9s %-6s %-6s %s%s\n' \
-            "${PH_HOST}:${PH_PORT}/IPv${PH_FAMILY}" "${PH_LAST_RTT_MS}ms" "$score" "$success" \
-            "$PH_BUSY_COUNT" "$PH_RESET_COUNT" "$PH_LAST_RESULT" "$penalty"
+        printf '%-43s %-8s %-6s %-15s %-16s %-16s %-13s %-14s %-16s %s%s\n' \
+            "${PH_HOST}:${PH_PORT}/IPv${PH_FAMILY}" "$rtt" "$score" "$samples" "$sweeps" "$PH_SUCCESS_COUNT" \
+            "$PH_BUSY_COUNT" "$PH_RESET_COUNT" "$PH_TIMEOUT_COUNT" "$PH_LAST_RESULT" "$penalty"
     done
-    printf '\nHealth is a local ordering hint; every formal test still performs live precheck and route/path validation.\n'
+    printf '\nUnits: Sample success = completed valid iperf sessions (including samples in incomplete sweeps); Completed sweeps = successful sweep operations; Completed ops = legacy successful probe/sweep/verify operations.\n'
+    printf 'Sample/sweep counters start when each endpoint migrates to v8.0.8; earlier events are not backfilled. Busy/reset/timeout count failed iperf attempts.\n'
+    printf 'Score uses the recent iperf-attempt availability window plus expiring path/peer hints; legacy history is a fallback prior.\n'
+    printf 'Health is a local ordering hint; every formal test still performs live precheck and route/path validation.\n'
 }
 
 peers_reset() {

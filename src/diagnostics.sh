@@ -11,9 +11,139 @@ FAILURE_STAGE=""
 FAILURE_REASON=""
 FAILURE_DETAIL=""
 FAILURE_SUGGESTION=""
+FAILURE_BUDGET_CONTEXT=""
+BUDGET_DIAGNOSTIC_KEYS=(
+    BUDGET_FAILURE_SUBTYPE BUDGET_LIMIT_BYTES BUDGET_USED_BYTES BUDGET_REMAINING_BYTES
+    BUDGET_REQUIRED_RESERVATION_BYTES BUDGET_LIMIT_SECONDS BUDGET_USED_SECONDS
+    BUDGET_REMAINING_SECONDS BUDGET_REQUIRED_RESERVATION_SECONDS
+    BUDGET_FEASIBILITY_REASON BUDGET_RESERVATION_SEMANTICS BUDGET_PROFILE
+)
+
+# Diagnostic snapshots only: this does not decide admission or change a ledger.
+# "reserved" means a next-stage reservation for guard failures, and the
+# expected remaining plan (not the worst-case upper bound) for feasibility.
+budget_failure_context() {
+    local origin="$1" limit="$2" used="$3" reserved="$4" time_limit="$5" elapsed="$6" reserved_time="$7" profile="$8"
+    local key remaining="" remaining_time="" subtype=unknown reason="" semantics=unknown
+    local tx_exhausted=0 time_exhausted=0 tx_blocked=0 time_blocked=0
+    for key in limit used reserved time_limit elapsed reserved_time; do
+        is_uint "${!key}" || printf -v "$key" ''
+    done
+    case "$profile" in quick|standard|strict) ;; *) profile=unknown ;; esac
+    if [[ -n "$limit" && -n "$used" ]]; then
+        remaining=$((limit-used)); (( remaining >= 0 )) || remaining=0
+        (( used < limit )) || tx_exhausted=1
+        [[ -z "$reserved" ]] || { (( used+reserved < limit )) || tx_blocked=1; }
+    fi
+    if [[ -n "$time_limit" && -n "$elapsed" ]]; then
+        remaining_time=$((time_limit-elapsed)); (( remaining_time >= 0 )) || remaining_time=0
+        (( elapsed < time_limit )) || time_exhausted=1
+        [[ -z "$reserved_time" ]] || { (( elapsed+reserved_time < time_limit )) || time_blocked=1; }
+    fi
+    if (( tx_exhausted || time_exhausted )); then
+        subtype=exhausted
+        (( ! tx_exhausted )) || reason="actual-tx-limit-reached"
+        (( ! time_exhausted )) || reason+="${reason:+,}actual-duration-limit-reached"
+    elif [[ "$origin" == feasibility ]]; then
+        subtype=feasibility-rejected
+        (( ! tx_blocked )) || reason="expected-remaining-tx-not-safe"
+        (( ! time_blocked )) || reason+="${reason:+,}expected-remaining-duration-not-safe"
+    elif [[ "$origin" == guard ]]; then
+        subtype=insufficient-reservation
+        (( ! tx_blocked )) || reason="next-tx-reservation-not-safe"
+        (( ! time_blocked )) || reason+="${reason:+,}next-duration-reservation-not-safe"
+    fi
+    case "$origin" in guard) semantics="next-stage-reservation" ;; feasibility) semantics="expected-remaining-plan" ;; esac
+    printf 'BUDGET_FAILURE_SUBTYPE\t%s\nBUDGET_LIMIT_BYTES\t%s\nBUDGET_USED_BYTES\t%s\nBUDGET_REMAINING_BYTES\t%s\nBUDGET_REQUIRED_RESERVATION_BYTES\t%s\n' \
+        "$subtype" "$limit" "$used" "$remaining" "$reserved"
+    printf 'BUDGET_LIMIT_SECONDS\t%s\nBUDGET_USED_SECONDS\t%s\nBUDGET_REMAINING_SECONDS\t%s\nBUDGET_REQUIRED_RESERVATION_SECONDS\t%s\n' \
+        "$time_limit" "$elapsed" "$remaining_time" "$reserved_time"
+    printf 'BUDGET_FEASIBILITY_REASON\t%s\nBUDGET_RESERVATION_SEMANTICS\t%s\nBUDGET_PROFILE\t%s\n' \
+        "${reason:-budget-type-not-recorded}" "$semantics" "$profile"
+}
+
+budget_diagnostic_key_valid() {
+    local key
+    for key in "${BUDGET_DIAGNOSTIC_KEYS[@]}"; do [[ "$1" != "$key" ]] || return 0; done
+    return 1
+}
+
+# Read new snapshots verbatim; infer older records only from recorded evidence.
+# Never use the current shell's budget when explaining a historical operation.
+budget_failure_context_from_summary() {
+    local file="$1" subtype key stage detail origin=unknown limit used reserved="" time_limit elapsed reserved_time="" profile
+    [[ -f "$file" && ! -L "$file" ]] || return 0
+    subtype=$(summary_value "$file" BUDGET_FAILURE_SUBTYPE)
+    case "$subtype" in
+        exhausted|insufficient-reservation|feasibility-rejected|unknown)
+            for key in "${BUDGET_DIAGNOSTIC_KEYS[@]}"; do printf '%s\t%s\n' "$key" "$(summary_value "$file" "$key")"; done
+            return 0 ;;
+    esac
+    [[ "$(summary_value "$file" FAILURE_REASON)" == budget-exceeded ]] || return 0
+    stage=$(summary_value "$file" FAILURE_STAGE); detail=$(summary_value "$file" FAILURE_DETAIL)
+    limit=$(summary_value "$file" MAX_TEST_TX_BYTES); used=$(summary_value "$file" TEST_TX_BYTES_USED)
+    time_limit=$(summary_value "$file" MAX_TEST_DURATION_SECONDS); elapsed=$(summary_value "$file" TEST_DURATION_USED)
+    profile=$(summary_value "$file" MEASUREMENT_PROFILE)
+    [[ "$limit" != 0 ]] || limit=""
+    [[ "$time_limit" != 0 ]] || time_limit=""
+    if [[ "$stage" == BUDGET_FEASIBILITY ]]; then
+        origin=feasibility
+        key=$(summary_value "$file" HARD_BUDGET_BYTES); [[ -z "$key" ]] || limit="$key"
+        key=$(summary_value "$file" USED_TX_BYTES); [[ -z "$key" ]] || used="$key"
+        reserved=$(summary_value "$file" EXPECTED_REMAINING_TX)
+        reserved_time=$(summary_value "$file" EXPECTED_REMAINING_DURATION_SECONDS)
+    else
+        if [[ "$detail" =~ TX=([0-9]+)/([0-9]+) ]]; then used="${BASH_REMATCH[1]}"; limit="${BASH_REMATCH[2]}"; fi
+        if [[ "$detail" =~ duration=([0-9]+)/([0-9]+) ]]; then elapsed="${BASH_REMATCH[1]}"; time_limit="${BASH_REMATCH[2]}"; fi
+        if [[ "$detail" =~ reserved-next=([0-9]+) ]]; then reserved="${BASH_REMATCH[1]}"; origin=guard; fi
+        if [[ "$detail" =~ reserved-time-next=([0-9]+) ]]; then reserved_time="${BASH_REMATCH[1]}"; origin=guard; fi
+    fi
+    budget_failure_context "$origin" "$limit" "$used" "$reserved" "$time_limit" "$elapsed" "$reserved_time" "$profile"
+}
+
+budget_failure_summary_update() {
+    local summary="$1" context="$2" key value
+    local -a budget_pairs=()
+    [[ -n "$context" ]] || context=$(budget_failure_context_from_summary "$summary")
+    while IFS=$'\t' read -r key value; do
+        [[ -n "$key" ]] || continue
+        budget_diagnostic_key_valid "$key" || return 1
+        budget_pairs+=("$key" "$value")
+    done <<< "$context"
+    ((${#budget_pairs[@]} == 0)) || history_summary_update "$summary" "${budget_pairs[@]}"
+}
+
+budget_failure_print() {
+    local summary="$1" context key value label
+    context=$(budget_failure_context_from_summary "$summary")
+    [[ -n "$context" ]] || return 0
+    printf '\nBudget at rejection (snapshot)\n'
+    while IFS=$'\t' read -r key value; do
+        case "$key" in
+            BUDGET_FAILURE_SUBTYPE) label='Budget subtype' ;;
+            BUDGET_LIMIT_BYTES) label='TX hard limit' ;;
+            BUDGET_USED_BYTES) label='TX used' ;;
+            BUDGET_REMAINING_BYTES) label='TX remaining' ;;
+            BUDGET_REQUIRED_RESERVATION_BYTES) label='Required TX' ;;
+            BUDGET_LIMIT_SECONDS) label='Time hard limit' ;;
+            BUDGET_USED_SECONDS) label='Time used' ;;
+            BUDGET_REMAINING_SECONDS) label='Time remaining' ;;
+            BUDGET_REQUIRED_RESERVATION_SECONDS) label='Required time' ;;
+            BUDGET_PROFILE) label='Selected profile' ;;
+            BUDGET_FEASIBILITY_REASON) label='Budget cause' ;;
+            BUDGET_RESERVATION_SEMANTICS) label='Required TX means' ;;
+            *) continue ;;
+        esac
+        case "$key" in
+            *_BYTES) if is_uint "$value"; then value="$(human_bytes "$value") ($value bytes)"; else value=unknown; fi ;;
+            *_SECONDS) if is_uint "$value"; then value="${value}s"; else value=unknown; fi ;;
+        esac
+        printf '%-20s %s\n' "$label" "${value:-unknown}"
+    done <<< "$context"
+}
 
 failure_reset() {
-    FAILURE_STAGE=""; FAILURE_REASON=""; FAILURE_DETAIL=""; FAILURE_SUGGESTION=""
+    FAILURE_STAGE=""; FAILURE_REASON=""; FAILURE_DETAIL=""; FAILURE_SUGGESTION=""; FAILURE_BUDGET_CONTEXT=""
 }
 
 failure_pending_write() {
@@ -24,12 +154,13 @@ failure_pending_write() {
         "$FAILURE_STAGE" "$FAILURE_REASON" "$FAILURE_DETAIL" "$FAILURE_SUGGESTION" > "$temp"; then
         rm -f -- "$temp"; return 1
     fi
+    [[ -z "$FAILURE_BUDGET_CONTEXT" ]] || printf '%s\n' "$FAILURE_BUDGET_CONTEXT" >> "$temp" || { rm -f -- "$temp"; return 1; }
     chmod 0600 "$temp" || { rm -f -- "$temp"; return 1; }
     mv -f -- "$temp" "$file"
 }
 
 failure_pending_load() {
-    local file="$1" line key value stage="" reason="" detail="" suggestion=""
+    local file="$1" line key value stage="" reason="" detail="" suggestion="" budget_context=""
     local -A seen=()
     [[ -f "$file" && ! -L "$file" && "$file" == "$HISTORY_DIR/"*/.failure-pending.tsv ]] || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -39,12 +170,20 @@ failure_pending_load() {
         seen[$key]=1
         case "$key" in
             STAGE) stage="$value" ;; REASON) reason="$value" ;; DETAIL) detail="$value" ;; SUGGESTION) suggestion="$value" ;;
-            *) return 1 ;;
+            *)
+                budget_diagnostic_key_valid "$key" || return 1
+                case "$key" in
+                    *_BYTES|*_SECONDS) [[ -z "$value" ]] || is_uint "$value" || return 1 ;;
+                    BUDGET_FAILURE_SUBTYPE) case "$value" in exhausted|insufficient-reservation|feasibility-rejected|unknown) ;; *) return 1 ;; esac ;;
+                    *) [[ "$value" =~ ^[a-z0-9,-]+$ ]] || return 1 ;;
+                esac
+                budget_context+="$line"$'\n' ;;
         esac
     done < "$file"
     [[ "$stage" =~ ^[A-Z][A-Z0-9_]{1,47}$ ]] && failure_reason_valid "$reason" || return 1
     [[ -n "${seen[DETAIL]+x}" && -n "${seen[SUGGESTION]+x}" ]] || return 1
     FAILURE_STAGE="$stage"; FAILURE_REASON="$reason"; FAILURE_DETAIL="$detail"; FAILURE_SUGGESTION="$suggestion"
+    FAILURE_BUDGET_CONTEXT="${budget_context%$'\n'}"
 }
 
 failure_reason_valid() {
@@ -74,7 +213,13 @@ failure_reason_explanation() {
         cpu-busy) printf 'CPU 忙碌度过高，测速结果可能受本机限制' ;;
         high-steal) printf '虚拟机 CPU steal 过高' ;;
         measurement-unstable) printf '重复样本离散度过高' ;;
-        budget-exceeded) printf '测量流量或时间硬预算已耗尽' ;;
+        budget-exceeded)
+            case "${2:-unknown}" in
+                exhausted) printf '测量 TX 或时间硬预算已耗尽' ;;
+                insufficient-reservation) printf '剩余 TX 或时间预算不足以安全覆盖下一阶段的必要预留' ;;
+                feasibility-rejected) printf '当前 profile 的剩余测量计划预计无法在指定 TX 或时间预算内完成' ;;
+                *) printf '测量因 TX 或时间预算限制而安全停止（历史记录未明确失败类型）' ;;
+            esac ;;
         no-clean-reference) printf '无法建立低速干净参考' ;;
         no-knee-confidence) printf '没有足够证据定位拐点' ;;
         candidate-confirm-failed) printf '候选速率未通过确认测试' ;;
@@ -98,7 +243,7 @@ failure_default_suggestion() {
         peer-*) printf '稍后重试，或使用自有 iperf3 服务端。' ;;
         path-*|endpoint-*|route-*|nexthop-*) printf '检查路由、策略路由与默认出口稳定性，然后重新测量。' ;;
         cpu-busy|high-steal|sample-contaminated|background-traffic) printf '停止其他高负载任务并等待线路空闲后重试。' ;;
-        budget-exceeded) printf '提高显式预算或改用 quick profile 后重新开始；本次不会复用未验证候选。' ;;
+        budget-exceeded) printf '重新执行并明确选择 --measurement-profile quick 或调整 --max-test-gib / --max-duration；本次不会复用未验证候选。' ;;
         tc-ownership-conflict) printf '先确认并由原管理工具移除第三方 qdisc；本项目不会强制覆盖。' ;;
         rollback-failed) printf '立即运行 bbr doctor，并依据保留的事务快照人工检查。' ;;
         *) printf '运行 bbr doctor 查看只读诊断，再根据具体差异处理。' ;;
@@ -119,6 +264,8 @@ failure_set() {
     detail=$(state_safe_text "$detail" 240); suggestion=$(state_safe_text "$suggestion" 240)
     FAILURE_STAGE="$stage"; FAILURE_REASON="$reason"; FAILURE_DETAIL="$detail"
     FAILURE_SUGGESTION="${suggestion:-$(failure_default_suggestion "$reason")}"; : "$rc"
+    FAILURE_BUDGET_CONTEXT=""
+    [[ "$reason" != budget-exceeded ]] || FAILURE_BUDGET_CONTEXT="${6:-}"
     failure_pending_write || true
 }
 
@@ -130,7 +277,7 @@ failure_from_rc() {
         "$IPERF_UNSTABLE_RC") failure_set "$stage" measurement-unstable "sample spread threshold exceeded" "" "$rc" ;;
         "$MEASURE_PATH_QUALITY_RC") failure_set PATH_CONTROL path-dirty "low-rate path control was not clean" "" "$rc" ;;
         "$MEASURE_ROUTE_MISMATCH_RC") failure_set ROUTE_GUARD path-changed "route fingerprint changed" "" "$rc" ;;
-        "${MEASURE_BUDGET_RC:-70}") failure_set "${MEASURE_BUDGET_STAGE:-$stage}" budget-exceeded "measurement hard budget reached" "" "$rc" ;;
+        "${MEASURE_BUDGET_RC:-70}") failure_set "${MEASURE_BUDGET_STAGE:-$stage}" budget-exceeded "measurement stopped by TX/time budget guard" "" "$rc" ;;
         "$MEASUREMENT_PREFLIGHT_RC") [[ -n "$FAILURE_REASON" ]] || failure_set PREFLIGHT sample-contaminated "environment preflight rejected measurement" "" "$rc" ;;
         "$ROLLBACK_FAILURE_RC") failure_set ROLLBACK rollback-failed "restoration did not complete" "" "$rc" ;;
         2) [[ -n "$FAILURE_REASON" ]] || failure_set "$stage" no-knee-confidence "measurement evidence was inconclusive" "" "$rc" ;;
@@ -140,15 +287,23 @@ failure_from_rc() {
 
 failure_record_write() {
     local dir="$1" stage="$2" reason="$3" detail="$4" rc="$5" rollback="$6" persistent="$7"
-    local original_stage="${8:-}" original_reason="${9:-}" original_rc="${10:-}" failure_file="$dir/failure.tsv" temp
+    local original_stage="${8:-}" original_reason="${9:-}" original_rc="${10:-}" failure_file="$dir/failure.tsv" temp context subtype suggestion
     [[ "$dir" == "$HISTORY_DIR/"* && -d "$dir" && ! -L "$dir" ]] || return 1
     temp=$(mktemp "${failure_file}.tmp.XXXXXX") || return 1
+    context=$(budget_failure_context_from_summary "$dir/summary.tsv")
+    if [[ "$reason" == budget-exceeded && -z "$context" ]]; then
+        context=$(budget_failure_context unknown '' '' '' '' '' '' unknown)
+    fi
+    subtype=$(summary_value /dev/stdin BUDGET_FAILURE_SUBTYPE <<< "$context")
+    suggestion=$(summary_value "$dir/summary.tsv" SUGGESTED_ACTION) || suggestion=""
+    [[ -n "$suggestion" ]] || suggestion=$(failure_default_suggestion "$reason")
     if ! printf 'SCHEMA\t%s\nSTAGE\t%s\nREASON\t%s\nEXPLANATION\t%s\nDETAIL\t%s\nRC\t%s\nROLLBACK\t%s\nPERSISTENT_CHANGES\t%s\nSUGGESTION\t%s\n' \
-        "$FAILURE_SCHEMA" "$stage" "$reason" "$(failure_reason_explanation "$reason")" \
+        "$FAILURE_SCHEMA" "$stage" "$reason" "$(failure_reason_explanation "$reason" "$subtype")" \
         "$(history_safe_value "$detail")" "$rc" "$rollback" "$persistent" \
-        "$(history_safe_value "$(failure_default_suggestion "$reason")")" > "$temp"; then
+        "$(history_safe_value "$suggestion")" > "$temp"; then
         rm -f -- "$temp"; return 1
     fi
+    [[ -z "$context" ]] || printf '%s\n' "$context" >> "$temp" || { rm -f -- "$temp"; return 1; }
     if [[ -n "$original_reason" ]]; then
         printf 'ORIGINAL_STAGE\t%s\nORIGINAL_REASON\t%s\nORIGINAL_RC\t%s\n' \
             "$original_stage" "$original_reason" "$original_rc" >> "$temp" || { rm -f -- "$temp"; return 1; }
@@ -184,6 +339,36 @@ history_summary_update() {
     mv -f -- "$temp" "$file"
 }
 
+measurement_history_invalidate_decision() {
+    local summary="$1" reason="$2" kind sample_score sample_grade sample_reasons
+    [[ -f "$summary" && ! -L "$summary" ]] || return 0
+    kind=$(summary_value "$summary" TYPE)
+    [[ "$kind" == sweep || "$kind" == verify ]] || return 0
+    sample_score=$(summary_value "$summary" SAMPLE_CONFIDENCE_SCORE)
+    sample_grade=$(summary_value "$summary" SAMPLE_CONFIDENCE_GRADE)
+    sample_reasons=$(summary_value "$summary" SAMPLE_CONFIDENCE_REASONS)
+    history_summary_update "$summary" \
+        SAMPLE_CONFIDENCE_SCORE "${sample_score:-0}" SAMPLE_CONFIDENCE_GRADE "${sample_grade:-low}" \
+        SAMPLE_CONFIDENCE_REASONS "${sample_reasons:-no-usable-sample}" \
+        DECISION_STATUS inconclusive DECISION_CONFIDENCE_SCORE 0 DECISION_CONFIDENCE_GRADE low DECISION_CONFIDENCE_REASONS "$reason" \
+        CONFIDENCE_SCORE 0 CONFIDENCE_GRADE low CONFIDENCE_REASONS "$reason" || return 1
+    if [[ "$kind" == sweep ]]; then
+        history_summary_update "$summary" RECOMMEND "" CONFIRMED 0 KNEE_MBIT "" CONFIRMED_KNEE ""
+    fi
+}
+
+measurement_history_complete_decision() {
+    local summary="$1" verify_score="$2" verify_reasons="$3" score grade decision_reasons
+    score=$(summary_value "$summary" SAMPLE_CONFIDENCE_SCORE); is_uint "$score" || score=0
+    decision_reasons=$(summary_value "$summary" SAMPLE_CONFIDENCE_REASONS); decision_reasons="${decision_reasons:-no-usable-sample}"
+    is_uint "$verify_score" || verify_score=0
+    if (( verify_score < score )); then score="$verify_score"; decision_reasons="$verify_reasons"; fi
+    if (( score >= 90 )); then grade=high; elif (( score >= 65 )); then grade=medium; else grade=low; fi
+    history_summary_update "$summary" DECISION_SCOPE operation DECISION_STATUS complete \
+        DECISION_CONFIDENCE_SCORE "$score" DECISION_CONFIDENCE_GRADE "$grade" DECISION_CONFIDENCE_REASONS "$decision_reasons" \
+        CONFIDENCE_SCORE "$score" CONFIDENCE_GRADE "$grade" CONFIDENCE_REASONS "$decision_reasons"
+}
+
 measurement_finalize_run() {
     local kind="$1" peer="$2" port="$3" iface="$4" rc="$5" rollback="${6:-complete}"
     local summary="${MEASURE_RUN_DIR:-}/summary.tsv" pending="${MEASURE_RUN_DIR:-}/.failure-pending.tsv"
@@ -203,6 +388,10 @@ measurement_finalize_run() {
         TEST_RX_BYTES_USED "${TEST_RX_BYTES_USED:-0}" TEST_DURATION_USED "${TEST_DURATION_USED:-0}" \
         MAX_TEST_TX_BYTES "${MEASURE_MAX_TX_BYTES:-0}" MAX_TEST_DURATION_SECONDS "${MEASURE_MAX_DURATION_SECONDS:-0}" || return 1
     if (( rc != 0 )); then
+        if [[ "$reason" == budget-exceeded ]]; then
+            budget_failure_summary_update "$summary" "$FAILURE_BUDGET_CONTEXT" || return 1
+        fi
+        measurement_history_invalidate_decision "$summary" "$reason" || return 1
         failure_record_write "$MEASURE_RUN_DIR" "$stage" "$reason" "$detail" "$rc" "$rollback" "$persistent" || return 1
     fi
     rm -f -- "$pending"
@@ -233,19 +422,22 @@ failure_finalize_outer_rollback() {
         ORIGINAL_FAILURE_STAGE "$original_stage" ORIGINAL_FAILURE_REASON "$original_reason" \
         ORIGINAL_FAILURE_DETAIL "$original_detail" ORIGINAL_FAILURE_SUGGESTION "$original_suggestion" \
         ORIGINAL_INTERNAL_RC "$([[ -n "$original_reason" ]] && printf '%s' "$original_rc")" COMPLETED_AT "$(utc_now)" || return 1
+    measurement_history_invalidate_decision "$summary" "$reason" || return 1
     failure_record_write "$dir" "$stage" "$reason" "$detail" "$final_rc" "$rollback" "$persistent" \
         "$original_stage" "$original_reason" "$original_rc"
 }
 
 failure_summary_print() {
-    local summary="${1:-${MEASURE_RUN_DIR:-}/summary.tsv}" final="${2:-0}" reason rollback persistent original
+    local summary="${1:-${MEASURE_RUN_DIR:-}/summary.tsv}" final="${2:-0}" reason rollback persistent original context subtype
     if [[ -n "${ACTION_TRANSACTION_DIR:-}" && "$final" != 1 ]]; then return 0; fi
     [[ -f "$summary" && ! -L "$summary" ]] || return 1
     [[ "$(summary_value "$summary" RESULT)" == FAILURE ]] || return 0
     reason=$(summary_value "$summary" FAILURE_REASON)
+    context=$(budget_failure_context_from_summary "$summary")
+    subtype=$(summary_value /dev/stdin BUDGET_FAILURE_SUBTYPE <<< "$context")
     printf '\nFailure summary\n\n'
     printf '%-20s %s\n' Stage "$(summary_value "$summary" FAILURE_STAGE)"
-    printf '%-20s %s (%s)\n' Reason "$reason" "$(failure_reason_explanation "$reason")"
+    printf '%-20s %s (%s)\n' Reason "$reason" "$(failure_reason_explanation "$reason" "$subtype")"
     printf '%-20s %s:%s\n' Peer "$(summary_value "$summary" PEER)" "$(summary_value "$summary" PORT)"
     printf '%-20s %s\n' 'Traffic used' "$(human_bytes "$(summary_value "$summary" TEST_TX_BYTES_USED)") TX"
     rollback=$(summary_value "$summary" ROLLBACK_RESULT); persistent=$(summary_value "$summary" PERSISTENT_CHANGES)
@@ -256,6 +448,7 @@ failure_summary_print() {
     original=$(summary_value "$summary" ORIGINAL_FAILURE_REASON)
     [[ -z "$original" ]] || printf '%-20s %s\n' 'Original reason' "$original"
     printf '%-20s %s\n' 'Persistent changes' "$persistent"
+    [[ "$reason" != budget-exceeded ]] || budget_failure_print "$summary"
     printf '\nSuggested action\n  %s\n' "$(summary_value "$summary" SUGGESTED_ACTION)"
 }
 
@@ -295,8 +488,32 @@ history_schema_supported() {
     is_uint "$schema" && (( 10#$schema <= HISTORY_SCHEMA ))
 }
 
+history_decision_grade() {
+    local file="$1" grade decision quality result
+    grade=$(history_field "$file" DECISION_CONFIDENCE_GRADE)
+    [[ -n "$grade" ]] || grade=$(history_field "$file" CONFIDENCE_GRADE)
+    if [[ "$(history_field "$file" TYPE)" == sweep ]]; then
+        decision=$(history_field "$file" SCAN_DECISION); result=$(history_field "$file" RESULT)
+        quality=$(history_field "$file" PATH_CONTROL_QUALITY)
+        [[ -n "$quality" ]] || quality=$(history_field "$file" BASELINE_QUALITY)
+        # Historical v8.0.7 budget interruptions could store high/clean. The
+        # reader applies the evidence gate without rewriting the old record.
+        if [[ "$result" == FAILURE || "$(history_field "$file" DECISION_STATUS)" == inconclusive ||
+              ( "$quality" != clean && "$quality" != good ) ]]; then
+            grade=low
+        elif [[ "$decision" == recommend && "$(history_field "$file" CONFIRMED)" == 1 &&
+                -n "$(history_field "$file" BROKE_AT)" && -n "$(history_field "$file" RECOMMEND)" ]] ||
+             [[ "$decision" == no-knee-clean && "$(history_field "$file" NO_KNEE)" == 1 ]]; then
+            :
+        else
+            grade=low
+        fi
+    fi
+    printf '%s\n' "${grade:-unknown}"
+}
+
 history_print_one() {
-    local file="$1" id result decision knee recommend verify traffic reason peer time schema
+    local file="$1" id result decision knee recommend verify traffic reason peer time schema last_clean suspected confirmed_break context subtype
     [[ -f "$file" && ! -L "$file" && "$file" == "$HISTORY_DIR/"*/summary.tsv ]] || return 1
     schema=$(history_field "$file" HISTORY_SCHEMA)
     history_schema_supported "$file" || { die "history 使用不支持的更新 schema: ${schema:-invalid}"; return 1; }
@@ -304,15 +521,33 @@ history_print_one() {
     time=$(history_field "$file" COMPLETED_AT); [[ -n "$time" ]] || time="${id%%-*}"
     result=$(history_field "$file" RESULT); [[ -n "$result" ]] || result=LEGACY
     decision=$(history_field "$file" SCAN_DECISION); [[ -n "$decision" ]] || decision=$(history_field "$file" TYPE)
-    knee=$(history_field "$file" KNEE_MBIT); recommend=$(history_field "$file" RECOMMEND)
+    knee=$(history_field "$file" CONFIRMED_KNEE); recommend=$(history_field "$file" RECOMMEND)
+    last_clean=$(history_field "$file" LAST_CLEAN); [[ -n "$last_clean" ]] || last_clean=$(history_field "$file" LAST_OK)
+    suspected=$(history_field "$file" SUSPECTED_BREAK); confirmed_break=$(history_field "$file" CONFIRMED_BREAK)
+    [[ -n "$confirmed_break" ]] || confirmed_break=$(history_field "$file" BROKE_AT)
+    if [[ -z "$knee" && -z "$(history_field "$file" KNEE_SEMANTICS)" ]]; then
+        # v8.0.5-7 KNEE_MBIT was an unconditional LAST_OK alias. Read old
+        # history without displaying a partial scan as a confirmed knee.
+        if [[ "$(history_field "$file" CONFIRMED)" == 1 && -n "$confirmed_break" && -n "$recommend" && "$result" != FAILURE ]]; then
+            knee=$(history_field "$file" KNEE_MBIT)
+        fi
+    fi
     verify=$(history_field "$file" VERDICT); [[ -n "$verify" ]] || verify=$(history_field "$file" FINAL_VERIFY_MODE)
     traffic=$(history_field "$file" TEST_TX_BYTES_USED); [[ -n "$traffic" ]] || traffic=0
     reason=$(history_field "$file" FAILURE_REASON); [[ -n "$reason" ]] || reason=none
     peer=$(history_field "$file" PEER); [[ -n "$peer" ]] || peer=unknown
     printf '%s\n' "ID                 $id" "Time               $time" "Operation          $(history_field "$file" TYPE)" \
         "Peer               $peer" "Result             $result" "Decision           ${decision:-unknown}" \
-        "Knee               ${knee:-none}" "Recommendation     ${recommend:-none}" "Verify             ${verify:-none}" \
+        "Last clean         ${last_clean:-none}" "Suspected break    ${suspected:-none}" "Confirmed break    ${confirmed_break:-none}" \
+        "Knee               ${knee:-none/unconfirmed}" \
+        "Sample confidence  $(history_field "$file" SAMPLE_CONFIDENCE_GRADE)" "Decision confidence $(history_decision_grade "$file")" "Recommendation     ${recommend:-none}" "Verify             ${verify:-none}" \
         "Traffic TX         $(human_bytes "$traffic")" "Failure reason     $reason"
+    if [[ "$reason" == budget-exceeded ]]; then
+        context=$(budget_failure_context_from_summary "$file")
+        subtype=$(summary_value /dev/stdin BUDGET_FAILURE_SUBTYPE <<< "$context")
+        printf '%-20s %s\n' 'Failure explanation' "$(failure_reason_explanation "$reason" "$subtype")"
+        budget_failure_print "$file"
+    fi
 }
 
 history_show() {
@@ -331,19 +566,24 @@ history_latest() {
 }
 
 history_list() {
-    local file id type result decision reason count=0
-    printf '%-31s %-9s %-9s %-28s %s\n' ID Type Result Decision/verify Failure
+    local file id type result decision reason subtype context count=0
+    printf '%-31s %-9s %-9s %-28s %-20s %s\n' ID Type Result Decision/verify Failure 'Budget subtype'
     while IFS= read -r file; do
         [[ -f "$file" ]] || continue
         id="${file%/summary.tsv}"; id="${id##*/}"; type=$(history_field "$file" TYPE)
         if ! history_schema_supported "$file"; then
-            printf '%-31s %-9s %-9s %-28s %s\n' "$id" unknown INVALID unsupported-schema ignored
+            printf '%-31s %-9s %-9s %-28s %-20s %s\n' "$id" unknown INVALID unsupported-schema ignored -
             continue
         fi
         result=$(history_field "$file" RESULT); [[ -n "$result" ]] || result=LEGACY
         decision=$(history_field "$file" SCAN_DECISION); [[ -n "$decision" ]] || decision=$(history_field "$file" VERDICT)
         reason=$(history_field "$file" FAILURE_REASON); [[ -n "$reason" ]] || reason=none
-        printf '%-31s %-9s %-9s %-28s %s\n' "$id" "${type:-unknown}" "$result" "${decision:-none}" "$reason"
+        subtype=-
+        if [[ "$reason" == budget-exceeded ]]; then
+            context=$(budget_failure_context_from_summary "$file")
+            subtype=$(summary_value /dev/stdin BUDGET_FAILURE_SUBTYPE <<< "$context")
+        fi
+        printf '%-31s %-9s %-9s %-28s %-20s %s\n' "$id" "${type:-unknown}" "$result" "${decision:-none}" "$reason" "$subtype"
         ((count+=1)); (( count < MAX_HISTORY_ENTRIES )) || break
     done < <(history_summary_files)
     (( count > 0 )) || printf '%s\n' '(no measurement history)'

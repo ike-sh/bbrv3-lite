@@ -1,0 +1,4 @@
+COMMAND=PATH=<external-native-docker-adapter> bash scripts/docker-validate.sh
+EXIT_CODE=0
+START_UTC=2026-11-12T22:44:58Z
+END_UTC=2026-11-12T23:03:20Z

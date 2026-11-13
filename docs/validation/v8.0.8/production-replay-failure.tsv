@@ -1,0 +1,9 @@
+SCHEMA	1
+STAGE	RATE_1222_RECHECK_3
+REASON	budget-exceeded
+EXPLANATION	测量流量或时间硬预算已耗尽
+DETAIL	TX=5739233591/6442450944 bytes; reserved-next=1200981349; duration=3/900s; reserved-time-next=27s
+RC	70
+ROLLBACK	complete
+PERSISTENT_CHANGES	none
+SUGGESTION	提高显式预算或改用 quick profile 后重新开始；本次不会复用未验证候选。

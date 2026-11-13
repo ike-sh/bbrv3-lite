@@ -3,7 +3,7 @@
 # This file is assembled from src/*.sh by scripts/build.sh.
 # shellcheck shell=bash
 
-SCRIPT_VERSION="8.0.7"
+SCRIPT_VERSION="8.0.8"
 SCRIPT_NAME="bbrv3-lite"
 PROJECT_REPO="ike-sh/bbrv3-lite"
 PROJECT_URL="https://github.com/${PROJECT_REPO}"
@@ -18,7 +18,7 @@ IPERF_CONTAMINATED_RC=66         # locally contaminated sample (peer failover al
 IPERF_UNSTABLE_RC=67             # unstable repeated samples (peer failover allowed)
 MEASURE_PATH_QUALITY_RC=68       # dirty PATH_CONTROL (peer failover allowed)
 MEASURE_ROUTE_MISMATCH_RC=69     # frozen route/path changed (peer failover allowed)
-MEASURE_BUDGET_RC=70             # top-level operation traffic/time budget exhausted
+MEASURE_BUDGET_RC=70             # operation cannot continue/complete within TX/time budget
 MEASUREMENT_PREFLIGHT_RC=71      # local environment rejected high-volume measurement
 DIAGNOSTIC_EXPORT_RC=72          # diagnostic bundle could not be produced safely
 ROLLBACK_FAILURE_RC=73           # restoration failed; highest-priority user failure
@@ -1726,7 +1726,7 @@ latest_path_brief() {
 # Health affects candidate ordering only; every endpoint is still prechecked.
 # -----------------------------------------------------------------------------
 
-PEER_HEALTH_SCHEMA="1"
+PEER_HEALTH_SCHEMA="2"
 PEER_HEALTH_WINDOW_SIZE=12
 
 peer_health_reset_values() {
@@ -1737,6 +1737,7 @@ peer_health_reset_values() {
     PH_LAST_RTT_MS=na; PH_LAST_RECEIVER_MBIT=na; PH_LAST_PATH_CONTROL_QUALITY=unknown
     PH_LAST_FAILURE_REASON=none; PH_TEMPORARY_PENALTY_UNTIL=0; PH_RECENT_WINDOW=""
     PH_LAST_RESULT=unknown; PH_UPDATED_AT=0
+    PH_SAMPLE_SUCCESS_COUNT=0; PH_COMPLETED_SWEEP_COUNT=0; PH_SAMPLE_RECENT_WINDOW=""; PH_SAMPLE_COUNTERS_SINCE=0
 }
 
 peer_health_is_public_host() {
@@ -1789,7 +1790,11 @@ peer_health_load() {
         [[ -z "${seen[$key]+x}" ]] || return 1
         seen[$key]=1
         case "$key" in
-            SCHEMA) schema="$value" ;;
+            SCHEMA)
+                schema="$value"; is_uint "$schema" || return 1
+                # Refuse a future format before encountering its unknown keys.
+                if (( 10#$schema > PEER_HEALTH_SCHEMA )); then return 2; fi
+                ;;
             HOST) PH_HOST="$value" ;;
             FAMILY) PH_FAMILY="$value" ;;
             ADDRESS) PH_ADDRESS="$value" ;;
@@ -1812,6 +1817,10 @@ peer_health_load() {
             RECENT_WINDOW) PH_RECENT_WINDOW="$value" ;;
             LAST_RESULT) PH_LAST_RESULT="$value" ;;
             UPDATED_AT) PH_UPDATED_AT="$value" ;;
+            SAMPLE_SUCCESS_COUNT) PH_SAMPLE_SUCCESS_COUNT="$value" ;;
+            COMPLETED_SWEEP_COUNT) PH_COMPLETED_SWEEP_COUNT="$value" ;;
+            SAMPLE_RECENT_WINDOW) PH_SAMPLE_RECENT_WINDOW="$value" ;;
+            SAMPLE_COUNTERS_SINCE) PH_SAMPLE_COUNTERS_SINCE="$value" ;;
             *) return 1 ;;
         esac
     done < "$file"
@@ -1823,15 +1832,21 @@ peer_health_load() {
     done
     is_uint "$schema" || return 1
     (( 10#$schema <= PEER_HEALTH_SCHEMA )) || return 2
-    [[ "$schema" == "$PEER_HEALTH_SCHEMA" ]] || return 1
+    [[ "$schema" == 1 || "$schema" == "$PEER_HEALTH_SCHEMA" ]] || return 1
+    if [[ "$schema" == 2 ]]; then
+        for required in SAMPLE_SUCCESS_COUNT COMPLETED_SWEEP_COUNT SAMPLE_RECENT_WINDOW SAMPLE_COUNTERS_SINCE; do
+            [[ -n "${seen[$required]+x}" ]] || return 1
+        done
+    fi
     validate_peer "$PH_HOST" "$PH_PORT" 2>/dev/null || return 1
     [[ "$PH_FAMILY" == 4 || "$PH_FAMILY" == 6 ]] || return 1
     measure_source_address_is_valid "$PH_FAMILY" "$PH_ADDRESS" || return 1
     for value in "$PH_SUCCESS_COUNT" "$PH_FAILURE_COUNT" "$PH_BUSY_COUNT" "$PH_RESET_COUNT" \
-        "$PH_TIMEOUT_COUNT" "$PH_PATH_DIRTY_COUNT" "$PH_SLOW_PEER_COUNT" "$PH_UNSTABLE_COUNT"; do
+        "$PH_TIMEOUT_COUNT" "$PH_PATH_DIRTY_COUNT" "$PH_SLOW_PEER_COUNT" "$PH_UNSTABLE_COUNT" \
+        "$PH_SAMPLE_SUCCESS_COUNT" "$PH_COMPLETED_SWEEP_COUNT"; do
         peer_health_counter_valid "$value" || return 1
     done
-    for value in "$PH_LAST_SUCCESS" "$PH_LAST_FAILURE" "$PH_TEMPORARY_PENALTY_UNTIL" "$PH_UPDATED_AT"; do
+    for value in "$PH_LAST_SUCCESS" "$PH_LAST_FAILURE" "$PH_TEMPORARY_PENALTY_UNTIL" "$PH_UPDATED_AT" "$PH_SAMPLE_COUNTERS_SINCE"; do
         peer_health_timestamp_valid "$value" || return 1
     done
     [[ "$PH_LAST_RTT_MS" == na ]] || is_decimal "$PH_LAST_RTT_MS" || return 1
@@ -1839,6 +1854,7 @@ peer_health_load() {
     [[ "$PH_LAST_PATH_CONTROL_QUALITY" =~ ^(unknown|clean|good|dirty|slow-peer)$ ]] || return 1
     [[ "$PH_LAST_FAILURE_REASON" =~ ^[a-z0-9-]{1,64}$ ]] || return 1
     [[ "$PH_RECENT_WINDOW" =~ ^[SBRDTLUFIK]{0,12}$ ]] || return 1
+    [[ "$PH_SAMPLE_RECENT_WINDOW" =~ ^[SBRT]{0,12}$ ]] || return 1
     [[ "$PH_LAST_RESULT" =~ ^[a-z0-9-]{1,64}$ ]] || return 1
 }
 
@@ -1856,6 +1872,10 @@ peer_health_write() {
         "$PH_SLOW_PEER_COUNT" "$PH_UNSTABLE_COUNT" "$PH_LAST_RTT_MS" "$PH_LAST_RECEIVER_MBIT" \
         "$PH_LAST_PATH_CONTROL_QUALITY" "$PH_LAST_FAILURE_REASON" "$PH_TEMPORARY_PENALTY_UNTIL" \
         "$PH_RECENT_WINDOW" "$PH_LAST_RESULT" "$PH_UPDATED_AT" > "$temp"; then
+        rm -f -- "$temp"; return 1
+    fi
+    if ! printf 'SAMPLE_SUCCESS_COUNT\t%s\nCOMPLETED_SWEEP_COUNT\t%s\nSAMPLE_RECENT_WINDOW\t%s\nSAMPLE_COUNTERS_SINCE\t%s\n' \
+        "$PH_SAMPLE_SUCCESS_COUNT" "$PH_COMPLETED_SWEEP_COUNT" "$PH_SAMPLE_RECENT_WINDOW" "$PH_SAMPLE_COUNTERS_SINCE" >> "$temp"; then
         rm -f -- "$temp"; return 1
     fi
     chmod 0600 "$temp" || { rm -f -- "$temp"; return 1; }
@@ -1891,7 +1911,7 @@ peer_health_window_code() {
 
 peer_health_record() {
     local host="$1" family="$2" address="$3" port="$4" outcome="$5" reason="${6:-none}"
-    local rtt="${7:-na}" receiver="${8:-na}" quality="${9:-unknown}" file rc now penalty code
+    local rtt="${7:-na}" receiver="${8:-na}" quality="${9:-unknown}" kind="${10:-operation}" file rc now penalty code
     peer_health_is_public_host "$host" || return 0
     validate_peer "$host" "$port" || return 1
     [[ "$family" == 4 || "$family" == 6 ]] && measure_source_address_is_valid "$family" "$address" || return 1
@@ -1913,9 +1933,30 @@ peer_health_record() {
     [[ "$rtt" == na ]] || is_decimal "$rtt" || rtt=na
     [[ "$receiver" == na ]] || is_decimal "$receiver" || receiver=na
     [[ "$quality" =~ ^(unknown|clean|good|dirty|slow-peer)$ ]] || quality=unknown
-    PH_LAST_RTT_MS="$rtt"; PH_LAST_RECEIVER_MBIT="$receiver"; PH_LAST_PATH_CONTROL_QUALITY="$quality"
+    # A failed attempt has no new RTT/capacity fact. Do not erase valid prior
+    # telemetry, or the path quality, when recording transport-only events.
+    [[ "$rtt" == na ]] || PH_LAST_RTT_MS="$rtt"
+    [[ "$receiver" == na ]] || PH_LAST_RECEIVER_MBIT="$receiver"
+    [[ "$quality" == unknown ]] || PH_LAST_PATH_CONTROL_QUALITY="$quality"
+    (( PH_SAMPLE_COUNTERS_SINCE > 0 )) || PH_SAMPLE_COUNTERS_SINCE="$now"
+    if [[ "$outcome" == sample-success ]]; then
+        ((PH_SAMPLE_SUCCESS_COUNT+=1))
+        PH_SAMPLE_RECENT_WINDOW="${PH_SAMPLE_RECENT_WINDOW}S"
+        if (( ${#PH_SAMPLE_RECENT_WINDOW} > PEER_HEALTH_WINDOW_SIZE )); then
+            PH_SAMPLE_RECENT_WINDOW="${PH_SAMPLE_RECENT_WINDOW: -$PEER_HEALTH_WINDOW_SIZE}"
+        fi
+        case "$PH_LAST_RESULT" in
+            peer-busy|peer-reset|peer-timeout|peer-unavailable)
+                PH_TEMPORARY_PENALTY_UNTIL=0; PH_LAST_RESULT=sample-success ;;
+        esac
+        peer_health_write "$file"
+        return
+    fi
     if [[ "$outcome" == success ]]; then
+        # SUCCESS_COUNT remains the legacy completed-operation counter. Its
+        # denominator was mixed with failed attempts; never present that ratio.
         ((PH_SUCCESS_COUNT+=1)); PH_LAST_SUCCESS="$now"; PH_LAST_RESULT=clean
+        if [[ "$kind" == sweep ]]; then ((PH_COMPLETED_SWEEP_COUNT+=1)); fi
         PH_TEMPORARY_PENALTY_UNTIL=0
     elif [[ "$outcome" == inconclusive ]]; then
         [[ "$reason" == measurement-inconclusive || "$reason" == knee-not-located ]] || reason=measurement-inconclusive
@@ -1935,6 +1976,13 @@ peer_health_record() {
             peer-too-slow) ((PH_SLOW_PEER_COUNT+=1)) ;;
             measurement-unstable|sample-contaminated) ((PH_UNSTABLE_COUNT+=1)) ;;
         esac
+        case "$reason" in
+            peer-busy|peer-reset|peer-timeout|peer-unavailable)
+                PH_SAMPLE_RECENT_WINDOW="${PH_SAMPLE_RECENT_WINDOW}$(peer_health_window_code "$reason")"
+                if (( ${#PH_SAMPLE_RECENT_WINDOW} > PEER_HEALTH_WINDOW_SIZE )); then
+                    PH_SAMPLE_RECENT_WINDOW="${PH_SAMPLE_RECENT_WINDOW: -$PEER_HEALTH_WINDOW_SIZE}"
+                fi ;;
+        esac
         penalty=$(peer_health_penalty_seconds "$reason")
         PH_TEMPORARY_PENALTY_UNTIL=$((now + penalty))
     fi
@@ -1944,6 +1992,10 @@ peer_health_record() {
         PH_RECENT_WINDOW="${PH_RECENT_WINDOW:$((${#PH_RECENT_WINDOW}-PEER_HEALTH_WINDOW_SIZE))}"
     fi
     peer_health_write "$file"
+}
+
+peer_health_record_sample_success() {
+    peer_health_record "$1" "$2" "$3" "$4" sample-success none "${5:-na}" "${6:-na}" unknown
 }
 
 peer_health_reason_from_text() {
@@ -1973,7 +2025,7 @@ peer_health_host_reset_count() {
 
 peer_health_score() {
     local host="$1" family="$2" address="$3" port="$4" rtt="${5:-9999}" file score=35 rtt_score=0 success_score=10
-    local now total host_resets=0 reason="no-history" age=0 history_weight=100 delta=0 recent_success recent_failure
+    local now total host_resets=0 reason="no-history" age=0 history_weight=100 delta=0 recent_success recent_failure availability_window
     if is_decimal "$rtt"; then
         if awk -v v="$rtt" 'BEGIN {exit !(v<=30)}'; then rtt_score=25
         elif awk -v v="$rtt" 'BEGIN {exit !(v<=60)}'; then rtt_score=20
@@ -1995,14 +2047,17 @@ peer_health_score() {
             return
         fi
         (( age < 86400 )) || history_weight=50
-        recent_success=$(tr -cd 'S' <<< "$PH_RECENT_WINDOW" | wc -c)
-        recent_failure=$(tr -cd 'BRDTLUF' <<< "$PH_RECENT_WINDOW" | wc -c)
+        # The new availability window contains only iperf attempts. Completed
+        # operations never inflate it. Old files keep their original prior.
+        availability_window="${PH_SAMPLE_RECENT_WINDOW:-$PH_RECENT_WINDOW}"
+        recent_success=$(tr -cd 'S' <<< "$availability_window" | wc -c)
+        recent_failure=$(tr -cd 'BRDTLUF' <<< "$availability_window" | wc -c)
         total=$((recent_success + recent_failure)); reason="history"
         if (( total > 0 )); then success_score=$((recent_success * 20 / total)); fi
         delta=$success_score
         [[ "$PH_LAST_PATH_CONTROL_QUALITY" != clean && "$PH_LAST_PATH_CONTROL_QUALITY" != good ]] || delta=$((delta+10))
-        [[ "$PH_RECENT_WINDOW" != *B* ]] || delta=$((delta-5))
-        [[ "$PH_RECENT_WINDOW" != *R* ]] || delta=$((delta-10))
+        [[ "$availability_window" != *B* ]] || delta=$((delta-5))
+        [[ "$availability_window" != *R* ]] || delta=$((delta-10))
         [[ "$PH_RECENT_WINDOW" != *D* ]] || delta=$((delta-8))
         [[ "$PH_RECENT_WINDOW" != *L* ]] || delta=$((delta-8))
         [[ "$PH_RECENT_WINDOW" != *U* ]] || delta=$((delta-8))
@@ -2034,9 +2089,10 @@ peer_health_rank_candidates() {
 }
 
 peers_show() {
-    local file score reason success total now penalty
+    local file score reason now penalty rtt samples sweeps
     printf 'Public iperf peer health\n\n'
-    printf '%-43s %-5s %-7s %-9s %-6s %-6s %s\n' 'Endpoint' 'RTT' 'Score' 'Success' 'Busy' 'Reset' 'Last result'
+    printf '%-43s %-8s %-6s %-15s %-16s %-16s %-13s %-14s %-16s %s\n' \
+        Endpoint RTT Score 'Sample success' 'Completed sweeps' 'Completed ops' 'Busy attempts' 'Reset attempts' 'Timeout attempts' 'Last result'
     if [[ ! -d "$PEER_HEALTH_DIR" || -L "$PEER_HEALTH_DIR" ]]; then
         printf '%s\n' '(no local peer health history)'
         return 0
@@ -2048,14 +2104,19 @@ peers_show() {
             continue
         fi
         IFS=$'\t' read -r score reason <<< "$(peer_health_score "$PH_HOST" "$PH_FAMILY" "$PH_ADDRESS" "$PH_PORT" "$PH_LAST_RTT_MS")"
-        total=$((PH_SUCCESS_COUNT + PH_FAILURE_COUNT)); success="${PH_SUCCESS_COUNT}/${total}"
+        samples="$PH_SAMPLE_SUCCESS_COUNT"; sweeps="$PH_COMPLETED_SWEEP_COUNT"
+        if (( PH_SAMPLE_COUNTERS_SINCE == 0 )); then samples=n/a; sweeps=n/a; fi
+        if is_decimal "$PH_LAST_RTT_MS"; then rtt="${PH_LAST_RTT_MS}ms"; else rtt=n/a; fi
         now=$(date +%s); penalty=""
         if (( PH_TEMPORARY_PENALTY_UNTIL > now )); then penalty=" (penalty $((PH_TEMPORARY_PENALTY_UNTIL-now))s)"; fi
-        printf '%-43s %-5s %-7s %-9s %-6s %-6s %s%s\n' \
-            "${PH_HOST}:${PH_PORT}/IPv${PH_FAMILY}" "${PH_LAST_RTT_MS}ms" "$score" "$success" \
-            "$PH_BUSY_COUNT" "$PH_RESET_COUNT" "$PH_LAST_RESULT" "$penalty"
+        printf '%-43s %-8s %-6s %-15s %-16s %-16s %-13s %-14s %-16s %s%s\n' \
+            "${PH_HOST}:${PH_PORT}/IPv${PH_FAMILY}" "$rtt" "$score" "$samples" "$sweeps" "$PH_SUCCESS_COUNT" \
+            "$PH_BUSY_COUNT" "$PH_RESET_COUNT" "$PH_TIMEOUT_COUNT" "$PH_LAST_RESULT" "$penalty"
     done
-    printf '\nHealth is a local ordering hint; every formal test still performs live precheck and route/path validation.\n'
+    printf '\nUnits: Sample success = completed valid iperf sessions (including samples in incomplete sweeps); Completed sweeps = successful sweep operations; Completed ops = legacy successful probe/sweep/verify operations.\n'
+    printf 'Sample/sweep counters start when each endpoint migrates to v8.0.8; earlier events are not backfilled. Busy/reset/timeout count failed iperf attempts.\n'
+    printf 'Score uses the recent iperf-attempt availability window plus expiring path/peer hints; legacy history is a fallback prior.\n'
+    printf 'Health is a local ordering hint; every formal test still performs live precheck and route/path validation.\n'
 }
 
 peers_reset() {
@@ -5447,6 +5508,9 @@ PUBLIC_PEER_CANDIDATES=()
 MEASURE_LEVEL_ROW=""
 MEASURE_LEVEL_SPIKE_HITS=0
 MEASURE_LEVEL_SPIKE_CONFIRMED=0
+MEASURE_LEVEL_SUSPECTED_BREAK=0
+MEASURE_LEVEL_REPRESENTATIVE=0
+MEASURE_LEVEL_PLATEAU_CONFIRMED=0
 MEASUREMENT_PROFILE="standard"
 MEASURE_MAX_TX_BYTES=6442450944
 MEASURE_MAX_DURATION_SECONDS=900
@@ -5589,7 +5653,9 @@ measurement_budget_check() {
           TEST_DURATION_USED >= MEASURE_MAX_DURATION_SECONDS || projected_duration >= MEASURE_MAX_DURATION_SECONDS )); then
         MEASURE_BUDGET_STAGE="$stage"
         if declare -F failure_set >/dev/null; then
-            failure_set "$stage" budget-exceeded "TX=${TEST_TX_BYTES_USED}/${MEASURE_MAX_TX_BYTES} bytes; reserved-next=${reserved_bytes}; duration=${TEST_DURATION_USED}/${MEASURE_MAX_DURATION_SECONDS}s; reserved-time-next=${reserved_seconds}s" "" "$MEASURE_BUDGET_RC"
+            failure_set "$stage" budget-exceeded "TX=${TEST_TX_BYTES_USED}/${MEASURE_MAX_TX_BYTES} bytes; reserved-next=${reserved_bytes}; duration=${TEST_DURATION_USED}/${MEASURE_MAX_DURATION_SECONDS}s; reserved-time-next=${reserved_seconds}s" "" "$MEASURE_BUDGET_RC" \
+                "$(budget_failure_context guard "$MEASURE_MAX_TX_BYTES" "$TEST_TX_BYTES_USED" "$reserved_bytes" \
+                    "$MEASURE_MAX_DURATION_SECONDS" "$TEST_DURATION_USED" "$reserved_seconds" "$MEASUREMENT_PROFILE")"
         fi
         if (( reserved_bytes > 0 && TEST_TX_BYTES_USED < MEASURE_MAX_TX_BYTES )); then
             remaining=$((MEASURE_MAX_TX_BYTES-TEST_TX_BYTES_USED))
@@ -5683,10 +5749,10 @@ measurement_budget_reserve_sample() {
 
 measurement_peer_health_finalize() {
     local peer="$1" family="$2" address="$3" port="$4" rc="$5"
-    local rtt="${6:-na}" receiver="${7:-na}" quality="${8:-unknown}" semantic="${9:-}" reason="${FAILURE_REASON:-measurement-unstable}"
+    local rtt="${6:-na}" receiver="${7:-na}" quality="${8:-unknown}" semantic="${9:-}" kind="${10:-operation}" reason="${FAILURE_REASON:-measurement-unstable}"
     declare -F peer_health_record >/dev/null || return 0
     if (( rc == 0 )); then
-        peer_health_record "$peer" "$family" "$address" "$port" success none "$rtt" "$receiver" "$quality"
+        peer_health_record "$peer" "$family" "$address" "$port" success none "$rtt" "$receiver" "$quality" "$kind"
         return
     fi
     if [[ "$semantic" == measurement-inconclusive || "$semantic" == knee-not-located ]]; then
@@ -6603,6 +6669,10 @@ iperf_sample() {
     fi
     if [[ -n "$MEASURE_IFACE" ]]; then background=$(background_tx_percent "$tx_before" "$tx_after" "$sender_bytes"); fi
     sample_is_contaminated "$background" "$cpu_steal" "$cpu_busy" && contaminated=1
+    if declare -F peer_health_record_sample_success >/dev/null; then
+        peer_health_record_sample_success "$MEASURE_PEER_HOST" "$MEASURE_PEER_FAMILY" "$MEASURE_PEER_ADDRESS" "$port" \
+            "$MEASURE_IDLE_RTT_MS" "$receiver_mbit" || log WARN "peer health 样本计数写入失败；网络事务不受影响"
+    fi
     # Column 1 keeps its compatibility position but now means receiver-delivered
     # throughput. Explicit endpoint fields are appended for auditability.
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -6671,6 +6741,47 @@ measurement_confidence() {
         reason=clean
     fi
     printf '%s\t%s\t%s\n' "$score" "$grade" "$reason"
+}
+
+# Telemetry quality is independent of whether the experiment has completed its
+# evidence chain. Only these two completed sweep verdicts may inherit it.
+measurement_decision_confidence() {
+    local score="$1" grade="$2" telemetry_reasons="$3" rc="$4" decision="$5" quality="$6"
+    local confirmed="$7" no_knee="$8" broke_at="$9" reject="${10:-}"
+    if (( rc != 0 )) || [[ -n "$reject" ]]; then
+        printf '0\tlow\t%s\n' "${reject:-incomplete-measurement-rc-${rc}}"
+    elif [[ "$quality" != clean && "$quality" != good ]]; then
+        printf '0\tlow\tpath-control-%s\n' "$quality"
+    elif [[ "$decision" == recommend && "$confirmed" == 1 && -n "$broke_at" ]] ||
+         [[ "$decision" == no-knee-clean && "$no_knee" == 1 ]]; then
+        printf '%s\t%s\t%s\n' "$score" "$grade" "$telemetry_reasons"
+    else
+        printf '0\tlow\t%s\n' "${reject:-incomplete-evidence-chain}"
+    fi
+}
+
+# Write an entire TSV row only after validating every cell. In particular, a
+# label or diagnostic must not create an extra row/column. Keep numeric text
+# verbatim (including decimal precision) and the existing 20-column schema.
+measurement_tsv_row() {
+    local value
+    (($# > 0)) || return 1
+    for value in "$@"; do
+        [[ "$value" != *$'\t'* && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+    done
+    printf '%s' "$1"; shift
+    if (($#)); then printf '\t%s' "$@"; fi
+    printf '\n'
+}
+
+measurement_sample_event() {
+    local label="$1" event="$2" detail="$3" file
+    [[ -n "$MEASURE_RESULT_FILE" ]] || return 0
+    file="${MEASURE_RESULT_FILE%/*}/sample-events.tsv"
+    if [[ ! -e "$file" ]]; then
+        printf 'TIME\tLABEL\tEVENT\tDETAIL\n' > "$file" || return 1
+    fi
+    measurement_tsv_row "$(utc_now)" "$label" "$event" "$detail" >> "$file"
 }
 
 compare_verdict() {
@@ -6748,12 +6859,15 @@ sample_repeated() {
                 "$g" "$r" "$b" "$l" "$rpg" "$loaded_med" "$loaded_tail" "$background" "$cpu_busy" "$cpu_steal" \
                 "$contaminated" "$sender_mbit" "$receiver_mbit" "$sender_bytes" "$receiver_bytes" "$receiver_fallback")
             bloat=$(bufferbloat_delta_ms "$MEASURE_IDLE_RTT_MS" "$loaded_tail")
-            [[ -n "$MEASURE_RESULT_FILE" ]] && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            if [[ -n "$MEASURE_RESULT_FILE" ]]; then
+                measurement_tsv_row \
                 "$(utc_now)" "$label" "$sender_mbit" "$receiver_mbit" "$r" "$sender_bytes" "$receiver_bytes" "$l" "$rpg" \
                 "$receiver_fallback" "$MEASURE_IDLE_RTT_MS" "$loaded_med" "$loaded_tail" "$bloat" "$background" "$cpu_busy" "$cpu_steal" \
-                "$contaminated" "$duration" "$parallel" >> "$MEASURE_RESULT_FILE"
+                "$contaminated" "$duration" "$parallel" >> "$MEASURE_RESULT_FILE" || return "$IPERF_DATA_RC"
+            fi
             if [[ "$contaminated" == 1 && "$contamination_retry" -lt "$contamination_retries" ]]; then
                 ((contamination_retry+=1))
+                measurement_sample_event "$label" CONTAMINATED "background=${background}; cpu-busy=${cpu_busy}; cpu-steal=${cpu_steal}; retry=${contamination_retry}" || return 1
                 log WARN "样本受到后台流量、CPU 饱和或 steal 污染，2 秒后重采（${contamination_retry}/${contamination_retries}）"
                 sleep 2
                 continue
@@ -6782,6 +6896,7 @@ sample_repeated() {
         spread=$(relative_spread_percent "${delivered_rates[@]}")
         if (( i >= count && i < max_count )) && awk -v s="$spread" -v t="$stability_threshold" 'BEGIN {exit !(t>0 && s>t)}'; then
             target_count=$((i + 1))
+            measurement_sample_event "$label" DISPERSION_RECHECK "spread=${spread}%; threshold=${stability_threshold}%; append-sample=${target_count}" || return 1
             log WARN "吞吐离散度 ${spread}% 超过 ${stability_threshold}%，追加第 ${target_count} 个样本"
         fi
         (( i < target_count )) && sleep 2
@@ -6800,6 +6915,13 @@ sample_repeated() {
             selected_distance="$distance"; selected_row="${rows[$index]}"
         fi
     done
+    for ((index=0; index<${#rows[@]}; index++)); do
+        if awk -v g="${delivered_rates[$index]}" -v m="$median_rate" -v t="$stability_threshold" \
+            'BEGIN {d=g-m; if(d<0)d=-d; exit !(t>0 && m>0 && d*100/m>t)}'; then
+            measurement_sample_event "$label" OUTLIER "sample=$((index+1)); receiver=${delivered_rates[$index]}; median=${median_rate}; selected-receiver=$(cut -f1 <<< "$selected_row")" || return 1
+        fi
+    done
+    measurement_sample_event "$label" REPRESENTATIVE_SELECTED "receiver=$(cut -f1 <<< "$selected_row"); final-spread=${spread}%; sample-count=${target_count}; selection=nearest-receiver-median" || return 1
     IFS=$'\t' read -r g r b l rpg loaded_med loaded_tail background cpu_busy cpu_steal contaminated \
         sender_mbit receiver_mbit sender_bytes receiver_bytes receiver_fallback <<< "$selected_row"
     bloat=$(bufferbloat_delta_ms "$MEASURE_IDLE_RTT_MS" "$loaded_tail")
@@ -6827,7 +6949,7 @@ measurement_cooldown() {
     is_decimal "$rate" || rate=0; is_uint "$duration" || duration=3
     case "$stage" in
         PRE_SCAN) seconds=$(awk -v r="$rate" -v d="$duration" 'BEGIN {v=int(d*0.8+r/1000+0.99); if(v<3)v=3; if(v>10)v=10; print v}') ;;
-        SPIKE_RECHECK) seconds=$(awk -v r="$rate" -v d="$duration" 'BEGIN {v=int(d*0.4+r/2000+0.99); if(v<2)v=2; if(v>6)v=6; print v}') ;;
+        SPIKE_RECHECK|THROUGHPUT_RECHECK) seconds=$(awk -v r="$rate" -v d="$duration" 'BEGIN {v=int(d*0.4+r/2000+0.99); if(v<2)v=2; if(v>6)v=6; print v}') ;;
         BETWEEN_LEVEL) seconds=$(awk -v r="$rate" -v d="$duration" 'BEGIN {v=int(d*0.25+r/4000+0.99); if(v<1)v=1; if(v>4)v=4; print v}') ;;
         PRE_VERIFY) seconds=$(awk -v r="$rate" -v d="$duration" 'BEGIN {v=int(d*0.8+r/1000+0.99); if(v<3)v=3; if(v>10)v=10; print v}') ;;
         *) die "未知测量冷却阶段: $stage"; return 1 ;;
@@ -6840,26 +6962,67 @@ measurement_cooldown() {
     sleep "$seconds"
 }
 
+measurement_throughput_representative() {
+    local row="$1" rate="$2" efficiency="$3"
+    [[ "$(cut -f19 <<< "$row")" != 1 ]] || return 1
+    awk -v g="$(cut -f1 <<< "$row")" -v r="$rate" -v e="$efficiency" \
+        'BEGIN {exit !(r<=0 || (g>0 && g>=r*e))}'
+}
+
+measurement_level_sample_audit() {
+    local label="$1" row="$2" rate="$3" efficiency="$4" threshold="$5" base_loss="$6" peer_limited="${7:-0}"
+    local loss_clean=1 representative=0
+    loss_spike "$(cut -f4 <<< "$row")" "$threshold" "$base_loss" && loss_clean=0
+    measurement_throughput_representative "$row" "$rate" "$efficiency" && representative=1
+    measurement_sample_event "$label" SAMPLE_QUALIFICATION \
+        "requested=${rate}; sender=$(cut -f15 <<< "$row"); receiver=$(cut -f1 <<< "$row"); minimum-efficiency=${efficiency}; LOSS_CLEAN=${loss_clean}; THROUGHPUT_REPRESENTATIVE=${representative}; PEER_LIMITED=${peer_limited}; PATH_DIRTY=0; CONTAMINATED=$(cut -f11 <<< "$row")"
+}
+
 measure_level_with_confirmation() {
     local peer="$1" port="$2" duration="$3" confirm_duration="$4" parallel="$5" label="$6"
-    local threshold="$7" base_loss="$8" planning_rate="${9:-0}" row loss rc=0 index hits=0 selected="" selected_loss="" gp
-    local -a rows=() spike_rows=() clean_rows=()
+    local threshold="$7" base_loss="$8" planning_rate="${9:-0}" efficiency="${10:-0.75}"
+    local allow_plateau="${11:-0}" row loss index hits=0 selected="" selected_loss="" gp recovery=0 initial_spike=0 recheck_stage failure_stage plateau_spread recovery_spread
+    local -a spike_rows=() clean_rows=() clean_rates=() plateau_rows=() plateau_rates=()
     MEASURE_LEVEL_ROW=""; MEASURE_LEVEL_SPIKE_HITS=0; MEASURE_LEVEL_SPIKE_CONFIRMED=0
+    MEASURE_LEVEL_SUSPECTED_BREAK=0; MEASURE_LEVEL_REPRESENTATIVE=0; MEASURE_LEVEL_PLATEAU_CONFIRMED=0
     row=$(sample_repeated "$peer" "$port" "$duration" "$parallel" 1 "$label" 1 0 "$planning_rate" shaped) || return $?
-    rows+=("$row")
+    measurement_level_sample_audit "$label" "$row" "$planning_rate" "$efficiency" "$threshold" "$base_loss" || return 1
     loss=$(cut -f4 <<< "$row")
     if loss_spike "$loss" "$threshold" "$base_loss"; then
-        hits=1; spike_rows+=("$row")
+        hits=1; initial_spike=1; spike_rows+=("$row")
+        MEASURE_LEVEL_SUSPECTED_BREAK=1; MEASURE_LEVEL_SPIKE_HITS=1
+    elif measurement_throughput_representative "$row" "$planning_rate" "$efficiency"; then
+        clean_rows+=("$row"); clean_rates+=("$(cut -f1 <<< "$row")"); selected="$row"
+    else
+        recovery=1
+        if (( allow_plateau )) && measurement_throughput_representative "$row" "$planning_rate" 0.75; then
+            plateau_rows+=("$row"); plateau_rates+=("$(cut -f1 <<< "$row")")
+        fi
+        log WARN "$label: LOSS_CLEAN=1，但 receiver $(cut -f1 <<< "$row")/${planning_rate} 低于效率门槛 ${efficiency}；冷却后同档有界复验，不作为 clean throughput reference"
+        measurement_sample_event "$label" THROUGHPUT_RECHECK "loss-clean-underfilled; required=2-representative-of-at-most-3; same-rate=${planning_rate}; existing-reference-allows-plateau=${allow_plateau}" || return 1
+    fi
+    if (( initial_spike || recovery )); then
+        # Preserve exactly three experiments and the existing 2/3 loss rule.
+        # An underfilled loss-clean row is still a non-spike observation, but
+        # it cannot become the delivered-throughput reference.
         for index in 2 3; do
-            measurement_cooldown SPIKE_RECHECK "$(cut -f1 <<< "$row")" "$confirm_duration" || return 1
+            if (( initial_spike )); then recheck_stage=SPIKE_RECHECK; else recheck_stage=THROUGHPUT_RECHECK; fi
+            measurement_cooldown "$recheck_stage" "$planning_rate" "$confirm_duration" || return $?
             row=$(sample_repeated "$peer" "$port" "$confirm_duration" "$parallel" 1 "${label}-recheck-${index}" 1 0 \
                 "$planning_rate" shaped "$(cut -f15 <<< "$row")" "$(cut -f4 <<< "$row")" "$(cut -f8 <<< "$row")") || return $?
-            rows+=("$row"); loss=$(cut -f4 <<< "$row")
+            measurement_level_sample_audit "${label}-recheck-${index}" "$row" "$planning_rate" "$efficiency" "$threshold" "$base_loss" || return 1
+            loss=$(cut -f4 <<< "$row")
             if loss_spike "$loss" "$threshold" "$base_loss"; then
-                ((hits+=1)); spike_rows+=("$row")
-            else
-                clean_rows+=("$row")
+                ((hits+=1)); spike_rows+=("$row"); MEASURE_LEVEL_SUSPECTED_BREAK=1
+            elif measurement_throughput_representative "$row" "$planning_rate" "$efficiency"; then
+                clean_rows+=("$row"); clean_rates+=("$(cut -f1 <<< "$row")")
+            elif (( allow_plateau )) && measurement_throughput_representative "$row" "$planning_rate" 0.75; then
+                plateau_rows+=("$row"); plateau_rates+=("$(cut -f1 <<< "$row")")
             fi
+            MEASURE_LEVEL_SPIKE_HITS="$hits"
+            # Two underfilled clean rows cannot reach a representative quorum
+            # of two within the three-experiment bound. Avoid a pointless third.
+            if (( recovery && index == 2 && hits == 0 && ${#clean_rows[@]} == 0 )); then break; fi
         done
         if (( hits >= 2 )); then
             MEASURE_LEVEL_SPIKE_CONFIRMED=1
@@ -6869,24 +7032,52 @@ measure_level_with_confirmation() {
                     selected="$row"; selected_loss="$loss"
                 fi
             done
+        elif (( allow_plateau && ${#clean_rows[@]} == 0 && ${#plateau_rows[@]} >= 2 )) &&
+             plateau_spread=$(relative_spread_percent "${plateau_rates[@]}") &&
+             awk -v s="$plateau_spread" 'BEGIN {exit !(s<=6)}'; then
+            # A qualified clean reference already exists. Preserve the frozen
+            # two-level receiver-plateau algorithm, now with repeated evidence
+            # at each underfilled level. These rows are never clean references.
+            selected="${plateau_rows[0]}"; MEASURE_LEVEL_PLATEAU_CONFIRMED=1
+            measurement_sample_event "$label" THROUGHPUT_PLATEAU_REPEAT_CONFIRMED \
+                "repeated-loss-clean-plateau; spread=${plateau_spread}%; THROUGHPUT_REPRESENTATIVE=0; cannot-update-last-clean" || return 1
+        elif (( ${#clean_rows[@]} == 0 || (recovery && ${#clean_rows[@]} < 2) )); then
+            measurement_level_sample_audit "$label" "$row" "$planning_rate" "$efficiency" "$threshold" "$base_loss" 1 || return 1
+            failure_stage="${label^^}"; failure_stage="${failure_stage//[^A-Z0-9]/_}"
+            declare -F failure_set >/dev/null && failure_set "$failure_stage" peer-too-slow \
+                "loss-clean samples underfilled ${planning_rate}Mbit; no representative quorum; minimum-efficiency=${efficiency}" "" 2
+            log WARN "$label: peer-limited/slow/inconclusive；未建立可靠吞吐参考，不判定 PATH_DIRTY 或 policer"
+            return 2
         else
+            if (( recovery && ${#clean_rows[@]} >= 2 )); then
+                recovery_spread=$(relative_spread_percent "${clean_rates[@]}")
+                if awk -v s="$recovery_spread" 'BEGIN {exit !(s>6)}'; then
+                    measurement_sample_event "$label" THROUGHPUT_RECOVERY_UNSTABLE "qualified-sample-spread=${recovery_spread}%; maximum=6%; no-reference-selected" || return 1
+                    failure_stage="${label^^}"; failure_stage="${failure_stage//[^A-Z0-9]/_}"
+                    declare -F failure_set >/dev/null && failure_set "$failure_stage" measurement-unstable \
+                        "qualified recovery samples spread=${recovery_spread}% above existing 6% stability gate" "" "$IPERF_UNSTABLE_RC"
+                    log WARN "$label: 恢复样本虽然各自达到效率下限，但离散度 ${recovery_spread}% 超过 6%；inconclusive，不建立参考"
+                    return "$IPERF_UNSTABLE_RC"
+                fi
+            fi
             for row in "${clean_rows[@]}"; do
                 gp=$(cut -f1 <<< "$row")
                 if [[ -z "$selected" ]] || awk -v a="$gp" -v b="$(cut -f1 <<< "$selected")" 'BEGIN {exit !(a>b)}'; then selected="$row"; fi
             done
-            [[ -n "$selected" ]] || selected="${rows[0]}"
         fi
-    else
-        clean_rows+=("$row"); selected="$row"
     fi
     MEASURE_LEVEL_ROW="$selected"
-    # shellcheck disable=SC2034 # Exposed to diagnostics and regression tests.
-    MEASURE_LEVEL_SPIKE_HITS="$hits"
+    measurement_throughput_representative "$selected" "$planning_rate" "$efficiency" && MEASURE_LEVEL_REPRESENTATIVE=1
     if (( MEASURE_LEVEL_SPIKE_CONFIRMED )); then
         log WARN "$label: 重传跳变经 3 次实验确认（${hits}/3）"
     elif (( hits > 0 )); then
         log INFO "$label: 单次重传尖峰未复现（${hits}/3），按瞬时公共对端竞争处理"
+    elif (( MEASURE_LEVEL_PLATEAU_CONFIRMED )); then
+        log INFO "$label: 同档重复确认稳定吞吐平台；不作为 clean reference，仍需原有双档 stall 与候选确认"
+    elif (( recovery )); then
+        log INFO "$label: 同档复验取得 2 个有代表性的干净样本，恢复吞吐参考资格"
     fi
+    return 0
 }
 
 minimum_efficiency_ratio() {
@@ -6942,6 +7133,162 @@ estimate_control_saturation_bytes() {
         mbit_seconds=cr*cd*control_samples + cap*sd*saturation_samples; if(aggregate) mbit_seconds+=cap*sd*saturation_samples
         printf "%.0f", mbit_seconds*1000000/8*1.08
     }'
+}
+
+# Remaining-work model, evaluated in a subshell so comparing quick/standard
+# never changes the selected profile. It predicts an ordinary policer search
+# from delivered capacity, not from the initial 5000M safety ceiling.
+measurement_remaining_plan() (
+    local profile="$1" capacity="$2" sender="$3" clean_loss="$4" low="$5" high="$6" step="$7" base="$8"
+    local no_scan="$9" final_verify="${10}" control_sender="${11}" control_rate="${12}" margin="${13:-3}"
+    local control saturation coarse confirm verify attempts="${BBRV3_IPERF_ATTEMPTS:-3}" contamination="${BBRV3_CONTAMINATION_RETRIES:-1}"
+    measurement_profile_configure "$profile" || return 1
+    IFS=$'\t' read -r control saturation coarse confirm <<< "$(measurement_profile_stage_durations "$base")"
+    verify=$(measurement_profile_verify_duration 6)
+    is_uint "$attempts" && (( attempts >= 1 && attempts <= 5 )) || attempts=3
+    is_uint "$contamination" && (( contamination <= 3 )) || contamination=1
+    awk -v profile="$profile" -v cap="$capacity" -v sender="$sender" -v loss="$clean_loss" \
+        -v low="$low" -v high="$high" -v step="$step" -v coarse="$coarse" -v confirm="$confirm" -v verify="$verify" \
+        -v no_scan="$no_scan" -v final_verify="$final_verify" -v cs="$control_sender" -v cr="$control_rate" -v margin="$margin" \
+        -v candidates="$MEASURE_CANDIDATE_SAMPLES" -v candidate_max="$MEASURE_CANDIDATE_MAX_SAMPLES" \
+        -v verifies="$MEASURE_VERIFY_SAMPLES" -v verify_max="$MEASURE_VERIFY_MAX_SAMPLES" \
+        -v attempts="$attempts" -v contamination="$contamination" '
+        function min(a,b) {return a<b?a:b}
+        function max(a,b) {return a>b?a:b}
+        function ceil(a) {return int(a)+(a>int(a))}
+        function txrate(r) {return min(r,max(sender,cap))*eff}
+        BEGIN {
+            eff=(cr>0 && cs>0)?cs/cr:1; if(eff<0.75)eff=0.75; if(eff>1)eff=1
+            if(loss<0)loss=0; if(loss>1)loss=1
+            factor=1.12+loss/100
+            count=0; seconds=0; mbit_seconds=0; upper_count=0; upper_seconds=0
+            retry=0; candidate=cap
+            if(!no_scan) {
+                if(step<=0 || high<=low || cap<=0) exit 1
+                levels=int((high-low)/step)+1
+                # Central scenario: break around 108% of delivered saturation;
+                # its position is uncertain, and the separate bound visits all
+                # levels, downward controls, refinement and all permitted retries.
+                expected_levels=ceil((min(high,cap*1.08)-low)/step)+1
+                expected_levels=max(1,min(levels,expected_levels))
+                break_rate=low+(expected_levels-1)*step
+                fine=min(4,max(0,step-1))
+                fine_max=7 # Descending first-point controls can widen the refine gap beyond high-low.
+                for(i=0;i<expected_levels;i++) mbit_seconds+=txrate(low+i*step)*coarse
+                seconds=expected_levels*coarse
+                count=expected_levels
+                # Two spike rechecks at the coarse break, and at the fine
+                # break when refinement has space. No confirmation is skipped.
+                rechecks=2+(fine>0?2:0)
+                mbit_seconds+=txrate(break_rate)*(fine*coarse+rechecks*confirm)
+                seconds+=fine*coarse+rechecks*confirm; count+=fine+rechecks
+                candidate=max(1,int(max(low,break_rate-step)*(100-margin)/100))
+                mbit_seconds+=txrate(candidate)*candidates*confirm
+                seconds+=candidates*confirm; count+=candidates
+                # At most 3 experiments per visited level, plus at most 3
+                # descending controls. Underfill and loss share that bound.
+                upper_count=(levels+fine_max+3)*3+candidate_max
+                upper_seconds=(levels+fine_max+3)*(coarse+2*confirm)+candidate_max*confirm
+                retry=2
+            }
+            if(final_verify) {
+                mbit_seconds+=txrate(candidate)*verifies*2*verify
+                seconds+=verifies*2*verify; count+=verifies*2
+                upper_count+=verify_max*2; upper_seconds+=verify_max*2*verify
+                if(no_scan) retry=1
+            }
+            mbit_seconds+=txrate(candidate)*retry*confirm
+            seconds+=retry*confirm; count+=retry
+            expected=mbit_seconds*1000000/8*factor+count*1048576
+            # All transport and contamination retries may consume a complete
+            # session. Use the maximum reservation overhead (12%+50%+25%).
+            multiplier=attempts*(1+contamination)
+            upper_count*=multiplier; upper_seconds*=multiplier
+            upper=max(high,max(sender,cap))*1000000/8*upper_seconds*1.87+upper_count*1048576
+            remaining_duration=seconds+count*2+(no_scan?0:7)+(final_verify?7:0)
+            printf "SELECTED_PROFILE\t%s\nEXPECTED_REMAINING_TX\t%.0f\nCONSERVATIVE_REMAINING_UPPER_BOUND\t%.0f\n",profile,expected,upper
+            printf "EXPECTED_REMAINING_SAMPLES\t%d\nREMAINING_SAMPLE_UPPER_BOUND\t%d\n",count,upper_count
+            printf "EXPECTED_REMAINING_DURATION_SECONDS\t%.0f\nRETRY_ALLOWANCE\t%d\nRETRY_ALLOWANCE_BYTES\t%.0f\n",remaining_duration,retry,txrate(candidate)*retry*confirm*1000000/8*factor
+            printf "RETRY_UPPER_MULTIPLIER\t%d\nBUDGET_MODEL\tdelivered-capacity-v1\n",multiplier
+            print "TRAFFIC_UPPER_BOUND_SEMANTICS\tremaining-at-post-control-saturation-including-retries"
+            print "BUDGET_ESTIMATE_UNCERTAINTY\thigh: break location, public peer contention and full-session retries are unknown; expected scenario assumes break near 108% of delivered capacity"
+        }'
+)
+
+measurement_budget_interactive() { [[ -t 0 ]]; }
+
+measurement_budget_feasibility_gate() {
+    local plan quick_plan key value expected upper samples duration retry remaining count=0 expected_duration
+    local choice new_gib new_limit file="${MEASURE_RUN_DIR}/budget-plan.tsv"
+    while true; do
+        measurement_usage_update
+        remaining=$((MEASURE_MAX_TX_BYTES-TEST_TX_BYTES_USED)); (( remaining < 0 )) && remaining=0
+        plan=$(measurement_remaining_plan "$MEASUREMENT_PROFILE" "$@") || return 1
+        expected=0; upper=0; samples=0; duration=0; retry=0
+        while IFS=$'\t' read -r key value; do
+            case "$key" in
+                EXPECTED_REMAINING_TX) expected="$value" ;;
+                CONSERVATIVE_REMAINING_UPPER_BOUND) upper="$value" ;;
+                EXPECTED_REMAINING_SAMPLES) samples="$value" ;;
+                EXPECTED_REMAINING_DURATION_SECONDS) duration="$value" ;;
+                RETRY_ALLOWANCE) retry="$value" ;;
+            esac
+        done <<< "$plan"
+        expected_duration=$((TEST_DURATION_USED+duration))
+        count=0
+        [[ ! -f "$MEASURE_RESULT_FILE" ]] || count=$(awk 'END {print (NR>0?NR-1:0)}' "$MEASURE_RESULT_FILE")
+        {
+            printf '%s\n' "$plan"
+            printf 'BUDGET_PLAN_STAGE\tpost-control-saturation\nHARD_BUDGET_BYTES\t%s\nUSED_TX_BYTES\t%s\nREMAINING_TX_BYTES\t%s\nEXPECTED_DURATION\t%s\n' \
+                "$MEASURE_MAX_TX_BYTES" "$TEST_TX_BYTES_USED" "$remaining" "$expected_duration"
+            printf 'PLANNED_SAMPLE_UPPER_BOUND\t%s\n' "$((count+$(awk -F'\t' '$1=="REMAINING_SAMPLE_UPPER_BOUND" {print $2}' <<< "$plan")))"
+        } > "$file" || return 1
+        log INFO "动态预算评估（${MEASUREMENT_PROFILE}；已完成 SATURATION/PATH_CONTROL）：hard budget $(human_bytes "$MEASURE_MAX_TX_BYTES")，已用 $(human_bytes "$TEST_TX_BYTES_USED")，剩余 $(human_bytes "$remaining")"
+        log INFO "Expected traffic：剩余约 $(human_bytes "$expected") / ${samples} 个样本；含 ${retry} 个完整样本的 retry allowance；预计总耗时约 ${expected_duration}s"
+        log INFO "Conservative upper bound：剩余 $(human_bytes "$upper")（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行"
+        log INFO "估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间"
+        # Sourced callers without an operation ledger receive an advisory.
+        # Every real measure_begin binds/configures that ledger before here.
+        (( MEASURE_BUDGET_CONFIGURED == 1 )) || return 0
+        if (( expected < remaining && expected_duration < MEASURE_MAX_DURATION_SECONDS )); then return 0; fi
+        log WARN "当前 profile 预计无法在剩余硬预算内完成；扫描尚未开始，未验证候选不会复用"
+        if [[ "$MEASUREMENT_PROFILE" != quick ]]; then
+            quick_plan=$(measurement_remaining_plan quick "$@") || return 1
+            log INFO "quick 对比：预计剩余 $(human_bytes "$(awk -F'\t' '$1=="EXPECTED_REMAINING_TX" {print $2}' <<< "$quick_plan")")；只有明确选择才会修改 profile，仍须完成重传确认和 final verify"
+        fi
+        if measurement_budget_interactive; then
+            printf '\n预算选择：q) 明确改用 quick  b) 重新指定更高 --max-test-gib  c) 取消并安全 rollback\n' >&2
+            read -r -p '选择 [c]: ' choice || choice=c
+            case "$choice" in
+                q|quick)
+                    if [[ "$MEASUREMENT_PROFILE" != quick ]]; then
+                        measurement_profile_configure quick || return 1
+                        log INFO "用户明确选择 quick；保留已有样本与同一 global budget ledger，只调整后续阶段"
+                    fi
+                    continue ;;
+                b|budget)
+                    read -r -p '新的 hard TX budget（GiB，必须高于当前值）: ' new_gib || new_gib=""
+                    if is_decimal "$new_gib" && awk -v g="$new_gib" 'BEGIN {exit !(g>0 && g<=1024)}'; then
+                        new_limit=$(awk -v g="$new_gib" 'BEGIN {printf "%.0f",g*1073741824}')
+                        if (( new_limit > MEASURE_MAX_TX_BYTES )); then
+                            MEASURE_MAX_TX_BYTES="$new_limit"
+                            log INFO "用户明确提高 hard TX budget 至 $(human_bytes "$new_limit")；已用流量和预算起点保持不变"
+                            continue
+                        fi
+                    fi
+                    log WARN "预算值无效；hard budget 未改变"
+                    continue ;;
+                *) : ;;
+            esac
+        fi
+        failure_set BUDGET_FEASIBILITY budget-exceeded \
+            "expected-remaining=${expected}; remaining=${remaining}; expected-duration=${expected_duration}; profile=${MEASUREMENT_PROFILE}; no next scan sample spawned" \
+            "重新执行并明确选择 --measurement-profile quick 或提高 --max-test-gib；时间不足时同时提高 --max-duration；不会复用未验证候选。" "$MEASURE_BUDGET_RC" \
+            "$(budget_failure_context feasibility "$MEASURE_MAX_TX_BYTES" "$TEST_TX_BYTES_USED" "$expected" \
+                "$MEASURE_MAX_DURATION_SECONDS" "$TEST_DURATION_USED" "$duration" "$MEASUREMENT_PROFILE")"
+        log ERR "预算可完成性不足，安全结束并 rollback。重新执行时明确指定 --measurement-profile quick 或更高 --max-test-gib；需要时增加 --max-duration"
+        return "$MEASURE_BUDGET_RC"
+    done
 }
 
 new_measure_run() {
@@ -7073,9 +7420,10 @@ measure_sweep() {
     local path_control_quality=unknown saturation_sender="" saturation_receiver="" saturation_state=unstable
     local saturation_fallback=0 capacity_mode=single capacity_receiver="" policer_suspected=0 measurement_state=MEASUREMENT_UNSTABLE
     local clean_reference_rate="" clean_reference_receiver="" clean_reference_loss="" first_scan_lossy=0 lower_attempts=0
-    local last_ok="" last_ok_gp="" broke_at="" fine_start fine_step recommend="" candidate="" confirm_row confirm_gp="" confirm_loss=""
-    local min_efficiency="0.90" confirmed=0 reject_reason="" estimated tests rc=0 no_knee=0 above_cap=0
+    local last_ok="" last_ok_gp="" broke_at="" suspected_break="" confirmed_knee="" fine_start fine_step recommend="" candidate="" confirm_row confirm_gp="" confirm_loss=""
+    local min_efficiency="0.75" confirmed=0 reject_reason="" estimated tests rc=0 no_knee=0 above_cap=0
     local control_duration saturation_duration coarse_duration confirm_duration target_points scan_width saturation_planning_rate
+    local profile_base_duration="$duration" plan_key plan_value plan_profile
     local auto_cap=0 nominal_was_auto=0 observed_cap
     local legacy_baseline_quality=unknown scan_decision=inconclusive no_knee_reason=""
     local confidence_row confidence confidence_score confidence_grade confidence_reasons preflight_capacity=0 restore_rc=0
@@ -7282,25 +7630,26 @@ measure_sweep() {
     fi
 
     if (( rc == 0 )); then
-        if (( no_knee )); then
-            tests=$((MEASURE_CONTROL_MAX_SAMPLES + MEASURE_SATURATION_MAX_SAMPLES)); [[ "$capacity_mode" == single+aggregate ]] && tests=$((tests + MEASURE_SATURATION_MAX_SAMPLES))
-            estimated=$(estimate_control_saturation_bytes "$path_control_rate" "$control_duration" "$capacity_receiver" \
-                "$saturation_duration" "$([[ "$capacity_mode" == single+aggregate ]] && echo 1 || echo 0)")
-        else
-            tests=$((MEASURE_CONTROL_MAX_SAMPLES + MEASURE_SATURATION_MAX_SAMPLES + MEASURE_CANDIDATE_MAX_SAMPLES + MEASURE_VERIFY_MAX_SAMPLES*2 + 20)); [[ "$capacity_mode" == single+aggregate ]] && tests=$((tests + MEASURE_SATURATION_MAX_SAMPLES))
-            estimated=$(estimate_measurement_plan_bytes "$path_control_rate" "$control_duration" "$capacity_receiver" \
-                "$saturation_duration" "$high" "$coarse_duration" "$confirm_duration" "$([[ "$capacity_mode" == single+aggregate ]] && echo 1 || echo 0)")
+        plan_profile="$MEASUREMENT_PROFILE"
+        measurement_budget_feasibility_gate "$capacity_receiver" "$saturation_sender" "$path_control_loss" "$low" "$high" "$step" \
+            "$profile_base_duration" "$((no_knee || above_cap))" "$([[ "$result_mode" == auto ]] && printf 1 || printf 0)" \
+            "$path_control_sender" "$path_control_rate" "$margin" || rc=$?
+        if [[ "$plan_profile" != "$MEASUREMENT_PROFILE" ]]; then
+            IFS=$'\t' read -r _ _ coarse_duration confirm_duration <<< "$(measurement_profile_stage_durations "$profile_base_duration")"
         fi
-        log INFO "计划最多采集 $tests 个样本、产生约 $(human_bytes "$estimated") 出站流量（上界估算，不含失败重试）"
-
-        if (( no_knee || above_cap )); then
+        if [[ -f "$dir/budget-plan.tsv" ]]; then
+            tests=$(awk -F'\t' '$1=="PLANNED_SAMPLE_UPPER_BOUND" {print $2}' "$dir/budget-plan.tsv")
+            estimated=$(awk -F'\t' '$1=="CONSERVATIVE_REMAINING_UPPER_BOUND" {print $2}' "$dir/budget-plan.tsv")
+        fi
+        if (( no_knee || above_cap || rc != 0 )); then
             :
         else
             measurement_cooldown PRE_SCAN "$capacity_receiver" "$saturation_duration" || rc=$?
             if (( rc == 0 )); then apply_shaping "$iface" "$low" || rc=$?; fi
             if (( rc == 0 )); then
                 measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
-                    "rate-${low}" "$threshold" "$path_control_loss" "$low" || rc=$?
+                    "rate-${low}" "$threshold" "$path_control_loss" "$low" "$min_efficiency" || rc=$?
+                (( MEASURE_LEVEL_SUSPECTED_BREAK )) && suspected_break="$low"
                 base_row="$MEASURE_LEVEL_ROW"
                 base_gp=$(cut -f1 <<< "${base_row:-$'0\t0\t0\t0'}")
                 base_loss=$(cut -f4 <<< "${base_row:-$'0\t0\t0\t0'}")
@@ -7314,7 +7663,7 @@ measure_sweep() {
                     measurement_cooldown BETWEEN_LEVEL "$lower_rate" "$coarse_duration" || { rc=$?; break; }
                     apply_shaping "$iface" "$lower_rate" || { rc=$?; break; }
                     measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
-                        "lower-control-${lower_rate}" "$threshold" "$path_control_loss" "$lower_rate" || { rc=$?; break; }
+                        "lower-control-${lower_rate}" "$threshold" "$path_control_loss" "$lower_rate" "$min_efficiency" || { rc=$?; break; }
                     if (( ! MEASURE_LEVEL_SPIKE_CONFIRMED )); then
                         base_row="$MEASURE_LEVEL_ROW"; base_gp=$(cut -f1 <<< "$base_row"); base_loss=$(cut -f4 <<< "$base_row")
                         last_ok="$lower_rate"; last_ok_gp="$base_gp"; broke_at="$known_broke"
@@ -7342,7 +7691,10 @@ measure_sweep() {
                     measurement_cooldown BETWEEN_LEVEL "$rate" "$coarse_duration" || { rc=$?; break; }
                     apply_shaping "$iface" "$rate" || { rc=$?; break; }
                     measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
-                        "rate-${rate}" "$threshold" "$clean_reference_loss" "$rate" || { rc=$?; break; }
+                        "rate-${rate}" "$threshold" "$clean_reference_loss" "$rate" "$min_efficiency" "$policer_suspected" || {
+                        rc=$?; (( MEASURE_LEVEL_SUSPECTED_BREAK )) && suspected_break="$rate"; break;
+                    }
+                    (( MEASURE_LEVEL_SUSPECTED_BREAK )) && suspected_break="$rate"
                     row="$MEASURE_LEVEL_ROW"
                     gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
                     printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%%\n' "$rate" "$gp" "$loss"
@@ -7351,6 +7703,11 @@ measure_sweep() {
                         ((stall_count+=1)); [[ -n "$stalled_rate" ]] || stalled_rate="$rate"
                         if (( stall_count >= 2 )); then broke_at="$stalled_rate"; break; fi
                         continue
+                    fi
+                    if (( MEASURE_LEVEL_PLATEAU_CONFIRMED )); then
+                        rc=2; reject_reason=underfilled-without-stall-evidence
+                        failure_set MEASUREMENT peer-too-slow "underfilled level ${rate}Mbit cannot update last clean" "" 2
+                        break
                     fi
                     stall_count=0; stalled_rate=""; last_ok="$rate"; last_ok_gp="$gp"; previous_gp="$gp"; previous_rate="$rate"
                 done
@@ -7363,7 +7720,10 @@ measure_sweep() {
                     measurement_cooldown BETWEEN_LEVEL "$rate" "$coarse_duration" || { rc=$?; break; }
                     apply_shaping "$iface" "$rate" || { rc=$?; break; }
                     measure_level_with_confirmation "$peer" "$port" "$coarse_duration" "$confirm_duration" "$parallel" \
-                        "refine-${rate}" "$threshold" "$clean_reference_loss" "$rate" || { rc=$?; break; }
+                        "refine-${rate}" "$threshold" "$clean_reference_loss" "$rate" "$min_efficiency" "$policer_suspected" || {
+                        rc=$?; (( MEASURE_LEVEL_SUSPECTED_BREAK )) && suspected_break="$rate"; break;
+                    }
+                    (( MEASURE_LEVEL_SUSPECTED_BREAK )) && suspected_break="$rate"
                     row="$MEASURE_LEVEL_ROW"
                     gp=$(cut -f1 <<< "$row"); loss=$(cut -f4 <<< "$row")
                     printf '  %6s Mbit -> %8s Mbit/s, retrans-est %s%% (refine)\n' "$rate" "$gp" "$loss"
@@ -7372,6 +7732,11 @@ measure_sweep() {
                         ((stall_count+=1)); [[ -n "$stalled_rate" ]] || stalled_rate="$rate"
                         if (( stall_count >= 2 )); then broke_at="$stalled_rate"; break; fi
                         continue
+                    fi
+                    if (( MEASURE_LEVEL_PLATEAU_CONFIRMED )); then
+                        rc=2; reject_reason=underfilled-without-stall-evidence
+                        failure_set MEASUREMENT peer-too-slow "underfilled level ${rate}Mbit cannot update last clean" "" 2
+                        break
                     fi
                     stall_count=0; stalled_rate=""; last_ok="$rate"; last_ok_gp="$gp"; previous_gp="$gp"; previous_rate="$rate"
                 done
@@ -7387,7 +7752,7 @@ measure_sweep() {
                     if (( rc == 0 )) && measurement_sample_acceptable "$confirm_gp" "$confirm_loss" "$candidate" "$min_efficiency" "$threshold" "$base_loss"; then
                         recommend="$candidate"; confirmed=1
                     elif (( rc == 0 )); then
-                        reject_reason="confirmation-failed"
+                        reject_reason="confirmation-failed"; rc=2
                         declare -F failure_set >/dev/null && failure_set CANDIDATE_CONFIRM candidate-confirm-failed "candidate ${candidate}Mbit did not meet throughput/retrans gates" "" 2
                         log WARN "候选档 ${candidate} Mbit 复测未通过吞吐/重传门槛，不生成推荐值"
                     fi
@@ -7406,24 +7771,48 @@ measure_sweep() {
     fi
 
     if (( rc == 0 )) && [[ -n "${recommend:-}" ]]; then scan_decision=recommend; measurement_state=CLEAN_POLICER_FOUND; fi
-    if (( rc == 0 )) && [[ "$reject_reason" == confirmation-failed ]]; then scan_decision=inconclusive-confirmation; fi
+    if [[ "$reject_reason" == confirmation-failed ]]; then scan_decision=inconclusive-confirmation; measurement_state=MEASUREMENT_UNSTABLE; fi
     if (( rc == MEASURE_BUDGET_RC )); then
         measurement_state=MEASUREMENT_BUDGET_EXCEEDED; scan_decision=budget-exceeded
         reject_reason=budget-exceeded; recommend=""; confirmed=0; no_knee=0
     fi
 
-    if (( rc == 0 || rc == MEASURE_PATH_QUALITY_RC || rc == MEASURE_BUDGET_RC || rc == MEASUREMENT_PREFLIGHT_RC || rc == 2 )); then
+    if (( rc != 0 )); then
+        if declare -F failure_pending_load >/dev/null; then
+            failure_pending_load "$dir/.failure-pending.tsv" 2>/dev/null || failure_from_rc "$rc" MEASUREMENT
+        fi
+        if [[ -z "$reject_reason" ]]; then reject_reason="${FAILURE_REASON:-incomplete-measurement}"; fi
+        if [[ "$scan_decision" != budget-exceeded && "$scan_decision" != path-dirty ]]; then
+            measurement_state=MEASUREMENT_UNSTABLE
+            [[ "$scan_decision" == inconclusive-* ]] || scan_decision="inconclusive-${reject_reason}"
+        fi
+        recommend=""; confirmed=0; no_knee=0
+    elif (( confirmed )) && [[ -n "$broke_at" && -n "$last_ok" ]]; then
+        confirmed_knee="$last_ok"
+    fi
+
+    if [[ -d "$dir" ]]; then
         printf 'TYPE\tsweep\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nHARDWARE_CLASS\t%s\nLINK_MBIT\t%s\nRX_QUEUES\t%s\nTX_QUEUES\t%s\nSCAN_CAP_MBIT\t%s\nSAMPLE_DURATION_SECONDS\t%s\nUNSHAPED_MBIT\t%s\nBASE_RETRANS_RATIO_EST_PERCENT\t%s\nCLEAN_BASE_RETRANS_RATIO_EST_PERCENT\t%s\nBASELINE_QUALITY\t%s\nSCAN_DECISION\t%s\nLOW\t%s\nHIGH\t%s\nSTEP\t%s\nMIN_EFFICIENCY_RATIO\t%s\nLAST_OK\t%s\nBROKE_AT\t%s\nCANDIDATE\t%s\nCONFIRM_MBIT\t%s\nCONFIRM_RETRANS_RATIO_EST_PERCENT\t%s\nCONFIRMED\t%s\nREJECT_REASON\t%s\nRECOMMEND\t%s\nMARGIN_PERCENT\t%s\nNO_KNEE\t%s\nNO_KNEE_REASON\t%s\nABOVE_CAP\t%s\n' \
             "$peer" "$port" "$iface" "$HARDWARE_CLASS" "$HARDWARE_LINK_MBIT" "$HARDWARE_RX_QUEUES" "$HARDWARE_TX_QUEUES" "$cap" "$duration" \
             "${saturation_receiver:-}" "${saturation_loss:-}" "${clean_reference_loss:-${path_control_loss:-0}}" "$legacy_baseline_quality" "$scan_decision" "$low" "$high" "$step" "$min_efficiency" "${last_ok:-}" "${broke_at:-}" "${candidate:-}" "${confirm_gp:-}" "${confirm_loss:-}" "$confirmed" "${reject_reason:-}" "${recommend:-}" "$margin" "$no_knee" "$no_knee_reason" "$above_cap" > "$dir/summary.tsv"
         printf 'MEASUREMENT_STATE\t%s\nPATH_CONTROL_RATE_MBIT\t%s\nPATH_CONTROL_SENDER_MBIT\t%s\nPATH_CONTROL_RECEIVER_MBIT\t%s\nPATH_CONTROL_RETRANS_EST_PERCENT\t%s\nPATH_CONTROL_QUALITY\t%s\nSATURATION_SENDER_MBIT\t%s\nSATURATION_RECEIVER_MBIT\t%s\nSATURATION_RETRANS_EST_PERCENT\t%s\nSATURATION_STATE\t%s\nCAPACITY_DISCOVERY_MODE\t%s\nCAPACITY_RECEIVER_MBIT\t%s\nPOLICER_SUSPECTED\t%s\nSCAN_LOW_MBIT\t%s\nSCAN_HIGH_MBIT\t%s\nSCAN_STEP_MBIT\t%s\nCLEAN_REFERENCE_RATE_MBIT\t%s\nCLEAN_REFERENCE_RECEIVER_MBIT\t%s\nCLEAN_REFERENCE_RETRANS_EST_PERCENT\t%s\nKNEE_MBIT\t%s\nUNSHAPED_SEMANTICS\treceiver-delivered-saturation-probe\n' \
             "$measurement_state" "$path_control_rate" "${path_control_sender:-}" "${path_control_receiver:-}" "${path_control_loss:-}" "$path_control_quality" \
             "${saturation_sender:-}" "${saturation_receiver:-}" "${saturation_loss:-}" "$saturation_state" "$capacity_mode" "${capacity_receiver:-}" \
-            "$policer_suspected" "$low" "$high" "$step" "${clean_reference_rate:-$path_control_rate}" \
-            "${clean_reference_receiver:-$path_control_receiver}" "${clean_reference_loss:-$path_control_loss}" "${last_ok:-}" >> "$dir/summary.tsv"
+            "$policer_suspected" "$low" "$high" "$step" "${clean_reference_rate:-}" \
+            "${clean_reference_receiver:-}" "${clean_reference_loss:-$path_control_loss}" "$confirmed_knee" >> "$dir/summary.tsv"
         printf 'CONTROL_DURATION_SECONDS\t%s\nSATURATION_DURATION_SECONDS\t%s\nCOARSE_DURATION_SECONDS\t%s\nCONFIRM_DURATION_SECONDS\t%s\nPLANNED_SAMPLE_UPPER_BOUND\t%s\nESTIMATED_TRAFFIC_BYTES_UPPER_BOUND\t%s\nMEASUREMENT_PROFILE\t%s\n' \
             "$control_duration" "$saturation_duration" "$coarse_duration" "$confirm_duration" "${tests:-0}" "${estimated:-0}" "$MEASUREMENT_PROFILE" >> "$dir/summary.tsv"
         printf 'BASELINE_QUALITY_SEMANTICS\tpath-control-compatibility-alias\n' >> "$dir/summary.tsv"
+        if [[ -f "$dir/budget-plan.tsv" ]]; then
+            while IFS=$'\t' read -r plan_key plan_value; do
+                [[ "$plan_key" != PLANNED_SAMPLE_UPPER_BOUND ]] || continue
+                printf '%s\t%s\n' "$plan_key" "$plan_value" >> "$dir/summary.tsv"
+            done < "$dir/budget-plan.tsv"
+        fi
+        printf 'LAST_CLEAN\t%s\nSUSPECTED_BREAK\t%s\nCONFIRMED_BREAK\t%s\nCONFIRMED_KNEE\t%s\nKNEE_SEMANTICS\tconfirmed-knee-only\nCLEAN_REFERENCE_THROUGHPUT_REPRESENTATIVE\t%s\nDECISION_SCOPE\tsweep\n' \
+            "$last_ok" "$suspected_break" "$broke_at" "$confirmed_knee" "$([[ -n "$clean_reference_rate" ]] && printf 1 || printf 0)" >> "$dir/summary.tsv"
+        printf 'LAST_LEVEL_SPIKE_HITS\t%s\nLAST_LEVEL_THROUGHPUT_REPRESENTATIVE\t%s\nSPIKE_CONFIRMATION_RULE\t2-of-3\n' \
+            "$MEASURE_LEVEL_SPIKE_HITS" "$MEASURE_LEVEL_REPRESENTATIVE" >> "$dir/summary.tsv"
         confidence_row="${confirm_row:-${saturation_row:-}}"
         if [[ -n "$confidence_row" ]]; then
             confidence=$(measurement_confidence "$(cut -f13 <<< "$confidence_row")" "$(cut -f12 <<< "$confidence_row")" "$(cut -f7 <<< "$confidence_row")" "$(cut -f11 <<< "$confidence_row")" 0 "$PATH_PROFILE_SCORE" "$(cut -f19 <<< "$confidence_row")")
@@ -7431,15 +7820,11 @@ measure_sweep() {
         else
             sample_confidence_score=0; sample_confidence_grade=low; sample_confidence_reasons=no-usable-sample
         fi
-        if [[ "$scan_decision" == inconclusive-* || "$path_control_quality" != clean ]]; then
-            decision_confidence_score=0; decision_confidence_grade=low
-            decision_confidence_reasons="${reject_reason:-measurement-unstable}"
-            confidence_score="$decision_confidence_score"; confidence_grade="$decision_confidence_grade"; confidence_reasons="$decision_confidence_reasons"
-        else
-            decision_confidence_score="$sample_confidence_score"; decision_confidence_grade="$sample_confidence_grade"
-            decision_confidence_reasons="$sample_confidence_reasons"
-            confidence_score="$sample_confidence_score"; confidence_grade="$sample_confidence_grade"; confidence_reasons="$sample_confidence_reasons"
-        fi
+        confidence=$(measurement_decision_confidence "$sample_confidence_score" "$sample_confidence_grade" "$sample_confidence_reasons" \
+            "$rc" "$scan_decision" "$path_control_quality" "$confirmed" "$no_knee" "$broke_at" "$reject_reason")
+        IFS=$'\t' read -r decision_confidence_score decision_confidence_grade decision_confidence_reasons <<< "$confidence"
+        confidence_score="$decision_confidence_score"; confidence_grade="$decision_confidence_grade"; confidence_reasons="$decision_confidence_reasons"
+        printf 'DECISION_STATUS\t%s\n' "$([[ "$scan_decision" == recommend || "$scan_decision" == no-knee-clean ]] && (( rc == 0 )) && printf complete || printf inconclusive)" >> "$dir/summary.tsv"
         printf 'IDLE_RTT_MS\t%s\nUNSHAPED_RETRANS_PER_GIB\t%s\nUNSHAPED_LOADED_RTT_P95_MS\t%s\nUNSHAPED_BUFFERBLOAT_P95_MS\t%s\nUNSHAPED_BACKGROUND_TX_PERCENT_MAX\t%s\nUNSHAPED_CPU_BUSY_PERCENT_MAX\t%s\nUNSHAPED_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_RETRANS_PER_GIB\t%s\nCONFIRM_LOADED_RTT_P95_MS\t%s\nCONFIRM_BUFFERBLOAT_P95_MS\t%s\nCONFIRM_BACKGROUND_TX_PERCENT_MAX\t%s\nCONFIRM_CPU_BUSY_PERCENT_MAX\t%s\nCONFIRM_CPU_STEAL_PERCENT_MAX\t%s\nCONFIRM_GOODPUT_SPREAD_PERCENT\t%s\nCONFIRM_SAMPLE_COUNT\t%s\nSAMPLE_CONFIDENCE_SCORE\t%s\nSAMPLE_CONFIDENCE_GRADE\t%s\nSAMPLE_CONFIDENCE_REASONS\t%s\nDECISION_CONFIDENCE_SCORE\t%s\nDECISION_CONFIDENCE_GRADE\t%s\nDECISION_CONFIDENCE_REASONS\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\n' \
             "$MEASURE_IDLE_RTT_MS" "$(cut -f5 <<< "${saturation_row:-}")" "$(cut -f7 <<< "${saturation_row:-}")" "$(cut -f14 <<< "${saturation_row:-}")" \
             "$(cut -f8 <<< "${saturation_row:-}")" "$(cut -f9 <<< "${saturation_row:-}")" "$(cut -f10 <<< "${saturation_row:-}")" \
@@ -7458,7 +7843,7 @@ measure_sweep() {
                 log INFO "确认业务表现后执行: ${0##*/} tc enable ${recommend} --knee ${broke_at:-0} --margin ${margin} --interface ${requested}"
             fi
         fi
-        if [[ "$scan_decision" == inconclusive-* ]]; then
+        if (( rc != 0 )) || [[ "$scan_decision" == inconclusive-* ]]; then
             log WARN "扫描结论: inconclusive（${decision_confidence_reasons}）；不会生成或持久化 measurement-derived 参数"
         else
             log INFO "扫描结论: ${scan_decision}；决策置信度 ${decision_confidence_grade} (${decision_confidence_score}/100, ${decision_confidence_reasons})"
@@ -7474,13 +7859,13 @@ measure_sweep() {
         }
         (( rc == 0 )) || failure_summary_print "$dir/summary.tsv" || true
     fi
-    if (( rc == 2 )) && [[ "$path_control_quality" == clean || "$path_control_quality" == good ]]; then
+    if (( rc == 2 )) && [[ "${FAILURE_REASON:-}" != peer-too-slow && ( "$path_control_quality" == clean || "$path_control_quality" == good ) ]]; then
         if [[ "$scan_decision" == inconclusive-policer-out-of-range ]]; then health_semantic="knee-not-located"
         else health_semantic=measurement-inconclusive
         fi
     fi
     measurement_peer_health_finalize "$peer" "$health_family" "$health_address" "$port" "$rc" "$health_rtt" \
-        "${saturation_receiver:-na}" "$path_control_quality" "$health_semantic" || log WARN "peer health 写入失败；网络事务不受影响"
+        "${saturation_receiver:-na}" "$path_control_quality" "$health_semantic" sweep || log WARN "peer health 写入失败；网络事务不受影响"
     return "$rc"
 }
 
@@ -7557,7 +7942,7 @@ measure_verify() {
     local multi_parallel
     local one_count multi_count combined_count one_spread multi_spread combined_spread combined_loaded combined_contaminated
     local confidence confidence_score confidence_grade confidence_reasons restore_rc=0 health_family health_address health_rtt preflight_capacity
-    local verify_planning_rate verify_rate_semantics
+    local verify_planning_rate verify_rate_semantics sample_confidence_score sample_confidence_grade sample_confidence_reasons
     validate_peer "$peer" "$port" || return 1
     is_uint "$duration" && (( duration >= 3 && duration <= 120 )) || { die "verify duration 超出安全范围"; return 1; }
     is_uint "$expected_rate" && (( expected_rate <= 1000000 )) || { die "verify 期望速率无效"; return 1; }
@@ -7627,11 +8012,16 @@ measure_verify() {
         if [[ "$(cut -f19 <<< "$one")" == 1 || "$(cut -f19 <<< "$multi")" == 1 ]]; then receiver_fallback=1; fi
         confidence=$(measurement_confidence "$combined_count" "$combined_spread" "$combined_loaded" "$combined_contaminated" 0 "$PATH_PROFILE_SCORE" "$receiver_fallback")
         IFS=$'\t' read -r confidence_score confidence_grade confidence_reasons <<< "$confidence"
+        sample_confidence_score="$confidence_score"; sample_confidence_grade="$confidence_grade"; sample_confidence_reasons="$confidence_reasons"
+        if (( ! accepted )); then confidence_score=0; confidence_grade=low; confidence_reasons="final-verify-failed:${reject_reason}"; fi
         printf 'TYPE\tverify\nPEER\t%s\nPORT\t%s\nINTERFACE\t%s\nEXPECTED_RATE_MBIT\t%s\nMIN_EFFICIENCY_RATIO\t%s\nIDLE_RTT_MS\t%s\nSINGLE_SENDER_MBIT\t%s\nSINGLE_RECEIVER_MBIT\t%s\nSINGLE_MBIT\t%s\nSINGLE_RETRANS_EST_PERCENT\t%s\nSINGLE_RETRANS_PER_GIB\t%s\nSINGLE_LOADED_RTT_P95_MS\t%s\nSINGLE_BUFFERBLOAT_P95_MS\t%s\nSINGLE_GOODPUT_SPREAD_PERCENT\t%s\nSINGLE_SAMPLE_COUNT\t%s\nMULTI_FLOWS\t%s\nMULTI_SENDER_MBIT\t%s\nMULTI_RECEIVER_MBIT\t%s\nMULTI_MBIT\t%s\nMULTI_RETRANS_EST_PERCENT\t%s\nMULTI_RETRANS_PER_GIB\t%s\nMULTI_LOADED_RTT_P95_MS\t%s\nMULTI_BUFFERBLOAT_P95_MS\t%s\nMULTI_GOODPUT_SPREAD_PERCENT\t%s\nMULTI_SAMPLE_COUNT\t%s\nRECEIVER_FALLBACK\t%s\nCLEAN_REFERENCE_RETRANS_EST_PERCENT\t%s\nCONFIDENCE_SCORE\t%s\nCONFIDENCE_GRADE\t%s\nCONFIDENCE_REASONS\t%s\nACCEPTED\t%s\nREJECT_REASON\t%s\n' \
             "$peer" "$port" "$iface" "$expected_rate" "$min_efficiency" "$MEASURE_IDLE_RTT_MS" \
             "$(cut -f15 <<< "$one")" "$(cut -f16 <<< "$one")" "$one_gp" "$one_loss" "$(cut -f5 <<< "$one")" "$(cut -f7 <<< "$one")" "$(cut -f14 <<< "$one")" "$one_spread" "$one_count" \
             "$multi_parallel" "$(cut -f15 <<< "$multi")" "$(cut -f16 <<< "$multi")" "$multi_gp" "$multi_loss" "$(cut -f5 <<< "$multi")" "$(cut -f7 <<< "$multi")" "$(cut -f14 <<< "$multi")" "$multi_spread" "$multi_count" \
             "$receiver_fallback" "$clean_reference_loss" "$confidence_score" "$confidence_grade" "$confidence_reasons" "$accepted" "$reject_reason" > "$dir/summary.tsv"
+        printf 'SAMPLE_CONFIDENCE_SCORE\t%s\nSAMPLE_CONFIDENCE_GRADE\t%s\nSAMPLE_CONFIDENCE_REASONS\t%s\nDECISION_CONFIDENCE_SCORE\t%s\nDECISION_CONFIDENCE_GRADE\t%s\nDECISION_CONFIDENCE_REASONS\t%s\nDECISION_STATUS\t%s\n' \
+            "$sample_confidence_score" "$sample_confidence_grade" "$sample_confidence_reasons" \
+            "$confidence_score" "$confidence_grade" "$confidence_reasons" "$([[ "$accepted" == 1 ]] && printf complete || printf inconclusive)" >> "$dir/summary.tsv"
         measure_append_locked_peer_summary "$dir/summary.tsv" || rc=$?
         if (( accepted )); then
             log OK "验证完成: 单流 ${one_gp} Mbit/s，多流(${multi_parallel}) ${multi_gp} Mbit/s"
@@ -12453,9 +12843,139 @@ FAILURE_STAGE=""
 FAILURE_REASON=""
 FAILURE_DETAIL=""
 FAILURE_SUGGESTION=""
+FAILURE_BUDGET_CONTEXT=""
+BUDGET_DIAGNOSTIC_KEYS=(
+    BUDGET_FAILURE_SUBTYPE BUDGET_LIMIT_BYTES BUDGET_USED_BYTES BUDGET_REMAINING_BYTES
+    BUDGET_REQUIRED_RESERVATION_BYTES BUDGET_LIMIT_SECONDS BUDGET_USED_SECONDS
+    BUDGET_REMAINING_SECONDS BUDGET_REQUIRED_RESERVATION_SECONDS
+    BUDGET_FEASIBILITY_REASON BUDGET_RESERVATION_SEMANTICS BUDGET_PROFILE
+)
+
+# Diagnostic snapshots only: this does not decide admission or change a ledger.
+# "reserved" means a next-stage reservation for guard failures, and the
+# expected remaining plan (not the worst-case upper bound) for feasibility.
+budget_failure_context() {
+    local origin="$1" limit="$2" used="$3" reserved="$4" time_limit="$5" elapsed="$6" reserved_time="$7" profile="$8"
+    local key remaining="" remaining_time="" subtype=unknown reason="" semantics=unknown
+    local tx_exhausted=0 time_exhausted=0 tx_blocked=0 time_blocked=0
+    for key in limit used reserved time_limit elapsed reserved_time; do
+        is_uint "${!key}" || printf -v "$key" ''
+    done
+    case "$profile" in quick|standard|strict) ;; *) profile=unknown ;; esac
+    if [[ -n "$limit" && -n "$used" ]]; then
+        remaining=$((limit-used)); (( remaining >= 0 )) || remaining=0
+        (( used < limit )) || tx_exhausted=1
+        [[ -z "$reserved" ]] || { (( used+reserved < limit )) || tx_blocked=1; }
+    fi
+    if [[ -n "$time_limit" && -n "$elapsed" ]]; then
+        remaining_time=$((time_limit-elapsed)); (( remaining_time >= 0 )) || remaining_time=0
+        (( elapsed < time_limit )) || time_exhausted=1
+        [[ -z "$reserved_time" ]] || { (( elapsed+reserved_time < time_limit )) || time_blocked=1; }
+    fi
+    if (( tx_exhausted || time_exhausted )); then
+        subtype=exhausted
+        (( ! tx_exhausted )) || reason="actual-tx-limit-reached"
+        (( ! time_exhausted )) || reason+="${reason:+,}actual-duration-limit-reached"
+    elif [[ "$origin" == feasibility ]]; then
+        subtype=feasibility-rejected
+        (( ! tx_blocked )) || reason="expected-remaining-tx-not-safe"
+        (( ! time_blocked )) || reason+="${reason:+,}expected-remaining-duration-not-safe"
+    elif [[ "$origin" == guard ]]; then
+        subtype=insufficient-reservation
+        (( ! tx_blocked )) || reason="next-tx-reservation-not-safe"
+        (( ! time_blocked )) || reason+="${reason:+,}next-duration-reservation-not-safe"
+    fi
+    case "$origin" in guard) semantics="next-stage-reservation" ;; feasibility) semantics="expected-remaining-plan" ;; esac
+    printf 'BUDGET_FAILURE_SUBTYPE\t%s\nBUDGET_LIMIT_BYTES\t%s\nBUDGET_USED_BYTES\t%s\nBUDGET_REMAINING_BYTES\t%s\nBUDGET_REQUIRED_RESERVATION_BYTES\t%s\n' \
+        "$subtype" "$limit" "$used" "$remaining" "$reserved"
+    printf 'BUDGET_LIMIT_SECONDS\t%s\nBUDGET_USED_SECONDS\t%s\nBUDGET_REMAINING_SECONDS\t%s\nBUDGET_REQUIRED_RESERVATION_SECONDS\t%s\n' \
+        "$time_limit" "$elapsed" "$remaining_time" "$reserved_time"
+    printf 'BUDGET_FEASIBILITY_REASON\t%s\nBUDGET_RESERVATION_SEMANTICS\t%s\nBUDGET_PROFILE\t%s\n' \
+        "${reason:-budget-type-not-recorded}" "$semantics" "$profile"
+}
+
+budget_diagnostic_key_valid() {
+    local key
+    for key in "${BUDGET_DIAGNOSTIC_KEYS[@]}"; do [[ "$1" != "$key" ]] || return 0; done
+    return 1
+}
+
+# Read new snapshots verbatim; infer older records only from recorded evidence.
+# Never use the current shell's budget when explaining a historical operation.
+budget_failure_context_from_summary() {
+    local file="$1" subtype key stage detail origin=unknown limit used reserved="" time_limit elapsed reserved_time="" profile
+    [[ -f "$file" && ! -L "$file" ]] || return 0
+    subtype=$(summary_value "$file" BUDGET_FAILURE_SUBTYPE)
+    case "$subtype" in
+        exhausted|insufficient-reservation|feasibility-rejected|unknown)
+            for key in "${BUDGET_DIAGNOSTIC_KEYS[@]}"; do printf '%s\t%s\n' "$key" "$(summary_value "$file" "$key")"; done
+            return 0 ;;
+    esac
+    [[ "$(summary_value "$file" FAILURE_REASON)" == budget-exceeded ]] || return 0
+    stage=$(summary_value "$file" FAILURE_STAGE); detail=$(summary_value "$file" FAILURE_DETAIL)
+    limit=$(summary_value "$file" MAX_TEST_TX_BYTES); used=$(summary_value "$file" TEST_TX_BYTES_USED)
+    time_limit=$(summary_value "$file" MAX_TEST_DURATION_SECONDS); elapsed=$(summary_value "$file" TEST_DURATION_USED)
+    profile=$(summary_value "$file" MEASUREMENT_PROFILE)
+    [[ "$limit" != 0 ]] || limit=""
+    [[ "$time_limit" != 0 ]] || time_limit=""
+    if [[ "$stage" == BUDGET_FEASIBILITY ]]; then
+        origin=feasibility
+        key=$(summary_value "$file" HARD_BUDGET_BYTES); [[ -z "$key" ]] || limit="$key"
+        key=$(summary_value "$file" USED_TX_BYTES); [[ -z "$key" ]] || used="$key"
+        reserved=$(summary_value "$file" EXPECTED_REMAINING_TX)
+        reserved_time=$(summary_value "$file" EXPECTED_REMAINING_DURATION_SECONDS)
+    else
+        if [[ "$detail" =~ TX=([0-9]+)/([0-9]+) ]]; then used="${BASH_REMATCH[1]}"; limit="${BASH_REMATCH[2]}"; fi
+        if [[ "$detail" =~ duration=([0-9]+)/([0-9]+) ]]; then elapsed="${BASH_REMATCH[1]}"; time_limit="${BASH_REMATCH[2]}"; fi
+        if [[ "$detail" =~ reserved-next=([0-9]+) ]]; then reserved="${BASH_REMATCH[1]}"; origin=guard; fi
+        if [[ "$detail" =~ reserved-time-next=([0-9]+) ]]; then reserved_time="${BASH_REMATCH[1]}"; origin=guard; fi
+    fi
+    budget_failure_context "$origin" "$limit" "$used" "$reserved" "$time_limit" "$elapsed" "$reserved_time" "$profile"
+}
+
+budget_failure_summary_update() {
+    local summary="$1" context="$2" key value
+    local -a budget_pairs=()
+    [[ -n "$context" ]] || context=$(budget_failure_context_from_summary "$summary")
+    while IFS=$'\t' read -r key value; do
+        [[ -n "$key" ]] || continue
+        budget_diagnostic_key_valid "$key" || return 1
+        budget_pairs+=("$key" "$value")
+    done <<< "$context"
+    ((${#budget_pairs[@]} == 0)) || history_summary_update "$summary" "${budget_pairs[@]}"
+}
+
+budget_failure_print() {
+    local summary="$1" context key value label
+    context=$(budget_failure_context_from_summary "$summary")
+    [[ -n "$context" ]] || return 0
+    printf '\nBudget at rejection (snapshot)\n'
+    while IFS=$'\t' read -r key value; do
+        case "$key" in
+            BUDGET_FAILURE_SUBTYPE) label='Budget subtype' ;;
+            BUDGET_LIMIT_BYTES) label='TX hard limit' ;;
+            BUDGET_USED_BYTES) label='TX used' ;;
+            BUDGET_REMAINING_BYTES) label='TX remaining' ;;
+            BUDGET_REQUIRED_RESERVATION_BYTES) label='Required TX' ;;
+            BUDGET_LIMIT_SECONDS) label='Time hard limit' ;;
+            BUDGET_USED_SECONDS) label='Time used' ;;
+            BUDGET_REMAINING_SECONDS) label='Time remaining' ;;
+            BUDGET_REQUIRED_RESERVATION_SECONDS) label='Required time' ;;
+            BUDGET_PROFILE) label='Selected profile' ;;
+            BUDGET_FEASIBILITY_REASON) label='Budget cause' ;;
+            BUDGET_RESERVATION_SEMANTICS) label='Required TX means' ;;
+            *) continue ;;
+        esac
+        case "$key" in
+            *_BYTES) if is_uint "$value"; then value="$(human_bytes "$value") ($value bytes)"; else value=unknown; fi ;;
+            *_SECONDS) if is_uint "$value"; then value="${value}s"; else value=unknown; fi ;;
+        esac
+        printf '%-20s %s\n' "$label" "${value:-unknown}"
+    done <<< "$context"
+}
 
 failure_reset() {
-    FAILURE_STAGE=""; FAILURE_REASON=""; FAILURE_DETAIL=""; FAILURE_SUGGESTION=""
+    FAILURE_STAGE=""; FAILURE_REASON=""; FAILURE_DETAIL=""; FAILURE_SUGGESTION=""; FAILURE_BUDGET_CONTEXT=""
 }
 
 failure_pending_write() {
@@ -12466,12 +12986,13 @@ failure_pending_write() {
         "$FAILURE_STAGE" "$FAILURE_REASON" "$FAILURE_DETAIL" "$FAILURE_SUGGESTION" > "$temp"; then
         rm -f -- "$temp"; return 1
     fi
+    [[ -z "$FAILURE_BUDGET_CONTEXT" ]] || printf '%s\n' "$FAILURE_BUDGET_CONTEXT" >> "$temp" || { rm -f -- "$temp"; return 1; }
     chmod 0600 "$temp" || { rm -f -- "$temp"; return 1; }
     mv -f -- "$temp" "$file"
 }
 
 failure_pending_load() {
-    local file="$1" line key value stage="" reason="" detail="" suggestion=""
+    local file="$1" line key value stage="" reason="" detail="" suggestion="" budget_context=""
     local -A seen=()
     [[ -f "$file" && ! -L "$file" && "$file" == "$HISTORY_DIR/"*/.failure-pending.tsv ]] || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -12481,12 +13002,20 @@ failure_pending_load() {
         seen[$key]=1
         case "$key" in
             STAGE) stage="$value" ;; REASON) reason="$value" ;; DETAIL) detail="$value" ;; SUGGESTION) suggestion="$value" ;;
-            *) return 1 ;;
+            *)
+                budget_diagnostic_key_valid "$key" || return 1
+                case "$key" in
+                    *_BYTES|*_SECONDS) [[ -z "$value" ]] || is_uint "$value" || return 1 ;;
+                    BUDGET_FAILURE_SUBTYPE) case "$value" in exhausted|insufficient-reservation|feasibility-rejected|unknown) ;; *) return 1 ;; esac ;;
+                    *) [[ "$value" =~ ^[a-z0-9,-]+$ ]] || return 1 ;;
+                esac
+                budget_context+="$line"$'\n' ;;
         esac
     done < "$file"
     [[ "$stage" =~ ^[A-Z][A-Z0-9_]{1,47}$ ]] && failure_reason_valid "$reason" || return 1
     [[ -n "${seen[DETAIL]+x}" && -n "${seen[SUGGESTION]+x}" ]] || return 1
     FAILURE_STAGE="$stage"; FAILURE_REASON="$reason"; FAILURE_DETAIL="$detail"; FAILURE_SUGGESTION="$suggestion"
+    FAILURE_BUDGET_CONTEXT="${budget_context%$'\n'}"
 }
 
 failure_reason_valid() {
@@ -12516,7 +13045,13 @@ failure_reason_explanation() {
         cpu-busy) printf 'CPU 忙碌度过高，测速结果可能受本机限制' ;;
         high-steal) printf '虚拟机 CPU steal 过高' ;;
         measurement-unstable) printf '重复样本离散度过高' ;;
-        budget-exceeded) printf '测量流量或时间硬预算已耗尽' ;;
+        budget-exceeded)
+            case "${2:-unknown}" in
+                exhausted) printf '测量 TX 或时间硬预算已耗尽' ;;
+                insufficient-reservation) printf '剩余 TX 或时间预算不足以安全覆盖下一阶段的必要预留' ;;
+                feasibility-rejected) printf '当前 profile 的剩余测量计划预计无法在指定 TX 或时间预算内完成' ;;
+                *) printf '测量因 TX 或时间预算限制而安全停止（历史记录未明确失败类型）' ;;
+            esac ;;
         no-clean-reference) printf '无法建立低速干净参考' ;;
         no-knee-confidence) printf '没有足够证据定位拐点' ;;
         candidate-confirm-failed) printf '候选速率未通过确认测试' ;;
@@ -12540,7 +13075,7 @@ failure_default_suggestion() {
         peer-*) printf '稍后重试，或使用自有 iperf3 服务端。' ;;
         path-*|endpoint-*|route-*|nexthop-*) printf '检查路由、策略路由与默认出口稳定性，然后重新测量。' ;;
         cpu-busy|high-steal|sample-contaminated|background-traffic) printf '停止其他高负载任务并等待线路空闲后重试。' ;;
-        budget-exceeded) printf '提高显式预算或改用 quick profile 后重新开始；本次不会复用未验证候选。' ;;
+        budget-exceeded) printf '重新执行并明确选择 --measurement-profile quick 或调整 --max-test-gib / --max-duration；本次不会复用未验证候选。' ;;
         tc-ownership-conflict) printf '先确认并由原管理工具移除第三方 qdisc；本项目不会强制覆盖。' ;;
         rollback-failed) printf '立即运行 bbr doctor，并依据保留的事务快照人工检查。' ;;
         *) printf '运行 bbr doctor 查看只读诊断，再根据具体差异处理。' ;;
@@ -12561,6 +13096,8 @@ failure_set() {
     detail=$(state_safe_text "$detail" 240); suggestion=$(state_safe_text "$suggestion" 240)
     FAILURE_STAGE="$stage"; FAILURE_REASON="$reason"; FAILURE_DETAIL="$detail"
     FAILURE_SUGGESTION="${suggestion:-$(failure_default_suggestion "$reason")}"; : "$rc"
+    FAILURE_BUDGET_CONTEXT=""
+    [[ "$reason" != budget-exceeded ]] || FAILURE_BUDGET_CONTEXT="${6:-}"
     failure_pending_write || true
 }
 
@@ -12572,7 +13109,7 @@ failure_from_rc() {
         "$IPERF_UNSTABLE_RC") failure_set "$stage" measurement-unstable "sample spread threshold exceeded" "" "$rc" ;;
         "$MEASURE_PATH_QUALITY_RC") failure_set PATH_CONTROL path-dirty "low-rate path control was not clean" "" "$rc" ;;
         "$MEASURE_ROUTE_MISMATCH_RC") failure_set ROUTE_GUARD path-changed "route fingerprint changed" "" "$rc" ;;
-        "${MEASURE_BUDGET_RC:-70}") failure_set "${MEASURE_BUDGET_STAGE:-$stage}" budget-exceeded "measurement hard budget reached" "" "$rc" ;;
+        "${MEASURE_BUDGET_RC:-70}") failure_set "${MEASURE_BUDGET_STAGE:-$stage}" budget-exceeded "measurement stopped by TX/time budget guard" "" "$rc" ;;
         "$MEASUREMENT_PREFLIGHT_RC") [[ -n "$FAILURE_REASON" ]] || failure_set PREFLIGHT sample-contaminated "environment preflight rejected measurement" "" "$rc" ;;
         "$ROLLBACK_FAILURE_RC") failure_set ROLLBACK rollback-failed "restoration did not complete" "" "$rc" ;;
         2) [[ -n "$FAILURE_REASON" ]] || failure_set "$stage" no-knee-confidence "measurement evidence was inconclusive" "" "$rc" ;;
@@ -12582,15 +13119,23 @@ failure_from_rc() {
 
 failure_record_write() {
     local dir="$1" stage="$2" reason="$3" detail="$4" rc="$5" rollback="$6" persistent="$7"
-    local original_stage="${8:-}" original_reason="${9:-}" original_rc="${10:-}" failure_file="$dir/failure.tsv" temp
+    local original_stage="${8:-}" original_reason="${9:-}" original_rc="${10:-}" failure_file="$dir/failure.tsv" temp context subtype suggestion
     [[ "$dir" == "$HISTORY_DIR/"* && -d "$dir" && ! -L "$dir" ]] || return 1
     temp=$(mktemp "${failure_file}.tmp.XXXXXX") || return 1
+    context=$(budget_failure_context_from_summary "$dir/summary.tsv")
+    if [[ "$reason" == budget-exceeded && -z "$context" ]]; then
+        context=$(budget_failure_context unknown '' '' '' '' '' '' unknown)
+    fi
+    subtype=$(summary_value /dev/stdin BUDGET_FAILURE_SUBTYPE <<< "$context")
+    suggestion=$(summary_value "$dir/summary.tsv" SUGGESTED_ACTION) || suggestion=""
+    [[ -n "$suggestion" ]] || suggestion=$(failure_default_suggestion "$reason")
     if ! printf 'SCHEMA\t%s\nSTAGE\t%s\nREASON\t%s\nEXPLANATION\t%s\nDETAIL\t%s\nRC\t%s\nROLLBACK\t%s\nPERSISTENT_CHANGES\t%s\nSUGGESTION\t%s\n' \
-        "$FAILURE_SCHEMA" "$stage" "$reason" "$(failure_reason_explanation "$reason")" \
+        "$FAILURE_SCHEMA" "$stage" "$reason" "$(failure_reason_explanation "$reason" "$subtype")" \
         "$(history_safe_value "$detail")" "$rc" "$rollback" "$persistent" \
-        "$(history_safe_value "$(failure_default_suggestion "$reason")")" > "$temp"; then
+        "$(history_safe_value "$suggestion")" > "$temp"; then
         rm -f -- "$temp"; return 1
     fi
+    [[ -z "$context" ]] || printf '%s\n' "$context" >> "$temp" || { rm -f -- "$temp"; return 1; }
     if [[ -n "$original_reason" ]]; then
         printf 'ORIGINAL_STAGE\t%s\nORIGINAL_REASON\t%s\nORIGINAL_RC\t%s\n' \
             "$original_stage" "$original_reason" "$original_rc" >> "$temp" || { rm -f -- "$temp"; return 1; }
@@ -12626,6 +13171,36 @@ history_summary_update() {
     mv -f -- "$temp" "$file"
 }
 
+measurement_history_invalidate_decision() {
+    local summary="$1" reason="$2" kind sample_score sample_grade sample_reasons
+    [[ -f "$summary" && ! -L "$summary" ]] || return 0
+    kind=$(summary_value "$summary" TYPE)
+    [[ "$kind" == sweep || "$kind" == verify ]] || return 0
+    sample_score=$(summary_value "$summary" SAMPLE_CONFIDENCE_SCORE)
+    sample_grade=$(summary_value "$summary" SAMPLE_CONFIDENCE_GRADE)
+    sample_reasons=$(summary_value "$summary" SAMPLE_CONFIDENCE_REASONS)
+    history_summary_update "$summary" \
+        SAMPLE_CONFIDENCE_SCORE "${sample_score:-0}" SAMPLE_CONFIDENCE_GRADE "${sample_grade:-low}" \
+        SAMPLE_CONFIDENCE_REASONS "${sample_reasons:-no-usable-sample}" \
+        DECISION_STATUS inconclusive DECISION_CONFIDENCE_SCORE 0 DECISION_CONFIDENCE_GRADE low DECISION_CONFIDENCE_REASONS "$reason" \
+        CONFIDENCE_SCORE 0 CONFIDENCE_GRADE low CONFIDENCE_REASONS "$reason" || return 1
+    if [[ "$kind" == sweep ]]; then
+        history_summary_update "$summary" RECOMMEND "" CONFIRMED 0 KNEE_MBIT "" CONFIRMED_KNEE ""
+    fi
+}
+
+measurement_history_complete_decision() {
+    local summary="$1" verify_score="$2" verify_reasons="$3" score grade decision_reasons
+    score=$(summary_value "$summary" SAMPLE_CONFIDENCE_SCORE); is_uint "$score" || score=0
+    decision_reasons=$(summary_value "$summary" SAMPLE_CONFIDENCE_REASONS); decision_reasons="${decision_reasons:-no-usable-sample}"
+    is_uint "$verify_score" || verify_score=0
+    if (( verify_score < score )); then score="$verify_score"; decision_reasons="$verify_reasons"; fi
+    if (( score >= 90 )); then grade=high; elif (( score >= 65 )); then grade=medium; else grade=low; fi
+    history_summary_update "$summary" DECISION_SCOPE operation DECISION_STATUS complete \
+        DECISION_CONFIDENCE_SCORE "$score" DECISION_CONFIDENCE_GRADE "$grade" DECISION_CONFIDENCE_REASONS "$decision_reasons" \
+        CONFIDENCE_SCORE "$score" CONFIDENCE_GRADE "$grade" CONFIDENCE_REASONS "$decision_reasons"
+}
+
 measurement_finalize_run() {
     local kind="$1" peer="$2" port="$3" iface="$4" rc="$5" rollback="${6:-complete}"
     local summary="${MEASURE_RUN_DIR:-}/summary.tsv" pending="${MEASURE_RUN_DIR:-}/.failure-pending.tsv"
@@ -12645,6 +13220,10 @@ measurement_finalize_run() {
         TEST_RX_BYTES_USED "${TEST_RX_BYTES_USED:-0}" TEST_DURATION_USED "${TEST_DURATION_USED:-0}" \
         MAX_TEST_TX_BYTES "${MEASURE_MAX_TX_BYTES:-0}" MAX_TEST_DURATION_SECONDS "${MEASURE_MAX_DURATION_SECONDS:-0}" || return 1
     if (( rc != 0 )); then
+        if [[ "$reason" == budget-exceeded ]]; then
+            budget_failure_summary_update "$summary" "$FAILURE_BUDGET_CONTEXT" || return 1
+        fi
+        measurement_history_invalidate_decision "$summary" "$reason" || return 1
         failure_record_write "$MEASURE_RUN_DIR" "$stage" "$reason" "$detail" "$rc" "$rollback" "$persistent" || return 1
     fi
     rm -f -- "$pending"
@@ -12675,19 +13254,22 @@ failure_finalize_outer_rollback() {
         ORIGINAL_FAILURE_STAGE "$original_stage" ORIGINAL_FAILURE_REASON "$original_reason" \
         ORIGINAL_FAILURE_DETAIL "$original_detail" ORIGINAL_FAILURE_SUGGESTION "$original_suggestion" \
         ORIGINAL_INTERNAL_RC "$([[ -n "$original_reason" ]] && printf '%s' "$original_rc")" COMPLETED_AT "$(utc_now)" || return 1
+    measurement_history_invalidate_decision "$summary" "$reason" || return 1
     failure_record_write "$dir" "$stage" "$reason" "$detail" "$final_rc" "$rollback" "$persistent" \
         "$original_stage" "$original_reason" "$original_rc"
 }
 
 failure_summary_print() {
-    local summary="${1:-${MEASURE_RUN_DIR:-}/summary.tsv}" final="${2:-0}" reason rollback persistent original
+    local summary="${1:-${MEASURE_RUN_DIR:-}/summary.tsv}" final="${2:-0}" reason rollback persistent original context subtype
     if [[ -n "${ACTION_TRANSACTION_DIR:-}" && "$final" != 1 ]]; then return 0; fi
     [[ -f "$summary" && ! -L "$summary" ]] || return 1
     [[ "$(summary_value "$summary" RESULT)" == FAILURE ]] || return 0
     reason=$(summary_value "$summary" FAILURE_REASON)
+    context=$(budget_failure_context_from_summary "$summary")
+    subtype=$(summary_value /dev/stdin BUDGET_FAILURE_SUBTYPE <<< "$context")
     printf '\nFailure summary\n\n'
     printf '%-20s %s\n' Stage "$(summary_value "$summary" FAILURE_STAGE)"
-    printf '%-20s %s (%s)\n' Reason "$reason" "$(failure_reason_explanation "$reason")"
+    printf '%-20s %s (%s)\n' Reason "$reason" "$(failure_reason_explanation "$reason" "$subtype")"
     printf '%-20s %s:%s\n' Peer "$(summary_value "$summary" PEER)" "$(summary_value "$summary" PORT)"
     printf '%-20s %s\n' 'Traffic used' "$(human_bytes "$(summary_value "$summary" TEST_TX_BYTES_USED)") TX"
     rollback=$(summary_value "$summary" ROLLBACK_RESULT); persistent=$(summary_value "$summary" PERSISTENT_CHANGES)
@@ -12698,6 +13280,7 @@ failure_summary_print() {
     original=$(summary_value "$summary" ORIGINAL_FAILURE_REASON)
     [[ -z "$original" ]] || printf '%-20s %s\n' 'Original reason' "$original"
     printf '%-20s %s\n' 'Persistent changes' "$persistent"
+    [[ "$reason" != budget-exceeded ]] || budget_failure_print "$summary"
     printf '\nSuggested action\n  %s\n' "$(summary_value "$summary" SUGGESTED_ACTION)"
 }
 
@@ -12737,8 +13320,32 @@ history_schema_supported() {
     is_uint "$schema" && (( 10#$schema <= HISTORY_SCHEMA ))
 }
 
+history_decision_grade() {
+    local file="$1" grade decision quality result
+    grade=$(history_field "$file" DECISION_CONFIDENCE_GRADE)
+    [[ -n "$grade" ]] || grade=$(history_field "$file" CONFIDENCE_GRADE)
+    if [[ "$(history_field "$file" TYPE)" == sweep ]]; then
+        decision=$(history_field "$file" SCAN_DECISION); result=$(history_field "$file" RESULT)
+        quality=$(history_field "$file" PATH_CONTROL_QUALITY)
+        [[ -n "$quality" ]] || quality=$(history_field "$file" BASELINE_QUALITY)
+        # Historical v8.0.7 budget interruptions could store high/clean. The
+        # reader applies the evidence gate without rewriting the old record.
+        if [[ "$result" == FAILURE || "$(history_field "$file" DECISION_STATUS)" == inconclusive ||
+              ( "$quality" != clean && "$quality" != good ) ]]; then
+            grade=low
+        elif [[ "$decision" == recommend && "$(history_field "$file" CONFIRMED)" == 1 &&
+                -n "$(history_field "$file" BROKE_AT)" && -n "$(history_field "$file" RECOMMEND)" ]] ||
+             [[ "$decision" == no-knee-clean && "$(history_field "$file" NO_KNEE)" == 1 ]]; then
+            :
+        else
+            grade=low
+        fi
+    fi
+    printf '%s\n' "${grade:-unknown}"
+}
+
 history_print_one() {
-    local file="$1" id result decision knee recommend verify traffic reason peer time schema
+    local file="$1" id result decision knee recommend verify traffic reason peer time schema last_clean suspected confirmed_break context subtype
     [[ -f "$file" && ! -L "$file" && "$file" == "$HISTORY_DIR/"*/summary.tsv ]] || return 1
     schema=$(history_field "$file" HISTORY_SCHEMA)
     history_schema_supported "$file" || { die "history 使用不支持的更新 schema: ${schema:-invalid}"; return 1; }
@@ -12746,15 +13353,33 @@ history_print_one() {
     time=$(history_field "$file" COMPLETED_AT); [[ -n "$time" ]] || time="${id%%-*}"
     result=$(history_field "$file" RESULT); [[ -n "$result" ]] || result=LEGACY
     decision=$(history_field "$file" SCAN_DECISION); [[ -n "$decision" ]] || decision=$(history_field "$file" TYPE)
-    knee=$(history_field "$file" KNEE_MBIT); recommend=$(history_field "$file" RECOMMEND)
+    knee=$(history_field "$file" CONFIRMED_KNEE); recommend=$(history_field "$file" RECOMMEND)
+    last_clean=$(history_field "$file" LAST_CLEAN); [[ -n "$last_clean" ]] || last_clean=$(history_field "$file" LAST_OK)
+    suspected=$(history_field "$file" SUSPECTED_BREAK); confirmed_break=$(history_field "$file" CONFIRMED_BREAK)
+    [[ -n "$confirmed_break" ]] || confirmed_break=$(history_field "$file" BROKE_AT)
+    if [[ -z "$knee" && -z "$(history_field "$file" KNEE_SEMANTICS)" ]]; then
+        # v8.0.5-7 KNEE_MBIT was an unconditional LAST_OK alias. Read old
+        # history without displaying a partial scan as a confirmed knee.
+        if [[ "$(history_field "$file" CONFIRMED)" == 1 && -n "$confirmed_break" && -n "$recommend" && "$result" != FAILURE ]]; then
+            knee=$(history_field "$file" KNEE_MBIT)
+        fi
+    fi
     verify=$(history_field "$file" VERDICT); [[ -n "$verify" ]] || verify=$(history_field "$file" FINAL_VERIFY_MODE)
     traffic=$(history_field "$file" TEST_TX_BYTES_USED); [[ -n "$traffic" ]] || traffic=0
     reason=$(history_field "$file" FAILURE_REASON); [[ -n "$reason" ]] || reason=none
     peer=$(history_field "$file" PEER); [[ -n "$peer" ]] || peer=unknown
     printf '%s\n' "ID                 $id" "Time               $time" "Operation          $(history_field "$file" TYPE)" \
         "Peer               $peer" "Result             $result" "Decision           ${decision:-unknown}" \
-        "Knee               ${knee:-none}" "Recommendation     ${recommend:-none}" "Verify             ${verify:-none}" \
+        "Last clean         ${last_clean:-none}" "Suspected break    ${suspected:-none}" "Confirmed break    ${confirmed_break:-none}" \
+        "Knee               ${knee:-none/unconfirmed}" \
+        "Sample confidence  $(history_field "$file" SAMPLE_CONFIDENCE_GRADE)" "Decision confidence $(history_decision_grade "$file")" "Recommendation     ${recommend:-none}" "Verify             ${verify:-none}" \
         "Traffic TX         $(human_bytes "$traffic")" "Failure reason     $reason"
+    if [[ "$reason" == budget-exceeded ]]; then
+        context=$(budget_failure_context_from_summary "$file")
+        subtype=$(summary_value /dev/stdin BUDGET_FAILURE_SUBTYPE <<< "$context")
+        printf '%-20s %s\n' 'Failure explanation' "$(failure_reason_explanation "$reason" "$subtype")"
+        budget_failure_print "$file"
+    fi
 }
 
 history_show() {
@@ -12773,19 +13398,24 @@ history_latest() {
 }
 
 history_list() {
-    local file id type result decision reason count=0
-    printf '%-31s %-9s %-9s %-28s %s\n' ID Type Result Decision/verify Failure
+    local file id type result decision reason subtype context count=0
+    printf '%-31s %-9s %-9s %-28s %-20s %s\n' ID Type Result Decision/verify Failure 'Budget subtype'
     while IFS= read -r file; do
         [[ -f "$file" ]] || continue
         id="${file%/summary.tsv}"; id="${id##*/}"; type=$(history_field "$file" TYPE)
         if ! history_schema_supported "$file"; then
-            printf '%-31s %-9s %-9s %-28s %s\n' "$id" unknown INVALID unsupported-schema ignored
+            printf '%-31s %-9s %-9s %-28s %-20s %s\n' "$id" unknown INVALID unsupported-schema ignored -
             continue
         fi
         result=$(history_field "$file" RESULT); [[ -n "$result" ]] || result=LEGACY
         decision=$(history_field "$file" SCAN_DECISION); [[ -n "$decision" ]] || decision=$(history_field "$file" VERDICT)
         reason=$(history_field "$file" FAILURE_REASON); [[ -n "$reason" ]] || reason=none
-        printf '%-31s %-9s %-9s %-28s %s\n' "$id" "${type:-unknown}" "$result" "${decision:-none}" "$reason"
+        subtype=-
+        if [[ "$reason" == budget-exceeded ]]; then
+            context=$(budget_failure_context_from_summary "$file")
+            subtype=$(summary_value /dev/stdin BUDGET_FAILURE_SUBTYPE <<< "$context")
+        fi
+        printf '%-31s %-9s %-9s %-28s %-20s %s\n' "$id" "${type:-unknown}" "$result" "${decision:-none}" "$reason" "$subtype"
         ((count+=1)); (( count < MAX_HISTORY_ENTRIES )) || break
     done < <(history_summary_files)
     (( count > 0 )) || printf '%s\n' '(no measurement history)'
@@ -13254,6 +13884,8 @@ Usage:
                          [--margin 3] [--loss-threshold 0.1] [--cap MBIT] [--force-scan]
                  Measurement commands accept --measurement-profile quick|standard|strict,
                  --max-test-gib GIB and --max-duration SEC.
+                 RC70 / budget-exceeded is retained; history reports the budget subtype:
+                 exhausted, insufficient-reservation, feasibility-rejected, or unknown (legacy).
   ${0##*/} peers [reset]
   ${0##*/} history [latest|show ID|prune]
   ${0##*/} doctor [--export [--include-addresses]]
@@ -13876,6 +14508,7 @@ auto_tune_execute() {
     fi
     auto_measure_with_peer_failover "$iface" "$nominal" || return $?
     summary="$MEASURE_RUN_DIR/summary.tsv"
+    AUTO_SWEEP_SUMMARY="$summary"
     sweep_path_fingerprint=$(summary_value "$summary" PATH_ROUTE_FINGERPRINT)
     [[ "$sweep_path_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
         die "扫描结果缺少合法网络路径指纹；不会持久化"
@@ -14009,6 +14642,9 @@ auto_tune_execute() {
         auto_tune_route_guard "$iface" "${WIZARD_PEER_ADDRESS:-$WIZARD_PEER}" || return 1
     fi
     persist_current_tuning || return 1
+    if declare -F measurement_history_complete_decision >/dev/null; then
+        measurement_history_complete_decision "$summary" "$verify_confidence_score" "$verify_confidence_reasons" || return 1
+    fi
     printf '\n'
     if (( final_verify_degraded )); then log OK "自动调优完成（degraded peer verification）"
     else log OK "自动调优、复验和持久化提交完成"
@@ -14041,6 +14677,7 @@ auto_first_sample_budget_gate() {
         "$(human_bytes "$AUTO_FIRST_SAMPLE_RESERVED_BYTES")" "$AUTO_FIRST_SAMPLE_STAGE" \
         "$AUTO_FIRST_SAMPLE_RATE" "$AUTO_FIRST_SAMPLE_DURATION"
     printf '  首样本时间预留  %ss / hard limit %ss\n' "$AUTO_FIRST_SAMPLE_RESERVED_SECONDS" "$max_duration"
+    printf '  Budget subtype insufficient-reservation\n'
     log ERR "MEASUREMENT_BUDGET_EXCEEDED：当前预算不足以安全启动第一次吞吐采样"
     log INFO "请提高 --max-test-gib（必须大于首样本安全预留）；不要降低安全余量"
     log INFO "未创建调优 transaction、未写入 baseline、未修改 sysctl/qdisc，也未启动 iperf"
@@ -14049,6 +14686,7 @@ auto_first_sample_budget_gate() {
 
 auto_tune_run_transaction() {
     local iface="$1" nominal="$4" rc rollback_rc=0 failure_dir="" measurement_mode=none
+    AUTO_SWEEP_SUMMARY=""
     if [[ -n "${WIZARD_PEER:-}" ]]; then
         if (( nominal > 0 )); then measurement_mode=known; else measurement_mode=auto; fi
     fi
@@ -14067,6 +14705,9 @@ auto_tune_run_transaction() {
     fi
     log WARN "自动调优未完成，正在恢复开始前状态"
     action_transaction_rollback || rollback_rc=$?
+    if [[ -n "$AUTO_SWEEP_SUMMARY" && -f "$AUTO_SWEEP_SUMMARY" ]] && declare -F measurement_history_invalidate_decision >/dev/null; then
+        measurement_history_invalidate_decision "$AUTO_SWEEP_SUMMARY" "operation-incomplete-rc-${rc}" || log WARN "sweep decision confidence finalization failed"
+    fi
     if [[ -n "$failure_dir" && -f "$failure_dir/summary.tsv" ]] && declare -F failure_finalize_outer_rollback >/dev/null; then
         failure_finalize_outer_rollback "$failure_dir/summary.tsv" "$rc" "$rollback_rc" || \
             log WARN "最终 failure summary 原子更新失败；保留原始 history 与事务证据"
@@ -14143,7 +14784,6 @@ auto_tune_wizard() {
     if (( nominal > 0 && tuning_rtt > 0 )); then
         profile=adaptive
         estimate_bytes=$(estimate_measurement_plan_bytes "$((nominal * 40 / 100))" "$WIZARD_SAMPLE_DURATION" "$nominal" "$WIZARD_SAMPLE_DURATION" "$((nominal * 13 / 10))" "$WIZARD_SAMPLE_DURATION" "$((WIZARD_SAMPLE_DURATION+2))" 0)
-        (( estimate_bytes > max_tx_bytes )) && estimate_bytes="$max_tx_bytes"
         estimate="≤ $(human_bytes "$estimate_bytes") 上行（正常上界；peer failure retries 仍计入硬预算）"
     elif [[ -n "${WIZARD_PEER:-}" ]]; then
         estimate="将按实测带宽动态计算，扫描上限 ${WIZARD_SCAN_CAP} Mbit/s"
@@ -14173,7 +14813,8 @@ auto_tune_wizard() {
         fi
         printf '  缓冲区调优 RTT  %sms（按用途下限与测速 RTT 取较大值）\n' "$tuning_rtt"
     fi
-    printf '  预计时间/流量   约 3–8 分钟 / %s\n' "$estimate"
+    printf '  时间/流量估算   %s；取得容量/路径遥测后评估剩余工作\n' "$estimate"
+    printf '  可完成性        当前预算不保证完成；动态评估不足时可明确改选 quick、提高预算或取消 rollback\n'
     printf '  硬流量预算      %s TX\n' "$(human_bytes "$max_tx_bytes")"
     if [[ "$AUTO_FIRST_SAMPLE_STAGE" == NONE ]]; then
         printf '  首样本安全预留  不运行测速\n'

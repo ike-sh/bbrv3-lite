@@ -1,0 +1,21 @@
+TIME	LABEL	EVENT	DETAIL
+2026-11-12T16:32:50Z	saturation	DISPERSION_RECHECK	spread=99.03%; threshold=6%; append-sample=3
+2026-11-12T16:32:50Z	saturation	OUTLIER	sample=1; receiver=386.30; median=1138.46; selected-receiver=1138.46
+2026-11-12T16:32:50Z	saturation	REPRESENTATIVE_SELECTED	receiver=1138.46; final-spread=0.73%; sample-count=3; selection=nearest-receiver-median
+2026-11-12T16:32:50Z	path-control	OUTLIER	sample=1; receiver=439.37; median=485.33; selected-receiver=485.33
+2026-11-12T16:32:50Z	path-control	REPRESENTATIVE_SELECTED	receiver=485.33; final-spread=0.50%; sample-count=3; selection=nearest-receiver-median
+2026-11-12T16:32:50Z	rate-1036	REPRESENTATIVE_SELECTED	receiver=631.58; final-spread=0.00%; sample-count=1; selection=nearest-receiver-median
+2026-11-12T16:32:50Z	rate-1036	SAMPLE_QUALIFICATION	requested=1036; sender=635.66; receiver=631.58; minimum-efficiency=0.75; LOSS_CLEAN=1; THROUGHPUT_REPRESENTATIVE=0; PEER_LIMITED=0; PATH_DIRTY=0; CONTAMINATED=0
+2026-11-12T16:32:50Z	rate-1036	THROUGHPUT_RECHECK	loss-clean-underfilled; required=2-representative-of-at-most-3; same-rate=1036; existing-reference-allows-plateau=0
+2026-11-12T16:32:51Z	rate-1036-recheck-2	REPRESENTATIVE_SELECTED	receiver=980; final-spread=0.00%; sample-count=1; selection=nearest-receiver-median
+2026-11-12T16:32:51Z	rate-1036-recheck-2	SAMPLE_QUALIFICATION	requested=1036; sender=990; receiver=980; minimum-efficiency=0.75; LOSS_CLEAN=1; THROUGHPUT_REPRESENTATIVE=1; PEER_LIMITED=0; PATH_DIRTY=0; CONTAMINATED=0
+2026-11-12T16:32:51Z	rate-1036-recheck-3	REPRESENTATIVE_SELECTED	receiver=982; final-spread=0.00%; sample-count=1; selection=nearest-receiver-median
+2026-11-12T16:32:51Z	rate-1036-recheck-3	SAMPLE_QUALIFICATION	requested=1036; sender=992; receiver=982; minimum-efficiency=0.75; LOSS_CLEAN=1; THROUGHPUT_REPRESENTATIVE=1; PEER_LIMITED=0; PATH_DIRTY=0; CONTAMINATED=0
+2026-11-12T16:32:51Z	rate-1098	REPRESENTATIVE_SELECTED	receiver=1036.75; final-spread=0.00%; sample-count=1; selection=nearest-receiver-median
+2026-11-12T16:32:51Z	rate-1098	SAMPLE_QUALIFICATION	requested=1098; sender=1043.00; receiver=1036.75; minimum-efficiency=0.92892; LOSS_CLEAN=1; THROUGHPUT_REPRESENTATIVE=1; PEER_LIMITED=0; PATH_DIRTY=0; CONTAMINATED=0
+2026-11-12T16:32:51Z	rate-1160	REPRESENTATIVE_SELECTED	receiver=1093.99; final-spread=0.00%; sample-count=1; selection=nearest-receiver-median
+2026-11-12T16:32:51Z	rate-1160	SAMPLE_QUALIFICATION	requested=1160; sender=1101.00; receiver=1093.99; minimum-efficiency=0.92892; LOSS_CLEAN=1; THROUGHPUT_REPRESENTATIVE=1; PEER_LIMITED=0; PATH_DIRTY=0; CONTAMINATED=0
+2026-11-12T16:32:51Z	rate-1222	REPRESENTATIVE_SELECTED	receiver=1137.92; final-spread=0.00%; sample-count=1; selection=nearest-receiver-median
+2026-11-12T16:32:51Z	rate-1222	SAMPLE_QUALIFICATION	requested=1222; sender=1145.00; receiver=1137.92; minimum-efficiency=0.92892; LOSS_CLEAN=0; THROUGHPUT_REPRESENTATIVE=1; PEER_LIMITED=0; PATH_DIRTY=0; CONTAMINATED=0
+2026-11-12T16:32:52Z	rate-1222-recheck-2	REPRESENTATIVE_SELECTED	receiver=647.41; final-spread=0.00%; sample-count=1; selection=nearest-receiver-median
+2026-11-12T16:32:52Z	rate-1222-recheck-2	SAMPLE_QUALIFICATION	requested=1222; sender=655.00; receiver=647.41; minimum-efficiency=0.92892; LOSS_CLEAN=1; THROUGHPUT_REPRESENTATIVE=0; PEER_LIMITED=0; PATH_DIRTY=0; CONTAMINATED=0

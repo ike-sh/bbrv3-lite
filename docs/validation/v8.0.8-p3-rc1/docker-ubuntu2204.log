@@ -1,0 +1,700 @@
+==> Docker validation: ubuntu:22.04
+debconf: delaying package configuration, since apt-utils is not installed
+==> Build single-file release
+built: /work/net-tcp-tune.sh
+==> Bash syntax
+==> Generated artifact markers
+==> Core tests
+==> tests/test_baseline_v803.sh
+[*] TCP 基线校验通过: v2 / adopt-current / eth0
+[+] 已恢复首次可信基线；基线和测量历史仍保留在 /tmp/tmp.YqqnUGR8bp/exact-v802/state
+[*] TCP 基线校验通过: v2 / native / eth0
+[+] 已恢复首次可信基线；基线和测量历史仍保留在 /tmp/tmp.YqqnUGR8bp/native-first-install/state
+baseline v8.0.3 regression tests: OK
+==> tests/test_core.sh
+==> test_config_parser
+==> test_legacy_migration
+[*] 迁移旧版配置: /tmp/tmp.o6iLqNUAgu/etc/bbrv3-lite.conf
+==> test_profile_math
+==> test_bbr_compatibility_guard_and_generation_reporting
+==> test_xanmod_cpu_level_and_track_selection
+==> test_hardware_aware_model
+==> test_managed_sysctl_runtime_verifier
+==> test_legacy_baseline_reference
+[+] 已引用旧版原始备份并保存旧版恢复工具: /tmp/tmp.o6iLqNUAgu/state/baseline
+==> test_qdisc_replay_filters_kernel_runtime_fields
+==> test_root_qdisc_handle_restore_paths
+==> test_cleanup_core_restores_pending_runtime_transactions_on_signal
+[!] 进程退出时 default_qdisc 临时事务仍未提交，正在恢复全局原值
+[!] 进程退出时仍有未完成的网络运行时事务，正在恢复全部接口和全局状态
+==> test_cleanup_core_discards_incomplete_action_snapshot_without_writes
+[!] 进程退出时仍有未提交事务，正在恢复操作前状态
+[*] 系统配置事务仍处于只读快照阶段；正在丢弃快照，不执行运行时回滚
+==> test_cleanup_failure_changes_successful_process_status
+[!] 进程退出时 default_qdisc 临时事务仍未提交，正在恢复全局原值
+[!] 进程退出时仍有未完成的网络运行时事务，正在恢复全部接口和全局状态
+==> test_qdisc_filter_and_managed_topology_guards
+==> test_mq_child_guard_and_restore
+==> test_managed_rate_unit_parsing
+==> test_tc_transaction
+[x] 应用 300 Mbit 整形失败，正在恢复操作前 qdisc
+[x] eth0 qdisc state:
+qdisc cake 8001: root refcnt 2 bandwidth 1Gbit
+[x] eth0 class state:
+
+[x] eth0 root-tree filter state:
+parent 8001::
+[none]
+[x] 拒绝覆盖未管理的 root qdisc 'cake'（eth0）；请先自行恢复或删除
+==> test_failed_tc_apply_retains_unrestored_snapshot
+==> test_measurement_math_and_history
+==> test_v71_measurement_metrics_and_confidence
+==> test_peak_core_cpu_detection
+==> test_adaptive_sampling_and_contamination_guard
+[*] adaptive: 3s × 1 flow(s), sample 1/2
+[*] adaptive: 3s × 1 flow(s), sample 2/2
+[!] 吞吐离散度 9.52% 超过 6%，追加第 3 个样本
+[*] adaptive: 3s × 1 flow(s), sample 3/3
+==> test_measure_compare_is_temporary_and_auditable
+[*] A/B 对照将交错执行 FQ 与 95 Mbit HTB/FQ，各 2 轮；最多约 154.50 MiB 出站流量
+[+] A/B 完成: FQ 100.00000 Mbit/s / 40.00000 ms，整形 98.00000 Mbit/s / 10.00000 ms，结论 improved
+[*] 对照置信度: high (100/100, clean)；未写入配置或服务
+[*] 结果: /tmp/tmp.o6iLqNUAgu/state/history/20261112T225426Z-compare
+==> test_systemd_generation
+==> test_baseline_captures_persistence_lifecycle
+[+] 已保存不可覆盖的初始基线: /tmp/tmp.o6iLqNUAgu/lifecycle/state/baseline (adopt-current)
+==> test_systemd_lifecycle_strict_queries_and_runtime_states
+==> test_persistent_artifact_consistency_verifier
+==> test_legacy_sysctl_retirement_requires_baseline_and_transaction
+[*] 已在事务内退役旧版 sysctl（首次可信基线仍可恢复）: /tmp/tmp.o6iLqNUAgu/legacy-sysctl-retire/etc/99-bbr-ultimate.conf
+==> test_cli_command_removal_is_scoped
+[+] 已删除 bbr 命令: /tmp/tmp.o6iLqNUAgu/bin/bbr
+[+] 已从 /tmp/tmp.o6iLqNUAgu/home/.bashrc 删除旧版 bbr shell function
+[!] 未在标准位置找到本项目的 bbr 命令；自定义 --prefix 安装需用安装器 uninstall 删除
+[!] 未在标准位置找到本项目的 bbr 命令；自定义 --prefix 安装需用安装器 uninstall 删除
+==> test_uninstall_purge_preflight_is_write_free
+==> test_uninstall_restores_before_removal
+[+] 已完整卸载；可用基线已恢复，备份和历史保留在 /tmp/tmp.o6iLqNUAgu/state
+[*] 恢复结果: TCP=1 DNS=1 IPv6=1；重新打开 shell 后 bbr 命令将消失
+[*] 当前 shell 如缓存过旧命令，可执行: unset -f bbr 2>/dev/null; hash -r
+==> test_uninstall_purge_removes_only_empty_policy_parent
+[*] 已删除空策略父目录: /tmp/tmp.o6iLqNUAgu/uninstall-policy-parent/etc/bbrv3-lite
+[!] 已完整卸载并永久删除状态目录
+[*] 恢复结果: TCP=1 DNS=0 IPv6=0；重新打开 shell 后 bbr 命令将消失
+[*] 当前 shell 如缓存过旧命令，可执行: unset -f bbr 2>/dev/null; hash -r
+[!] 策略父目录包含非项目内容，已保留: /tmp/tmp.o6iLqNUAgu/uninstall-policy-parent/etc/bbrv3-lite
+[!] 策略父目录包含非项目内容，已保留: /tmp/tmp.o6iLqNUAgu/uninstall-policy-parent/etc/bbrv3-lite
+[!] 策略目录使用自定义父路径，卸载不会删除其父目录: /tmp/tmp.o6iLqNUAgu/uninstall-policy-parent/custom/bbrv3-lite
+[!] 策略父目录是符号链接，卸载不会删除: /tmp/tmp.o6iLqNUAgu/uninstall-policy-parent/symlink/bbrv3-lite
+==> test_uninstall_cleanup_failures_do_not_claim_success
+==> test_uninstall_without_baseline_propagates_cleanup_failures
+==> test_tcp_sysctl_snapshot_whitespace_portability
+==> test_tcp_baseline_validation_is_write_free
+==> test_tcp_baseline_capture_is_atomic_and_replayable
+[+] 已保存不可覆盖的初始基线: /tmp/tmp.o6iLqNUAgu/tcp-baseline-capture/state/baseline (adopt-current)
+==> test_native_mq_baseline_requires_complete_qdisc_class_mapping
+==> test_native_handle_zero_baseline_allows_recoverable_default_mismatch
+==> test_tcp_restore_preflight_rejects_mq_queue_drift_before_later_checks
+==> test_valid_v1_tcp_baseline_restores
+[*] TCP 基线校验通过: legacy-v1 / native / eth0
+[+] 已恢复首次可信基线；基线和测量历史仍保留在 /tmp/tmp.o6iLqNUAgu/tcp-baseline-restore/state
+==> test_uninstall_scans_all_interfaces_before_removal
+==> test_apply_preflight_and_stale_transaction_are_write_free
+==> test_configured_state_runtime_apply_is_atomic
+==> test_tcp_mutations_require_safe_environment
+==> test_submenu_stays_until_explicit_return
+==> test_menu_exits_after_uninstall_signal
+==> test_peer_parser
+==> test_public_peer_requires_real_iperf_preflight
+==> test_public_peer_pool_and_formal_failover
+[*] 正在按 RTT 筛选公共 iperf3 节点（Leaseweb / OVH / Clouvider）
+[+] 公共对端已通过 IPv4 iperf3 预检: near.example:5201 -> 203.0.113.10 (近端/ProviderA, RTT 1ms, health 70/100 no-history)
+[*] 已保留备用公共对端: backup.example:5203 -> 198.51.100.10 (IPv4, 备用/ProviderB, RTT 8ms, health 70/100 no-history)
+[*] 已保留备用公共对端: near.example:5202 -> 203.0.113.10 (IPv4, 近端/ProviderA, RTT 1ms, health 70/100 no-history)
+[*] 已保留备用公共对端: backup.example:5204 -> 198.51.100.10 (IPv4, 备用/ProviderB, RTT 8ms, health 70/100 no-history)
+[!] 切换到备用公共对端 2/4: backup.example:5203（备用/ProviderB，RTT 8ms）
+[!] 最终复验切换到同主机备用端口: backup.example:5204
+[!] 跳过备用公共端点 other-iface.example:5201：其出口 eth1 与本轮网卡 eth0 不同
+[!] 切换到备用公共对端 3/3: same-iface.example:5201（备用/ProviderC，RTT 3ms）
+==> test_repeated_sample_classifies_peer_unavailable
+==> test_sweep_without_knee_does_not_recommend_ceiling
+[*] PATH_CONTROL: 40 Mbit/s（标称速率的 40%）
+[*] SATURATION: receiver 100 Mbit/s, retrans-est 0.00000%（未见 policer 跳变）
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 955.67 MiB / 16 个样本；含 2 个完整样本的 retry allowance；预计总耗时约 111s
+[*] Conservative upper bound：剩余 44.11 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[*] 低速干净参考: 80/80，后续最低可接受效率比 0.98000
+      90 Mbit ->       90 Mbit/s, retrans-est 0.00000%
+     100 Mbit ->      100 Mbit/s, retrans-est 0.00000%
+     110 Mbit ->      110 Mbit/s, retrans-est 0.00000%
+     120 Mbit ->      120 Mbit/s, retrans-est 0.00000%
+     130 Mbit ->      130 Mbit/s, retrans-est 0.00000%
+[*] 扫描结论: no-knee-clean；决策置信度 low (25/100, contamination-unknown,single-sample,spread-unknown,loaded-rtt-unavailable)
+[*] 完整结果: /tmp/tmp.o6iLqNUAgu/state/history/20261112T225430Z-sweep
+==> test_refine_preserves_throughput_stall_and_confirmation_gate
+[*] PATH_CONTROL: 120 Mbit/s（标称速率的 40%）
+[*] SATURATION: receiver 300 Mbit/s, retrans-est 2.00000%（疑似 policer；不是脏路径判据）
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 3.13 GiB / 19 个样本；含 2 个完整样本的 retry allowance；预计总耗时约 126s
+[*] Conservative upper bound：剩余 142.83 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[*] 低速干净参考: 230.40/240，后续最低可接受效率比 0.94080
+     255 Mbit ->   244.80 Mbit/s, retrans-est 0%
+     270 Mbit ->   259.20 Mbit/s, retrans-est 0%
+     285 Mbit ->   273.60 Mbit/s, retrans-est 0%
+     300 Mbit ->   288.00 Mbit/s, retrans-est 0%
+[!] rate-315: LOSS_CLEAN=1，但 receiver 288.00/315 低于效率门槛 0.94080；冷却后同档有界复验，不作为 clean throughput reference
+[*] rate-315: 同档重复确认稳定吞吐平台；不作为 clean reference，仍需原有双档 stall 与候选确认
+     315 Mbit ->   288.00 Mbit/s, retrans-est 0%
+[!] rate-330: LOSS_CLEAN=1，但 receiver 288.00/330 低于效率门槛 0.94080；冷却后同档有界复验，不作为 clean throughput reference
+[*] rate-330: 同档重复确认稳定吞吐平台；不作为 clean reference，仍需原有双档 stall 与候选确认
+     330 Mbit ->   288.00 Mbit/s, retrans-est 0%
+     302 Mbit ->   288.00 Mbit/s, retrans-est 0% (refine)
+     304 Mbit ->   288.00 Mbit/s, retrans-est 0% (refine)
+     306 Mbit ->   288.00 Mbit/s, retrans-est 0% (refine)
+[!] refine-308: LOSS_CLEAN=1，但 receiver 288.00/308 低于效率门槛 0.94080；冷却后同档有界复验，不作为 clean throughput reference
+[*] refine-308: 同档重复确认稳定吞吐平台；不作为 clean reference，仍需原有双档 stall 与候选确认
+     308 Mbit ->   288.00 Mbit/s, retrans-est 0% (refine)
+[!] refine-310: LOSS_CLEAN=1，但 receiver 288.00/310 低于效率门槛 0.94080；冷却后同档有界复验，不作为 clean throughput reference
+[*] refine-310: 同档重复确认稳定吞吐平台；不作为 clean reference，仍需原有双档 stall 与候选确认
+     310 Mbit ->   288.00 Mbit/s, retrans-est 0% (refine)
+[+] 扫描完成: last clean=306 Mbit, break=308 Mbit, 推荐=296 Mbit
+[*] 确认业务表现后执行: test_core.sh tc enable 296 --knee 308 --margin 3 --interface auto
+[*] 扫描结论: recommend；决策置信度 low (25/100, contamination-unknown,single-sample,spread-unknown,loaded-rtt-unavailable)
+[*] 完整结果: /tmp/tmp.o6iLqNUAgu/state/history/20261112T225430Z-sweep-1
+[*] PATH_CONTROL: 120 Mbit/s（标称速率的 40%）
+[*] SATURATION: receiver 300 Mbit/s, retrans-est 2.00000%（疑似 policer；不是脏路径判据）
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 3.13 GiB / 19 个样本；含 2 个完整样本的 retry allowance；预计总耗时约 126s
+[*] Conservative upper bound：剩余 142.83 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[*] 低速干净参考: 230.40/240，后续最低可接受效率比 0.94080
+     255 Mbit ->   244.80 Mbit/s, retrans-est 0%
+     270 Mbit ->   259.20 Mbit/s, retrans-est 0%
+     285 Mbit ->   273.60 Mbit/s, retrans-est 0%
+     300 Mbit ->   288.00 Mbit/s, retrans-est 0%
+[!] rate-315: LOSS_CLEAN=1，但 receiver 288.00/315 低于效率门槛 0.94080；冷却后同档有界复验，不作为 clean throughput reference
+[*] rate-315: 同档重复确认稳定吞吐平台；不作为 clean reference，仍需原有双档 stall 与候选确认
+     315 Mbit ->   288.00 Mbit/s, retrans-est 0%
+[!] rate-330: LOSS_CLEAN=1，但 receiver 288.00/330 低于效率门槛 0.94080；冷却后同档有界复验，不作为 clean throughput reference
+[*] rate-330: 同档重复确认稳定吞吐平台；不作为 clean reference，仍需原有双档 stall 与候选确认
+     330 Mbit ->   288.00 Mbit/s, retrans-est 0%
+     302 Mbit ->   288.00 Mbit/s, retrans-est 0% (refine)
+     304 Mbit ->   288.00 Mbit/s, retrans-est 0% (refine)
+     306 Mbit ->   288.00 Mbit/s, retrans-est 0% (refine)
+[!] refine-308: LOSS_CLEAN=1，但 receiver 288.00/308 低于效率门槛 0.94080；冷却后同档有界复验，不作为 clean throughput reference
+[*] refine-308: 同档重复确认稳定吞吐平台；不作为 clean reference，仍需原有双档 stall 与候选确认
+     308 Mbit ->   288.00 Mbit/s, retrans-est 0% (refine)
+[!] refine-310: LOSS_CLEAN=1，但 receiver 288.00/310 低于效率门槛 0.94080；冷却后同档有界复验，不作为 clean throughput reference
+[*] refine-310: 同档重复确认稳定吞吐平台；不作为 clean reference，仍需原有双档 stall 与候选确认
+     310 Mbit ->   288.00 Mbit/s, retrans-est 0% (refine)
+[!] 候选档 296 Mbit 复测未通过吞吐/重传门槛，不生成推荐值
+[!] 扫描结论: inconclusive（confirmation-failed）；不会生成或持久化 measurement-derived 参数
+[*] 完整结果: /tmp/tmp.o6iLqNUAgu/state/history/20261112T225432Z-sweep
+
+Failure summary
+
+Stage                CANDIDATE_CONFIRM
+Reason               candidate-confirm-failed (候选速率未通过确认测试)
+Peer                 example.com:5201
+Traffic used         0 B TX
+Rollback             complete
+Persistent changes   none
+
+Suggested action
+  运行 bbr doctor 查看只读诊断，再根据具体差异处理。
+==> test_sweep_baseline_failure_stops_and_restores
+==> test_sweep_hard_cap_and_setup_failure_restore
+[*] PATH_CONTROL: 120 Mbit/s（标称速率的 40%）
+[*] SATURATION: receiver 300 Mbit/s, retrans-est 0%（未见 policer 跳变）
+[!] 扫描上界 1000 Mbit/s 超过硬上限 400 Mbit/s，已收敛到硬上限
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 2.69 GiB / 16 个样本；含 2 个完整样本的 retry allowance；预计总耗时约 111s
+[*] Conservative upper bound：剩余 119.39 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[*] 低速干净参考: 100/100，后续最低可接受效率比 0.98000
+     200 Mbit ->      200 Mbit/s, retrans-est 0%
+     300 Mbit ->      300 Mbit/s, retrans-est 0%
+     400 Mbit ->      400 Mbit/s, retrans-est 0%
+[*] 扫描结论: no-knee-clean；决策置信度 low (60/100, single-sample,loaded-rtt-unavailable)
+[*] 完整结果: /tmp/tmp.o6iLqNUAgu/state/history/20261112T225433Z-sweep-1
+==> test_persistence_restart_hands_off_lock
+==> test_dependency_install_is_minimal
+[*] 仅安装缺少的依赖包: iperf3 jq
+==> test_process_substitution_source_resolution
+==> test_self_update_rolls_back_split_install
+[+] 已更新到 v8.0.9；bash/version/checksum/persistence 自检通过；上一版本保存在 /tmp/tmp.o6iLqNUAgu/self-update/bbr.previous
+[*] 更新仅替换程序文件，未自动重新应用网络配置；可运行 bbr verify 检查当前 runtime
+==> test_action_transaction_rolls_back_failed_step
+[*] 已创建本次操作回滚点: /tmp/tmp.o6iLqNUAgu/state/.transaction.1TFjQs
+[+] 已恢复本次操作前的 qdisc、sysctl、配置和服务状态
+==> test_action_transaction_rejects_late_filter_before_rollback_writes
+[*] 已创建本次操作回滚点: /tmp/tmp.o6iLqNUAgu/action-late-filter/state/.transaction.rNwsDJ
+==> test_container_mutation_guard
+==> test_install_failure_is_not_success
+==> test_force_scan_requires_explicit_flag
+==> test_measurement_acceptance_gate
+==> test_action_transaction_capture_failure_clears_state
+==> test_action_transaction_route_snapshot_failure_is_write_free
+==> test_apply_initial_windows_requires_complete_family_success
+==> test_route_window_restore_rejects_route_identity_drift
+==> test_route_window_dynamic_attrs_do_not_trigger_drift
+==> test_auto_tune_commits_only_after_final_verify
+
+[+] BBR + FQ 基础调优和持久化提交完成（未运行测速）
+[x] 扫描候选值未通过确认测试（confirmation-failed），不会应用或持久化
+[!] 最终 verify path profile 不是 trusted（missing）；保留完整 sweep path profile 作为状态依据
+
+[+] 自动调优、复验和持久化提交完成
+[*] 最终复验置信度: high (100/100, clean)
+[*] 扫描记录: /tmp/tmp.o6iLqNUAgu/state/history/20260101T000000Z-sweep/summary.tsv
+[x] 扫描与最终复验经过不同网络路径；拒绝把跨路径结果持久化
+[x] 扫描与最终复验使用了不同测速端点；拒绝把跨端点结果持久化
+==> test_dns_apply_failure_restores_action_snapshot
+==> test_ipv6_malformed_baseline_is_immutable_and_write_free
+==> test_cli_rejects_missing_and_ignored_options
+core tests: OK
+==> tests/test_dns_policy_v740.sh
+dns v7.4.0 policy tests: OK
+==> tests/test_dns_v721.sh
+dns v7.2.1 tests passed
+==> tests/test_installer.sh
+installer tests: OK
+==> tests/test_iperf_family_v801.sh
+[*] 已冻结测速路径: dual.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, port 5201, path aaaaaaaaaaaa）
+[*] 已冻结测速路径: dual.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, port 5201, path aaaaaaaaaaaa）
+[*] 已冻结测速路径: dual.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, port 5201, path aaaaaaaaaaaa）
+[!] 跳过 203.0.113.10（IPv4）：路由、来源地址或出口 eth0 核验未通过
+[*] 已冻结测速路径: dual.example -> 2001:db8::10（IPv6, src 2001:db8::2, dev eth0, port 5201, path aaaaaaaaaaaa）
+[!] 跳过 203.0.113.10:5201（IPv4）：TCP/iperf3 预检不可用
+[*] 已冻结测速路径: dual.example -> 2001:db8::10（IPv6, src 2001:db8::2, dev eth0, port 5201, path aaaaaaaaaaaa）
+[!] 跳过 203.0.113.10:5201（IPv4）：TCP/iperf3 预检不可用
+[*] 已冻结测速路径: dual.example -> 2001:db8::10（IPv6, src 2001:db8::2, dev eth0, port 5201, path aaaaaaaaaaaa）
+[*] 已冻结测速路径: dual.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, port 5201, path aaaaaaaaaaaa）
+[*] 已冻结测速路径: dual.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, port 5201, path aaaaaaaaaaaa）
+[*] 已冻结测速路径: dual.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, port 5201, path aaaaaaaaaaaa）
+[*] 已冻结测速路径: dual.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, path aaaaaaaaaaaa）
+[*] 正在按 RTT 筛选公共 iperf3 节点（Leaseweb / OVH / Clouvider）
+[+] 公共对端已通过 IPv4 iperf3 预检: dual.example:5201 -> 203.0.113.10 (测试/Provider, RTT 5ms, health na/100 no-history)
+[*] 已冻结测速路径: dual.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, port 5201, path aaaaaaaaaaaa）
+[*] 已冻结测速路径: dual.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, port 5201, path aaaaaaaaaaaa）
+[*] 已冻结测速路径: public.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, port 5207, path aaaaaaaaaaaa）
+[!] 跳过 203.0.113.10:5201（IPv4）：TCP/iperf3 预检不可用
+[*] 已冻结测速路径: dual.example -> 2001:db8::10（IPv6, src 2001:db8::2, dev eth1, port 5201, path cccccccccccc）
+iperf family v8.0.1 tests: OK
+==> tests/test_ipv6_policy_v740.sh
+ipv6 v7.4.0 policy tests: OK
+==> tests/test_ipv6_v721.sh
+[+] IPv6 已永久禁用（保留 lo/::1）
+[+] IPv6 disable flags 已按逐接口基线精确恢复；地址和路由仅保留诊断快照，不作重放
+[+] IPv6 disable flags 已按逐接口基线精确恢复；地址和路由仅保留诊断快照，不作重放
+[!] 旧 IPv6 基线没有逐接口原值；仅执行 best-effort 恢复，无法证明每张网卡都回到首次状态
+[!] IPv6 disable flags 已按 legacy/partial-best-effort 恢复；无法宣称地址或路由已还原
+[!] 启动级 IPv6 禁用仍然生效；已恢复持久化文件，但运行时状态只能在修改启动配置并重启后恢复
+[!] IPv6 disable flags 已按 persistent-only/reboot-required 恢复；无法宣称地址或路由已还原
+[+] IPv6 已临时禁用（保留 lo/::1）
+real global IPv6 topology counterexample: OK
+[+] IPv6 disable flags 已按逐接口基线精确恢复；地址和路由仅保留诊断快照，不作重放
+real v2 restore all-trigger regression: OK
+ipv6 v7.2.1 tests: OK
+==> tests/test_ipv6_warning_v803.sh
+IPv6 warning v8.0.3 regression tests: OK
+==> tests/test_measure_v721.sh
+[*] 已冻结测速路径: peer.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, path 50d230c92ef9）
+[*] 空闲 RTT 基线: 1.0 ms
+[*] 已冻结测速路径: v6.example -> 2001:db8::10（IPv6, src 2001:db8::2, dev eth0, path 045bda6292ee）
+[*] 已冻结测速路径: peer.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, path 50d230c92ef9）
+[*] 已冻结测速路径: peer.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, port 5201, path 50d230c92ef9）
+[+] receiver 可用带宽代表样本: 100 Mbit/s（sender 100），重传 0.000 次/GiB
+[*] 测量置信度: low (45/100, receiver-fallback,path-unsafe)
+[*] 结果: /tmp/tmp.YhIJ2vLm9w/state/history/20261112T225451Z-probe
+measure v7.2.1 route-lock tests: OK
+==> tests/test_measure_v805.sh
+==> test_real_200m_regression
+[*] PATH_CONTROL: 80 Mbit/s（标称速率的 40%）
+[*] SATURATION: receiver 192 Mbit/s, retrans-est 8.76210%（疑似 policer；不是脏路径判据）
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 2.51 GiB / 20 个样本；含 2 个完整样本的 retry allowance；预计总耗时约 150s
+[*] Conservative upper bound：剩余 99.64 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[*] 低速干净参考: 169.26/182，后续最低可接受效率比 0.91140
+[!] rate-212: 重传跳变经 3 次实验确认（3/3）
+[+] 扫描完成: last clean=210 Mbit, break=212 Mbit, 推荐=203 Mbit
+[*] 候选档已通过扫描确认；最终单双流复验通过后才会持久化
+[*] 扫描结论: recommend；决策置信度 medium (75/100, single-sample)
+[*] 完整结果: /tmp/tmp.Sg61s2J8iB/state/history/20261112T225451Z-sweep
+==> test_auto_nominal_runs_saturation_then_control
+[*] SATURATION: receiver 192 Mbit/s, retrans-est 0%（未见 policer 跳变）
+[*] PATH_CONTROL: 86 Mbit/s（不限速 receiver 的 45%）
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 774.04 MiB / 5 个样本；含 1 个完整样本的 retry allowance；预计总耗时约 47s
+[*] Conservative upper bound：剩余 9.91 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[*] 扫描结论: no-knee-clean；决策置信度 medium (75/100, single-sample)
+[*] 完整结果: /tmp/tmp.Sg61s2J8iB/state/history/20261112T225452Z-sweep
+==> test_auto_nominal_lossy_saturation_runs_full_sweep
+[*] SATURATION: receiver 192 Mbit/s, retrans-est 8.76210%（疑似 policer；不是脏路径判据）
+[*] PATH_CONTROL: 86 Mbit/s（不限速 receiver 的 45%）
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 2.30 GiB / 20 个样本；含 2 个完整样本的 retry allowance；预计总耗时约 150s
+[*] Conservative upper bound：剩余 99.64 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[*] 低速干净参考: 162.75/175，后续最低可接受效率比 0.91140
+[!] rate-219: 重传跳变经 3 次实验确认（3/3）
+[!] refine-212: 重传跳变经 3 次实验确认（3/3）
+[+] 扫描完成: last clean=210 Mbit, break=212 Mbit, 推荐=203 Mbit
+[*] 候选档已通过扫描确认；最终单双流复验通过后才会持久化
+[*] 扫描结论: recommend；决策置信度 medium (75/100, single-sample)
+[*] 完整结果: /tmp/tmp.Sg61s2J8iB/state/history/20261112T225452Z-sweep-1
+==> test_clean_sender_receiver_no_policer
+[*] PATH_CONTROL: 40 Mbit/s（标称速率的 40%）
+[*] SATURATION: receiver 100 Mbit/s, retrans-est 0%（未见 policer 跳变）
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 405.54 MiB / 5 个样本；含 1 个完整样本的 retry allowance；预计总耗时约 47s
+[*] Conservative upper bound：剩余 4.78 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[*] 扫描结论: no-knee-clean；决策置信度 medium (75/100, single-sample)
+[*] 完整结果: /tmp/tmp.Sg61s2J8iB/state/history/20261112T225452Z-sweep-2
+==> test_clean_but_slow_peer_is_not_no_policer
+==> test_sender_does_not_drive_scan_range
+==> test_dirty_control_stops_before_saturation
+==> test_spike_requires_two_of_three
+[*] transient: 单次重传尖峰未复现（1/3），按瞬时公共对端竞争处理
+[!] confirmed: 重传跳变经 3 次实验确认（2/3）
+==> test_first_scan_loss_descends_to_clean_reference
+[*] PATH_CONTROL: 40 Mbit/s（标称速率的 40%）
+[*] SATURATION: receiver 100 Mbit/s, retrans-est 5%（疑似 policer；不是脏路径判据）
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 1.36 GiB / 21 个样本；含 2 个完整样本的 retry allowance；预计总耗时约 155s
+[*] Conservative upper bound：剩余 49.59 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[!] rate-91: 重传跳变经 3 次实验确认（3/3）
+[!] 首个扫描点 91 Mbit/s 已确认重传跳变；向下检查控制点 68 Mbit/s（1/3）
+[*] 低速干净参考: 64/68，后续最低可接受效率比 0.92235
+[!] refine-89: 重传跳变经 3 次实验确认（3/3）
+[+] 扫描完成: last clean=86 Mbit, break=89 Mbit, 推荐=83 Mbit
+[*] 候选档已通过扫描确认；最终单双流复验通过后才会持久化
+[*] 扫描结论: recommend；决策置信度 medium (75/100, single-sample)
+[*] 完整结果: /tmp/tmp.Sg61s2J8iB/state/history/20261112T225453Z-sweep-3
+==> test_capacity_discovery_mode_is_separate
+[*] PATH_CONTROL: 1200 Mbit/s（标称速率的 40%）
+[*] SATURATION: receiver 1000 Mbit/s, retrans-est 0%（未见 policer 跳变）
+[*] CAPACITY_DISCOVERY: 单流明显低于高带宽标称值，追加 8 流容量探针
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 10.96 GiB / 5 个样本；含 1 个完整样本的 retry allowance；预计总耗时约 47s
+[*] Conservative upper bound：剩余 131.70 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[*] 扫描结论: no-knee-clean；决策置信度 medium (75/100, single-sample)
+[*] 完整结果: /tmp/tmp.Sg61s2J8iB/state/history/20261112T225454Z-sweep
+==> test_receiver_fallback_reduces_confidence
+==> test_final_verify_uses_receiver_and_clean_reference
+==> test_traffic_bound_is_finite
+v8.0.5 measurement rewrite tests: PASS
+==> tests/test_network_v721.sh
+[!] 检测到 2 条 IPv4 默认路由；将以具体测速目标的 route-get 结果决定是否可安全继续
+[*] 测速目标路由检查通过: peer.example -> eth0
+[*] 已将整形持久化接口固化为实际网卡: eth7
+
+[+] BBR + FQ 基础调优和持久化提交完成（未运行测速）
+[*] 测速目标路由检查通过: 1.1.1.1 (IPv4) -> eth0
+network v7.2.1 tests: PASS
+==> tests/test_nic_v800.sh
+==> test_strict_policy_layout_and_identity
+==> test_immutable_baseline_rejects_reused_interface_identity
+[+] 已保存网卡原始 qdisc 基线: eth3 (snapshot)
+==> test_global_model_and_config_invariants
+==> test_auto_stage_uses_global_aggregate_but_persists_target_model
+==> test_tc_enable_does_not_copy_another_nic_global_model
+==> test_read_only_plan_includes_aggregate_effect
+==> test_ownership_gate
+==> test_restore_preflight_rejects_external_filter_before_writes
+==> test_restore_preflight_rejects_mq_queue_drift_before_writes
+==> test_apply_failure_rolls_back_every_interface_and_global_runtime
+==> test_apply_rollback_failure_preserves_snapshot
+==> test_runtime_transaction_rejects_late_filter_before_global_writes
+==> test_snapshot_failure_is_write_free
+==> test_policy_enumerator_failure_is_write_free
+==> test_route_snapshot_failure_is_write_free
+==> test_multi_transaction_snapshots_policy_and_legacy_interfaces
+==> test_multi_transaction_snapshot_failure_is_write_free
+==> test_legacy_single_nic_migration
+[+] 已把旧版单网卡配置迁移为独立策略: eth0/shape
+==> test_legacy_delegate_restores_v8_interfaces_first
+[*] TCP 基线校验通过: legacy-reference / legacy-reference / eth0
+[*] 将恢复操作交给迁移时保存的旧版本工具
+[+] 旧版可信基线恢复完成
+==> test_cli_contract
+multi-NIC v8.0.0 tests: OK
+==> tests/test_path_v730.sh
+==> test_route_and_endpoint_fingerprints
+==> test_gateway_table_and_mtu_drift_is_rejected
+[*] 已冻结测速路径: peer.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, path 770bbac40861）
+[*] 已冻结测速路径: peer.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, path 770bbac40861）
+[*] 已冻结测速路径: peer.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, path 770bbac40861）
+==> test_stable_profile_and_pmtu
+[*] 已冻结测速路径: peer.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, path 770bbac40861）
+==> test_ipv6_tcp_mss_math
+==> test_unstable_and_unknown_profiles
+[*] 已冻结测速路径: peer.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, path 770bbac40861）
+[!] 路径画像不稳定（icmp-loss-high,jitter-high）；已按 --force-scan 继续，仅供人工判断
+[*] 已冻结测速路径: peer.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, path 770bbac40861）
+[!] 路径画像不完整或置信度有限（icmp-unavailable,pmtu-unavailable）；测量可以继续，但结论会降级
+==> test_history_and_latest_path
+[*] 已冻结测速路径: peer.example -> 203.0.113.10（IPv4, src 192.0.2.10, dev eth0, path 770bbac40861）
+[*] 空闲 RTT 基线: 2 ms
+[*] 路径画像: /tmp/tmp.Ar3eV6wA1T/state/history/20261112T225504Z-path
+==> test_path_confidence_penalty
+path v7.3.0 tests: OK
+==> tests/test_sysctl_provider_v803.sh
+sysctl provider v8.0.3 regression tests: OK
+==> tests/test_systemd_v803.sh
+[+] 已保存不可覆盖的初始基线: /tmp/tmp.3I2Awx7864/baseline-missing/state/baseline (adopt-current)
+[*] 已创建本次操作回滚点: /tmp/tmp.3I2Awx7864/action-missing/state/.transaction.uSZMst
+[*] 自动调优出口检查通过: eth0（未运行测速）
+[*] 已创建本次操作回滚点: /tmp/tmp.3I2Awx7864/action-missing/state/.transaction.H4zuIN
+[*] 已创建本次操作回滚点: /tmp/tmp.3I2Awx7864/action-missing/state/.transaction.ECbrhx
+systemd v8.0.3 regression tests: OK
+==> tests/test_tc_v721.sh
+tc v7.2.1 tests passed
+==> tests/test_transaction_v803.sh
+transaction v8.0.3 regression tests: OK
+==> tests/test_v804.sh
+==> test_single_ipv6_nhid_default_passes
+[*] 自动调优出口检查通过: eth0（未运行测速）
+==> test_fibmatch_single_nhid_passes
+==> test_nhid_exact_get_dump_fallback
+==> test_nhid_fail_closed_matrix
+==> test_dirty_path_control_is_inconclusive_and_low_confidence
+==> test_public_dirty_path_restarts_on_next_peer
+[!] 当前公共对端低速 path control 判定 PATH_DIRTY；下一个候选将重新执行完整实验
+[!] 切换到备用公共对端 2/2: clean.example:5201（干净/ProviderB，RTT 2ms）
+==> test_all_public_dirty_rolls_back_without_persisting
+==> test_final_verification_fallback_boundaries
+==> test_local_fallback_rechecks_frozen_path
+v8.0.4 regression tests: PASS
+==> tests/test_v806.sh
+[!] 忽略损坏的 peer health 记录并原子重建: /tmp/tmp.B5nhk3igL0/state/peer-health/endpoint-1a9f2da3113f4e18a14744a71fc6667bcdc5e13a07e489fe9065c3f4cf7f07d1.tsv
+[+] 仅 peer health cache 已删除；baseline、history、config 和网络状态均未改变
+[!] 诊断包将包含完整网络地址；hostname、MAC、机器身份与 secret 仍会脱敏
+v8.0.6 reliability/diagnostics tests: PASS
+==> tests/test_v806_budget_guard.sh
+[*] saturation: 5s × 1 flow(s), sample 1/2
+[*] saturation: 5s × 1 flow(s), sample 2/2
+v8.0.6 hard-budget guard tests: PASS
+==> tests/test_v806_hardening.sh
+==> test_global_operation_budget_lifetime
+==> test_formal_peer_precheck_traffic_is_accounted
+==> test_budget_exhaustion_rolls_back_without_commit
+==> test_peer_reputation_decay_and_relative_capacity
+==> test_real_production_measurement_fixtures
+[*] PATH_CONTROL: 80 Mbit/s（标称速率的 40%）
+[*] SATURATION: receiver 191.38 Mbit/s, retrans-est 5.38%（疑似 policer；不是脏路径判据）
+[*] 动态预算评估（standard；已完成 SATURATION/PATH_CONTROL）：hard budget 6.00 GiB，已用 0 B，剩余 6.00 GiB
+[*] Expected traffic：剩余约 2.49 GiB / 20 个样本；含 2 个完整样本的 retry allowance；预计总耗时约 152s
+[*] Conservative upper bound：剩余 72.71 GiB（包含有界复验/失败重试；不是必然消耗）；Hard budget 始终由接口 TX 与逐样本预留强制执行
+[*] 估算不确定性高：假设拐点位于实测容量约 108% 附近；实际拐点、公共对端竞争和重试可能显著改变流量/时间
+[*] 低速干净参考: 169.28/183，后续最低可接受效率比 0.90653
+[!] rate-210: 重传跳变经 3 次实验确认（3/3）
+[+] 扫描完成: last clean=209 Mbit, break=210 Mbit, 推荐=202 Mbit
+[*] 候选档已通过扫描确认；最终单双流复验通过后才会持久化
+[*] 扫描结论: recommend；决策置信度 medium (75/100, single-sample)
+[*] 完整结果: /tmp/tmp.OAG0cD18KB/state/history/20261112T225523Z-sweep
+==> test_profile_safety
+[!] quick-spike: 重传跳变经 3 次实验确认（2/3）
+==> test_failure_summary_after_outer_rollback
+==> test_status_measurement_age_and_semantics
+==> test_no_network_read_only_commands
+==> test_state_parsing_and_tsv_sanitization
+==> test_rc_registry_and_dispatch
+==> test_telemetry_failure_boundary
+==> test_doctor_export_prune_locking
+[+] measurement history 已清理，仅保留最近 1 次；baseline/config/transaction 未改变
+==> test_production_peer_churn_operation
+[!] 忽略损坏的 peer health 记录并原子重建: /tmp/tmp.OAG0cD18KB/state/peer-health/endpoint-1a9f2da3113f4e18a14744a71fc6667bcdc5e13a07e489fe9065c3f4cf7f07d1.tsv
+[!] 切换到备用公共对端 2/4: speedtest.hkg12.hk.leaseweb.net:5201（香港/Leaseweb，RTT 40ms）
+[!] 切换到备用公共对端 3/4: speedtest.sin1.sg.leaseweb.net:5201（新加坡/Leaseweb，RTT 60ms）
+[!] 切换到备用公共对端 4/4: speedtest.tyo11.jp.leaseweb.net:5202（东京/Leaseweb，RTT 12ms）
+[!] 最终复验切换到同主机备用端口: speedtest.tyo11.jp.leaseweb.net:5201
+[!] 最终 verify path profile 不是 trusted（missing）；保留完整 sweep path profile 作为状态依据
+[+] 自动调优、复验和持久化提交完成
+[*] 最终复验置信度: medium (85/100, peer-failover)
+[*] 扫描记录: /tmp/tmp.OAG0cD18KB/state/history/20260915T170004Z-sweep/summary.tsv
+v8.0.6 post-hardening tests: PASS
+==> tests/test_v807_pmtu.sh
+==> test_ipv4_full_mtu_success
+==> test_single_transient_timeout_recovers
+==> test_definitive_too_large_binary_search
+==> test_ambiguous_only_is_inconclusive
+==> test_ipv6_overhead_and_packet_too_big
+==> test_tokyo_977_production_regression
+==> test_final_verify_provenance_and_immutability
+v8.0.7 PMTU/provenance tests: PASS
+==> tests/test_v808_budget_failure_semantics.sh
+v8.0.8 P3-RC1 budget failure semantics: PASS
+==> tests/test_v808_budget_feasibility.sh
+200M expected remaining: 3.17 GiB
+1.14G standard expected remaining: 17.82 GiB
+1.14G quick expected remaining: 12.99 GiB
+v8.0.8 budget feasibility: PASS
+==> tests/test_v808_decision_confidence.sh
+v8.0.8 decision confidence: PASS
+==> tests/test_v808_history_tsv_integrity.sh
+[*] saturation: 5s × 1 flow(s), sample 1/2
+[!] 2 秒后重试（1/3）
+[!] 2 秒后重试（2/3）
+[*] saturation: 5s × 1 flow(s), sample 2/2
+[!] 吞吐离散度 99.03% 超过 6%，追加第 3 个样本
+[*] saturation: 5s × 1 flow(s), sample 3/3
+v8.0.8 history TSV integrity: PASS
+==> tests/test_v808_incomplete_knee.sh
+v8.0.8 incomplete knee / production fixture: PASS
+==> tests/test_v808_peer_health_semantics.sh
+[*] busy-then-success: 3s × 1 flow(s), sample 1/1
+[!] iperf3 speedtest.hkg12.hk.leaseweb.net:5201（64.120.117.34）测试失败: the server is busy running a test
+[!] 2 秒后重试（1/3）
+v8.0.8 peer health semantics: PASS
+==> tests/test_v808_reference_representativeness.sh
+v8.0.8 reference representativeness: PASS
+==> ShellCheck
+==> All checks passed
+==> tests/integration_iperf_family.sh
+[*] 已冻结测速路径: dualstack.integration -> 198.51.100.2（IPv4, src 198.51.100.1, dev b8ifh66479, port 5231, path 129248b7022d）
+[!] 跳过 198.51.100.2:5232（IPv4）：TCP/iperf3 预检不可用
+[*] 已冻结测速路径: dualstack.integration -> 2001:db8:801::2（IPv6, src 2001:db8:801::1, dev b8ifh66479, port 5232, path fdbb8a9dbc86）
+[*] 已冻结测速路径: 2001:db8:801::2 -> 2001:db8:801::2（IPv6, src 2001:db8:801::1, dev b8ifh66479, port 5232, path fdbb8a9dbc86）
+[*] 已冻结测速路径: 2001:db8:803::2 -> 2001:db8:803::2（IPv6, src 2001:db8:802::1, dev b8ifh66479, port 5233, path 5e1e5ec4eea6）
+[*] 空闲 RTT 基线: 0.034 ms
+iperf family integration test: OK (b8ifh66479)
+==> tests/integration_ipv6_policy.sh
+[+] IPv6 已临时禁用（保留 lo/::1）
+[+] IPv6 策略与运行时一致: disabled-temporary
+[+] IPv6 策略与运行时一致: disabled-temporary
+[+] IPv6 disable flags 已按逐接口基线精确恢复；地址和路由仅保留诊断快照，不作重放
+[+] IPv6 native 策略验证通过
+[+] IPv6 已永久禁用（保留 lo/::1）
+[+] IPv6 策略与运行时一致: disabled-persistent
+[+] IPv6 策略与运行时一致: disabled-persistent
+[+] IPv6 disable flags 已按逐接口基线精确恢复；地址和路由仅保留诊断快照，不作重放
+[+] IPv6 native 策略验证通过
+integration IPv6 policy tests passed
+==> tests/integration_measure.sh
+[*] 空闲 RTT 基线: 0 ms
+[*] 已冻结测速路径: 127.0.0.1 -> 127.0.0.1（IPv4, src 127.0.0.1, dev lo, port 5209, path 84f4fb253c76）
+[*] integration: 3s × 1 flow(s), sample 1/2
+[*] 已冻结测速路径: 127.0.0.1 -> 127.0.0.1（IPv4, src 127.0.0.1, dev lo, port 5209, path 84f4fb253c76）
+[*] integration: 3s × 1 flow(s), sample 2/2
+[*] 已冻结测速路径: 127.0.0.1 -> 127.0.0.1（IPv4, src 127.0.0.1, dev lo, port 5209, path 84f4fb253c76）
+[*] 已冻结测速路径: 127.0.0.1 -> 127.0.0.1（IPv4, src 127.0.0.1, dev lo, port 5209, path 84f4fb253c76）
+[*] 测速环境预检: CPU 2.60% / steal 0.00% / load 2.23/16 CPU / 背景 TX 0.00 Mbit/s / RX 0.00 Mbit/s / established 0
+[*] 空闲 RTT 基线: 0.027 ms
+[*] PRE_VERIFY 冷却 3s（rate=0 Mbit/s, sample=3s）
+[*] verify-single: 3s × 1 flow(s), sample 1/2
+[*] verify-single: 3s × 1 flow(s), sample 2/2
+[*] verify-multi-4: 3s × 4 flow(s), sample 1/2
+[*] verify-multi-4: 3s × 4 flow(s), sample 2/2
+[+] 验证完成: 单流 984.94 Mbit/s，多流(4) 992.65 Mbit/s
+[*] 负载 RTT p95: 单流 0.960 ms，多流 4.21 ms；置信度 high (100/100)
+[*] 验证结果: /tmp/tmp.9MDBYoqHVn/state/history/20261112T225734Z-verify
+[*] 本轮接口流量: TX 1.40 GiB, RX 1.40 GiB
+[*] 测量预算累计: TX 1.40 GiB / 6.00 GiB, 时间 23s / 900s
+measurement integration test: OK
+==> tests/integration_multi_nic.sh
+[+] 已保存网卡原始 qdisc 基线: bbrv8a (snapshot)
+[+] 已保存网卡原始 qdisc 基线: bbrv8b (snapshot)
+[+] 多网卡运行时与策略一致
+[+] 多网卡运行时与策略一致
+multi-NIC integration test: OK (bbrv8a + bbrv8b)
+==> tests/integration_nhid.sh
+nhid integration tests: PASS
+==> tests/integration_path.sh
+[*] 已冻结测速路径: 198.51.100.2 -> 198.51.100.2（IPv4, src 198.51.100.1, dev bvph80956, path 391da0084a53）
+[*] 空闲 RTT 基线: 0.026 ms
+Target                 198.51.100.2 -> 198.51.100.2
+Route                  IPv4 / src 198.51.100.1 / dev bvph80956
+Gateway / table        none / main
+Route fingerprint      391da0084a5365ccf9d6d22add425387a88367f832e2573a01e4d199a550237d
+RTT distribution       min 0.026 / median 0.026 / p95 0.135 / max 0.135 ms
+Jitter / ICMP loss     0.11 ms / 0.00% (3/3)
+Gateway RTT            na ms
+MTU / PMTU / MSS       1500 / 1500 / 1460
+PMTU evidence          full-mtu-confirmed
+Path class             local / stable
+Path confidence        high (100/100)
+Tuning decision        trusted (clean)
+[*] 路径画像: /tmp/tmp.bZyIflgxkP/state/history/20261112T225812Z-path
+[*] 已冻结测速路径: 198.51.100.2 -> 198.51.100.2（IPv4, src 198.51.100.1, dev bvph80956, path 391da0084a53）
+[*] 空闲 RTT 基线: 0.02850 ms
+[*] 路径画像: /tmp/tmp.bZyIflgxkP/no-pmtu/state/history/20261112T225814Z-path
+[*] 已冻结测速路径: 198.51.100.2 -> 198.51.100.2（IPv4, src 198.51.100.1, dev bvph80956, path 391da0084a53）
+path integration test: OK (bvph80956)
+[x] 测速端点路径指纹发生变化；拒绝使用本次样本
+==> tests/integration_signal_cleanup.sh
+Terminated
+tests/integration_signal_cleanup.sh: line 71: 83234 Hangup                  ( set -Eeuo pipefail; STATE_DIR="$state_root"; PERSIST_DIR="$TEST_ROOT/persisted-$signal-$rollback_mode/persist"; ACTION_TRANSACTION_DIR="$dir"; ACTION_TRANSACTION_IFACE=eth0; ACTION_TRANSACTION_INTERFACES=eth0; ACTION_TRANSACTION_READY=1; ACTION_TRANSACTION_MUTATED=0; ACTION_TRANSACTION_ROLLING_BACK=0; ACTION_TRANSACTION_ROLLBACK_FAILED=0; LOCK_HELD=0; QDISC_DEFAULT_TRANSACTION_ACTIVE=0; NIC_RUNTIME_TRANSACTION_DIR=""; TC_TRIAL_IFACE=""; TC_TRIAL_SNAPSHOT=""; MEASURE_IFACE=""; MEASURE_SNAPSHOT=""; DNS_TRANSACTION_DIR=""; IPV6_TRANSACTION_DIR=""; function action_transaction_begin_multi () 
+{ 
+    :
+}; if [[ "$rollback_mode" == fail ]]; then
+    function action_transaction_snapshot_validate () 
+    { 
+        ((snapshot_checks+=1));
+        (( snapshot_checks == 1 ))
+    };
+else
+    function action_transaction_snapshot_validate () 
+    { 
+        :
+    };
+fi; function action_transaction_quiesce_unit_for_restore () 
+{ 
+    :
+}; function action_transaction_restore_path () 
+{ 
+    printf 'restore-path:%s\n' "$2" >> "$events"
+}; function action_transaction_restore_tree () 
+{ 
+    :
+}; function restore_tcp_sysctl_snapshot_file () 
+{ 
+    :
+}; function action_transaction_restore_routes () 
+{ 
+    :
+}; function restore_action_qdisc () 
+{ 
+    :
+}; function action_transaction_restore_unit () 
+{ 
+    :
+}; function release_lock () 
+{ 
+    printf 'cleanup-latch:%s\n' "$ACTION_TRANSACTION_ROLLBACK_FAILED" >> "$events"
+}; function systemctl () 
+{ 
+    [[ "$1" == daemon-reload ]]
+}; function auto_tune_execute () 
+{ 
+    printf 'body:%s\n' "$(<"$ACTION_TRANSACTION_DIR/transaction.state")" >> "$events";
+    kill "-$signal" "$BASHPID";
+    sleep 5;
+    printf 'continued-after-signal\n' >> "$events"
+}; function action_transaction_commit () 
+{ 
+    printf 'commit\n' >> "$events"
+}; trap cleanup_core_exit EXIT; auto_tune_run_transaction eth0 balanced mixed 0 100 0 )
+Terminated
+Terminated
+Terminated
+Terminated
+Terminated
+Terminated
+Terminated
+tests/integration_signal_cleanup.sh: line 193: 83297 Hangup                  ( set -Eeuo pipefail; ACTION_TRANSACTION_DIR=""; ACTION_TRANSACTION_IFACE=""; ACTION_TRANSACTION_MUTATED=0; trap cleanup_core_exit EXIT; auto_tune_run_transaction eth0 balanced mixed 0 100 0 )
+integration signal cleanup tests passed
+==> tests/integration_tc.sh
+IPv6 RA expiry transaction test: OK
+handle-0 restore test: OK (ifb, kind=fq_codel, default=kernel-observed)
+clsact preservation test: OK (bbrcls0)
+tc integration test: OK (eth0)
+==> tests/integration_tcp_sysctl_snapshot.sh
+real sysctl snapshot integration: OK

@@ -2,7 +2,7 @@
 
 BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-当前开发版本：v8.0.7
+当前正式版本：[v8.0.8](https://github.com/ike-sh/bbrv3-lite/releases/tag/v8.0.8)
 
 项目不追求“sysctl 越多越好”。默认配置保持克制。命令行 `measure` 只给出结果；交互式 `auto` 会在一次总确认后完成测量、决策、应用和复验，未发现可信拐点时保持纯 FQ。
 
@@ -247,7 +247,7 @@ sudo bbr measure sweep \
 6. `PRE_SCAN`、`SPIKE_RECHECK`、`BETWEEN_LEVEL` 和 `PRE_VERIFY` 使用不同冷却预算；粗扫较短，尖峰确认和最终候选较长。摘要记录样本数与流量上界，超过污染、CPU 或稳定性门槛时停止并恢复。
 7. 最后干净档位按 `--margin` 退让并再次确认。最终 verify 同样使用 receiver 和低速干净参考；任何端点/来源/出口/路由/FIB/MTU 指纹漂移仍会使结果失效。
 
-核心状态为 `CLEAN_NO_POLICER`、`CLEAN_POLICER_FOUND`、`PATH_DIRTY`、`MEASUREMENT_UNSTABLE`，预算耗尽另记 `MEASUREMENT_BUDGET_EXCEEDED`。公共 peer 只有在低速 control 脏、对端不可用或过慢、服务繁忙、测量持续不稳定或路径漂移时才切换；“干净 control + lossy saturation”不会触发中途换 peer。
+核心状态为 `CLEAN_NO_POLICER`、`CLEAN_POLICER_FOUND`、`PATH_DIRTY`、`MEASUREMENT_UNSTABLE`；不能在预算内继续或完成时兼容记录 `MEASUREMENT_BUDGET_EXCEEDED`，具体原因见 budget subtype。公共 peer 只有在低速 control 脏、对端不可用或过慢、服务繁忙、测量持续不稳定或路径漂移时才切换；“干净 control + lossy saturation”不会触发中途换 peer。
 
 `quick` 缩短 coarse 样本并减少干净样本，`standard` 保持 v8.0.5 的采样次数、持续时间和冷却行为，`strict` 增加 control/capacity/candidate/final-verify 样本并延长冷却。三种深度都保留路径指纹、2/3 spike confirmation、candidate confirmation、最终单双流 verify 和外层事务。
 
@@ -737,6 +737,32 @@ tag 推送会触发 Release 工作流，验证 tag 与脚本版本一致，并�
 - **IPv6 and scale coverage**：route identity 改为 resolved leaf semantics，忽略 RA lifetime 和等价 leaf 的 nhid ID churn，继续拒绝 nexthop group/ECMP；确定性矩阵覆盖 100M/20ms 到 10G/250ms、single-flow limited/aggregate discovery、CPU/steal/background contamination 和 v8.0.5 真实 200M regression fixture。
 - **Update/dry-run**：更新后复验语法、版本、checksum 和 systemd 副本同步但不 apply 网络；`auto --dry-run` 只做本地检测、依赖/路径说明与预算规划，显式 `--peer` 时可进行 DNS/route discovery，但不 ping、不做 TCP precheck、不运行 iperf，也不创建项目状态。输出明确说明没有系统修改、没有吞吐测量；它不是“完全离线”模式。
 - **Repair**：v8.0.6 未提供自动 `repair`。未知拓扑和第三方 TC 仍坚持 diagnose/explain/fail safe；用户可依据 `verify`/`doctor` 的具体差异显式重新安装或重新调优。
+
+## v8.0.8 High-Bandwidth Measurement Reliability
+
+高带宽测量在 SATURATION/PATH_CONTROL 完成后、第一次扫描前评估剩余工作。`budget-plan.tsv` 分开记录实测推导的 `EXPECTED_REMAINING_TX`、包含同档复验、下降控制点、精扫、候选确认、单双流 final verify 及有界失败重试的 `CONSERVATIVE_REMAINING_UPPER_BOUND`，以及真实执行的 `HARD_BUDGET_BYTES`、接口计数得到的已用/剩余 TX。预算不是完成保证；默认仍为 6 GiB，不因预测结果自动提高。
+
+预期模型是假设拐点接近实测接收容量 108% 的普通搜索场景，包含显式 retry allowance；它不是精确预测。公共对端竞争、拐点位置与重试可能带来很大差异。保守上界遍历所有允许的工作分支，可能远大于预期值，不代表必然消耗。quick/standard 比较在隔离作用域计算，不改变当前 profile。预计剩余流量或时间超过预算时，交互用户可明确改选 quick、输入更高 `--max-test-gib` 或取消并 rollback；非交互模式以 RC70 安全退出并提供重新执行建议。所有选择保留同一 operation ledger 和已用 TX，不复用未验证候选。
+
+P3-RC1 保留 RC70、`budget-exceeded`、`SCAN_DECISION` 与 `MEASUREMENT_BUDGET_EXCEEDED` 的兼容口径，在 schema 1 的 summary/failure 记录中增加 `BUDGET_FAILURE_SUBTYPE`：`exhausted` 表示实际 TX 或时间达到硬上限，`insufficient-reservation` 表示仍有余额但不能安全覆盖下一阶段预留，`feasibility-rejected` 表示实测容量发现后的剩余计划预计不可完成。后三者中的预留不足和可完成性拒绝不会显示“硬预算已耗尽”；缺少足够证据的旧历史显示 `unknown`，不会补造分类。
+
+`BUDGET_LIMIT_BYTES`、`BUDGET_USED_BYTES`、`BUDGET_REMAINING_BYTES`、`BUDGET_REQUIRED_RESERVATION_BYTES` 及对应 seconds 字段保存拒绝发生时的快照；`TEST_TX_BYTES_USED` 仍是最后一次接口计量，二者可能因后续控制/背景流量而不同。`BUDGET_FEASIBILITY_REASON` 标注 TX/时间维度。`BUDGET_RESERVATION_SEMANTICS=next-stage-reservation` 表示下一阶段安全预留，`expected-remaining-plan` 表示触发既有 feasibility gate 的 expected 剩余计划；它不等于保守分支 upper，也不是已经发送或扣除的流量。CLI Failure summary、`history` 列表、`history latest/show` 使用相同子类型；旧文件只读解释，不迁移或重写。预算失败仍为 FAILURE、low/inconclusive、无 confirmed knee/recommendation，并按实际结果报告 rollback/persistence。
+
+`LOSS_CLEAN` 与 `THROUGHPUT_REPRESENTATIVE` 分开：初始 clean throughput reference 必须满足原算法已有的 0.75 效率下限；之后按该参考推导既有动态效率门槛。低重传但吞吐不足时先冷却、同档有界复验，最多三个实验，取得两个有效干净样本且满足原有 6% 稳定度门槛才恢复参考资格；两个低效样本已经不可能达到 quorum 时提前 inconclusive/peer-too-slow。已有可靠参考和 saturation 丢包证据时，同档重复确认的稳定平台可参与原有两个档位 stall 判据，但不更新 LAST_CLEAN、不成为 clean reference，且仍需候选确认与 final verify。重传尖峰的 2/3 确认和所有原有 knee/margin/verify 阈值保持不变。
+
+`sample-events.tsv` 记录 dispersion 追加原因、outlier、最终代表样本、最终离散度，以及 `LOSS_CLEAN` / `THROUGHPUT_REPRESENTATIVE` / `PEER_LIMITED` / `PATH_DIRTY` / `CONTAMINATED`。SATURATION 仍以接收中位数附近的真实完整 tuple 作为代表；PATH_CONTROL 语义与阈值不变。
+
+summary 明确区分 `LAST_CLEAN`、`SUSPECTED_BREAK`、`CONFIRMED_BREAK`、`CONFIRMED_KNEE`。兼容字段 `LAST_OK` 保留；`KNEE_MBIT` 仅在完成确认后作为 `CONFIRMED_KNEE` 的别名。不完整扫描保留审计证据，但 knee、recommendation 为空。history 读取 v8.0.5–7 时会检查确认链，避免把旧 `KNEE_MBIT=LAST_OK` 的未完成记录显示成已确认 knee。
+
+sample confidence 评价已采集样本的遥测质量；decision confidence 评价证据链是否完成。budget exceeded、peer unavailable、bad baseline、path dirty、unstable samples、无已确认 knee、候选未确认和 final verify failed 均为 low/inconclusive。只有完成 clean-no-policer 或 confirmed-policer 所需实验的结论才可继承样本置信度；自动调优还结合 final verify 置信度。兼容 `CONFIDENCE_*` 表示决策置信度。失败或 rollback 后清空 recommendation，并同步降级 originating sweep 的决策。
+
+`peers` 显示独立单位：Sample success 为有效 iperf 会话数（包括未完成 sweep 中的样本），Completed sweeps 为成功 sweep 次数，Completed ops 为旧版成功操作数；Busy/Reset/Timeout 为失败 iperf 尝试次数。schema 1 继续可读，并在新事件到来时原子迁移为 schema 2；新样本/sweep 计数不倒推旧记录，记录起算时间。评分采用独立的近期 iperf 尝试窗口和到期 penalty，仍以 live precheck 为准。缺少 RTT 显示 `n/a`。
+
+`samples.tsv` 保持 20 列 schema 与原小数文本，写入前验证单元格不会注入 Tab/换行。原六组 v8.0.8 测试及 P3-RC1 budget semantics 回归覆盖 1.14G 预算中断、参考样本资格、置信度、Peer Health、TSV 与历史兼容。P2 已直接确认旧生产原文件为 20 列、11 条数据，hash 不变；P3 的旧构建实测证据和 P3-RC1 的新构建证据分别记录。P3-RC1 已完成独立差异审计及真实 VPS 只读重放，当前资格为 `P3_QUALIFIED`：未变预算执行和 rollback 路径继承原 P3 真实证据，新诊断输出由 RC1 构建隔离重放验证，未重复真实 iperf 或网络变更。低效参考和未完成 spike 的真实覆盖仍为 `NOT EXERCISED / FIXTURE PASS`；不代表完整 auto 已实机通过。
+
+完整本地调查和验证证据见 [v8.0.8 High-Bandwidth Reliability Report](docs/v8.0.8-high-bandwidth-reliability-report.md)。
+
+本次资格依据见 [P3-RC1 Targeted Qualification Report](docs/v8.0.8-p3-rc1-targeted-qualification-report.md)，最终发布门禁修复和验证见 [Final Audit Blocker Resolution Report](docs/v8.0.8-final-audit-blocker-resolution-report.md)，发布内容见 [v8.0.8 Release Notes](docs/release-notes-v8.0.8.md) 和 [CHANGELOG](CHANGELOG.md)。默认安装器解析最新正式 GitHub Release 并校验 SHA256。公共 iperf 可用性会变化，高带宽实测会消耗真实流量，部分异常样本仅有 deterministic fixture 覆盖；Automatic Repair 尚未实现。
 
 ## v8.0.7 PMTU Evidence / Final Path Provenance
 

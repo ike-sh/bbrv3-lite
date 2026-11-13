@@ -1,0 +1,16 @@
+ID                 20261112T163249Z-sweep
+Time               2026-11-12T16:32:52Z
+Operation          sweep
+Peer               speedtest.hkg12.hk.leaseweb.net
+Result             FAILURE
+Decision           budget-exceeded
+Last clean         1160
+Suspected break    1222
+Confirmed break    none
+Knee               none/unconfirmed
+Sample confidence  high
+Decision confidence low
+Recommendation     none
+Verify             none
+Traffic TX         5.35 GiB
+Failure reason     budget-exceeded

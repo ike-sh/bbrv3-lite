@@ -214,7 +214,7 @@ test_peer_health_lifecycle() (
     peer_health_load "$file" || fail "corrupt peer cache was not rebuilt"
     assert_eq 1 "$PH_SUCCESS_COUNT" "corrupt cache rebuild count"
 
-    sed -i 's/^SCHEMA\t1$/SCHEMA\t2/' "$file"
+    sed -i 's/^SCHEMA\t2$/SCHEMA\t99/' "$file"
     old_hash=$(sha256sum "$file" | awk '{print $1}')
     if peer_health_record "$host" 4 203.0.113.10 5201 success none 18 920 clean >/dev/null 2>&1; then
         fail "newer peer-health schema was overwritten"
@@ -222,7 +222,7 @@ test_peer_health_lifecycle() (
     new_hash=$(sha256sum "$file" | awk '{print $1}')
     assert_eq "$old_hash" "$new_hash" "newer schema immutability"
 
-    sed -i 's/^SCHEMA\t2$/SCHEMA\t1/' "$file"
+    sed -i 's/^SCHEMA\t99$/SCHEMA\t2/' "$file"
     old_hash=$(sha256sum "$file" | awk '{print $1}')
     mv() { return 9; }
     if peer_health_record "$host" 4 203.0.113.10 5201 success none 18 920 clean >/dev/null 2>&1; then fail "interrupted atomic write reported success"; fi

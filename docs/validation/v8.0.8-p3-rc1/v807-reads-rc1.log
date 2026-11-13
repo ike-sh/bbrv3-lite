@@ -1,0 +1,11 @@
+ID                 20261112T220549Z-sweep
+Time               2026-11-12T22:43:46Z
+Operation          sweep
+Peer               fixture.example
+Result             FAILURE
+Decision           budget-exceeded
+Knee               none
+Recommendation     none
+Verify             none
+Traffic TX         2.39 GiB
+Failure reason     budget-exceeded

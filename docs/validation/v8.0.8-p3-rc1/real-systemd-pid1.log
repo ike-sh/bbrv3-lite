@@ -1,0 +1,64 @@
+==> Docker validation: Debian 12 with systemd-resolved as a real service
+Policy module        DNS
+Requested policy     plain
+Current policy       native
+Decision             ready
+Action               install-plain
+Resolver owner       systemd-resolved
+Resolved lifecycle   enabled/active
+Routing domains      simple
+Risks                plaintext-dns
+Reason               显式配置普通公共 DNS；不会由 strict-dot 自动降级到该策略
+Plan mutation        none (read-only)
+[+] DNS 策略已应用: plain
+[+] DNS 策略与运行时一致: plain
+Policy module        DNS
+Requested policy     native
+Current policy       plain
+Decision             ready
+Action               restore-baseline
+Resolver owner       systemd-resolved
+Resolved lifecycle   enabled/active
+Routing domains      simple
+Risks                none
+Reason               恢复首次可信 DNS 基线；不推测或重建原解析器配置
+Plan mutation        none (read-only)
+[+] DNS 已恢复到首次修改前状态
+[+] DNS native 策略验证通过：项目未接管当前解析器
+Policy module        DNS
+Requested policy     strict-dot
+Current policy       native
+Decision             ready
+Action               install-strict-dot
+Resolver owner       systemd-resolved
+Resolved lifecycle   enabled/active
+Routing domains      simple
+Risks                none
+Reason               配置经认证 DoT；任何验证失败都会恢复操作前状态，不降级
+Plan mutation        none (read-only)
+[+] DNS 策略已应用: strict-dot
+[+] DNS 策略与运行时一致: strict-dot
+Policy module        DNS
+Requested policy     native
+Current policy       strict-dot
+Decision             ready
+Action               restore-baseline
+Resolver owner       systemd-resolved
+Resolved lifecycle   enabled/active
+Routing domains      simple
+Risks                none
+Reason               恢复首次可信 DNS 基线；不推测或重建原解析器配置
+Plan mutation        none (read-only)
+[+] DNS 已恢复到首次修改前状态
+[+] DNS native 策略验证通过：项目未接管当前解析器
+integration systemd-resolved tests passed
+[+] 已保存不可覆盖的初始基线: /var/tmp/bbrv3-unit-state.WtJknl/state/baseline (adopt-current)
+[*] 已创建本次操作回滚点: /var/tmp/bbrv3-unit-state.WtJknl/state/.transaction.HkkW92
+[*] 已创建本次操作回滚点: /var/tmp/bbrv3-unit-state.WtJknl/state/.transaction.rjylMx
+[*] 已创建本次操作回滚点: /var/tmp/bbrv3-unit-state.WtJknl/state/.transaction.dvlhVZ
+Created symlink /etc/systemd/system/multi-user.target.wants/bbrv3-lite-v803-missing.service → /etc/systemd/system/bbrv3-lite-v803-missing.service.
+Removed "/etc/systemd/system/multi-user.target.wants/bbrv3-lite-v803-missing.service".
+Created symlink /etc/systemd/system/multi-user.target.wants/bbrv3-lite-v803-missing.service → /etc/systemd/system/bbrv3-lite-v803-missing.service.
+Created symlink /etc/systemd/system/multi-user.target.wants/bbrv3-lite-v803-missing.service → /etc/systemd/system/bbrv3-lite-v803-missing.service.
+integration systemd unit-state tests passed
+==> Docker validation matrix passed

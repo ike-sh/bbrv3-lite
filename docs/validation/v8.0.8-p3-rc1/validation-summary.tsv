@@ -1,0 +1,46 @@
+CHECK	STATUS	DETAIL
+tests/test_baseline_v803.sh	PASS	final new build; local and all four privileged images
+tests/test_core.sh	PASS	final new build; local and all four privileged images
+tests/test_dns_policy_v740.sh	PASS	final new build; local and all four privileged images
+tests/test_dns_v721.sh	PASS	final new build; local and all four privileged images
+tests/test_installer.sh	PASS	final new build; local and all four privileged images
+tests/test_iperf_family_v801.sh	PASS	final new build; local and all four privileged images
+tests/test_ipv6_policy_v740.sh	PASS	final new build; local and all four privileged images
+tests/test_ipv6_v721.sh	PASS	final new build; local and all four privileged images
+tests/test_ipv6_warning_v803.sh	PASS	final new build; local and all four privileged images
+tests/test_measure_v721.sh	PASS	final new build; local and all four privileged images
+tests/test_measure_v805.sh	PASS	final new build; local and all four privileged images
+tests/test_network_v721.sh	PASS	final new build; local and all four privileged images
+tests/test_nic_v800.sh	PASS	final new build; local and all four privileged images
+tests/test_path_v730.sh	PASS	final new build; local and all four privileged images
+tests/test_sysctl_provider_v803.sh	PASS	final new build; local and all four privileged images
+tests/test_systemd_v803.sh	PASS	final new build; local and all four privileged images
+tests/test_tc_v721.sh	PASS	final new build; local and all four privileged images
+tests/test_transaction_v803.sh	PASS	final new build; local and all four privileged images
+tests/test_v804.sh	PASS	final new build; local and all four privileged images
+tests/test_v806.sh	PASS	final new build; local and all four privileged images
+tests/test_v806_budget_guard.sh	PASS	final new build; local and all four privileged images
+tests/test_v806_hardening.sh	PASS	final new build; local and all four privileged images
+tests/test_v807_pmtu.sh	PASS	final new build; local and all four privileged images
+tests/test_v808_budget_failure_semantics.sh	PASS	final new build; local and all four privileged images
+tests/test_v808_budget_feasibility.sh	PASS	final new build; local and all four privileged images
+tests/test_v808_decision_confidence.sh	PASS	final new build; local and all four privileged images
+tests/test_v808_history_tsv_integrity.sh	PASS	final new build; local and all four privileged images
+tests/test_v808_incomplete_knee.sh	PASS	final new build; local and all four privileged images
+tests/test_v808_peer_health_semantics.sh	PASS	final new build; local and all four privileged images
+tests/test_v808_reference_representativeness.sh	PASS	final new build; local and all four privileged images
+build	PASS	final P3-RC1 build
+bash syntax	PASS	final P3-RC1 build
+ShellCheck	PASS	final P3-RC1 build
+SHA256	PASS	final P3-RC1 build
+RC70/reason compatibility	PASS	final P3-RC1 build
+legacy history read-only	PASS	final P3-RC1 build
+P3 deterministic fixture	PASS	final P3-RC1 build
+privileged:debian:12	PASS	30 test scripts + 9 integration scripts; official matrix exit 0
+privileged:debian:13	PASS	30 test scripts + 9 integration scripts; official matrix exit 0
+privileged:ubuntu:22.04	PASS	30 test scripts + 9 integration scripts; official matrix exit 0
+privileged:ubuntu:24.04	PASS	30 test scripts + 9 integration scripts; official matrix exit 0
+real-systemd-PID1	PASS	Debian 12: resolved and unit-state
+new-build-real-VPS	NOT RUN	no SSH connection or upload in repair phase
+new-real-VPS-iperf	NOT RUN	no additional campaign traffic authorized or used
+qualification	P3_NOT_QUALIFIED	await review and lightweight new-build verification

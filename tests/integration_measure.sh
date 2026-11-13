@@ -23,15 +23,13 @@ export BBRV3_MAX_CPU_BUSY_PERCENT=100
 
 # shellcheck source=../net-tcp-tune.sh
 source "$ROOT_DIR/net-tcp-tune.sh"
+# shellcheck source=helpers/iperf-server.sh
+source "$ROOT_DIR/tests/helpers/iperf-server.sh"
 require_commands iperf3 jq ping timeout
 
-iperf3 -s -p 5209 > "$TEST_ROOT/iperf-server.log" 2>&1 &
+iperf3 -s -4 -B 127.0.0.1 -p 5209 > "$TEST_ROOT/iperf-server.log" 2>&1 &
 SERVER_PID=$!
-for _ in 1 2 3 4 5; do
-    if peer_port_open 127.0.0.1 5209; then break; fi
-    sleep 1
-done
-peer_port_open 127.0.0.1 5209 || { echo "FAIL: local iperf3 server did not start" >&2; exit 1; }
+integration_wait_for_iperf_server 127.0.0.1 5209 4 127.0.0.1 "$TEST_ROOT/iperf-server.log"
 
 MEASURE_IFACE=lo
 measure_set_latency_baseline 127.0.0.1

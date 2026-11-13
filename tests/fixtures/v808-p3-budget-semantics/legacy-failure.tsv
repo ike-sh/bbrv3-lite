@@ -1,0 +1,9 @@
+SCHEMA	1
+STAGE	BUDGET_FEASIBILITY
+REASON	budget-exceeded
+EXPLANATION	测量流量或时间硬预算已耗尽
+DETAIL	expected-remaining=14640332764; remaining=3880344551; expected-duration=184; profile=standard; no next scan sample spawned
+RC	70
+ROLLBACK	complete
+PERSISTENT_CHANGES	none
+SUGGESTION	提高显式预算或改用 quick profile 后重新开始；本次不会复用未验证候选。

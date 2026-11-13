@@ -8,11 +8,11 @@ echo "==> Build single-file release"
 bash scripts/build.sh
 
 echo "==> Bash syntax"
-for file in src/*.sh scripts/*.sh tests/*.sh install-alias.sh; do bash -n "$file"; done
+for file in src/*.sh scripts/*.sh tests/*.sh tests/helpers/*.sh install-alias.sh; do bash -n "$file"; done
 bash -n net-tcp-tune.sh
 
 echo "==> Generated artifact markers"
-grep -Fq 'SCRIPT_VERSION="8.0.7"' net-tcp-tune.sh
+grep -Fq 'SCRIPT_VERSION="8.0.8"' net-tcp-tune.sh
 grep -Fq 'Configuration is data and is never sourced' net-tcp-tune.sh
 grep -Fq 'MEASURE_PEER_PORT=""' net-tcp-tune.sh
 grep -Fq 'LOCKED_PORT' net-tcp-tune.sh
@@ -93,7 +93,7 @@ fi
 echo "==> ShellCheck"
 if command -v shellcheck >/dev/null 2>&1; then
     # load_config/migrate_legacy_config intentionally accept optional paths used by sourced tests.
-    shellcheck -S warning -e SC2120 net-tcp-tune.sh scripts/*.sh tests/*.sh install-alias.sh
+    shellcheck -S warning -e SC2120 net-tcp-tune.sh scripts/*.sh tests/*.sh tests/helpers/*.sh install-alias.sh
 else
     echo "shellcheck unavailable; skipped"
 fi

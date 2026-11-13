@@ -1,0 +1,116 @@
+BRANCH codex/v8.0.8-high-bandwidth-reliability
+HEAD 0f6f686598f1a31df1f78bebb9942a6171113f6c
+Uncommitted P1 implementation plus P3-RC1 semantics repair and evidence.
+NO TAG; NO PUSH; NO RELEASE; no release commit; no VPS operation.
+Pre-existing dist and P1/P2/P3 reports preserved.
+
+ M README.md
+ M SHA256SUMS
+ M net-tcp-tune.sh
+ M scripts/validate.sh
+ M src/00-header.sh
+ M src/cli.sh
+ M src/diagnostics.sh
+ M src/measure.sh
+ M src/peer-health.sh
+ M tests/integration_iperf_family.sh
+ M tests/integration_measure.sh
+ M tests/test_core.sh
+ M tests/test_installer.sh
+ M tests/test_measure_v805.sh
+ M tests/test_v806.sh
+ M tests/test_v806_hardening.sh
+?? dist/bbrv3-lite-v8.0.6-rc-20260915.tar.gz
+?? dist/bbrv3-lite-v8.0.6-rc-20260915.tar.gz.sha256
+?? dist/bbrv3-lite-v8.0.6-rc-20260915/README-RC-TEST.txt
+?? dist/bbrv3-lite-v8.0.6-rc-20260915/SHA256SUMS
+?? dist/bbrv3-lite-v8.0.6-rc-20260915/net-tcp-tune.sh
+?? dist/bbrv3-lite-v8.0.6-rc-20260915/rc-vps-acceptance.sh
+?? dist/bbrv3-lite-v8.0.6-rc2-20260915.tar.gz
+?? dist/bbrv3-lite-v8.0.6-rc2-20260915.tar.gz.sha256
+?? dist/bbrv3-lite-v8.0.6-rc2-20260915/README-RC-TEST.txt
+?? dist/bbrv3-lite-v8.0.6-rc2-20260915/SHA256SUMS
+?? dist/bbrv3-lite-v8.0.6-rc2-20260915/net-tcp-tune.sh
+?? dist/bbrv3-lite-v8.0.6-rc2-20260915/rc-vps-acceptance.sh
+?? dist/bbrv3-lite-v8.0.6-rc3-20260915.tar.gz
+?? dist/bbrv3-lite-v8.0.6-rc3-20260915.tar.gz.sha256
+?? dist/bbrv3-lite-v8.0.6-rc3-20260915/README-RC-TEST.txt
+?? dist/bbrv3-lite-v8.0.6-rc3-20260915/SHA256SUMS
+?? dist/bbrv3-lite-v8.0.6-rc3-20260915/net-tcp-tune.sh
+?? dist/bbrv3-lite-v8.0.6-rc3-20260915/rc-vps-acceptance.sh
+?? dist/release-download-v8.0.6-final/SHA256SUMS
+?? dist/release-download-v8.0.6-final/install-alias.sh
+?? dist/release-download-v8.0.6-final/net-tcp-tune.sh
+?? dist/release-download-v8.0.7-final/SHA256SUMS
+?? dist/release-download-v8.0.7-final/install-alias.sh
+?? dist/release-download-v8.0.7-final/net-tcp-tune.sh
+?? dist/v8.0.6-release-notes.md
+?? dist/v8.0.7-release-notes.md
+?? docs/v8.0.8-high-bandwidth-reliability-report.md
+?? docs/v8.0.8-p2-real-vps-acceptance-report.md
+?? docs/v8.0.8-p3-rc1-budget-semantics-repair-report.md
+?? docs/v8.0.8-p3-real-vps-qualification-report.md
+?? docs/validation/v8.0.8-p3-rc1/README.md
+?? docs/validation/v8.0.8-p3-rc1/SHA256SUMS
+?? docs/validation/v8.0.8-p3-rc1/build-identity.tsv
+?? docs/validation/v8.0.8-p3-rc1/docker-debian12.log
+?? docs/validation/v8.0.8-p3-rc1/docker-debian13.log
+?? docs/validation/v8.0.8-p3-rc1/docker-matrix.log
+?? docs/validation/v8.0.8-p3-rc1/docker-ubuntu2204.log
+?? docs/validation/v8.0.8-p3-rc1/docker-ubuntu2404.log
+?? docs/validation/v8.0.8-p3-rc1/frozen-core-review.txt
+?? docs/validation/v8.0.8-p3-rc1/git-state.txt
+?? docs/validation/v8.0.8-p3-rc1/local-validate.log
+?? docs/validation/v8.0.8-p3-rc1/matrix-process-result.txt
+?? docs/validation/v8.0.8-p3-rc1/new-source-manifest.sha256
+?? docs/validation/v8.0.8-p3-rc1/p3-reads-rc1.log
+?? docs/validation/v8.0.8-p3-rc1/production-replay-budget-plan.tsv
+?? docs/validation/v8.0.8-p3-rc1/production-replay-cli.log
+?? docs/validation/v8.0.8-p3-rc1/production-replay-failure.tsv
+?? docs/validation/v8.0.8-p3-rc1/production-replay-history.txt
+?? docs/validation/v8.0.8-p3-rc1/production-replay-samples.tsv
+?? docs/validation/v8.0.8-p3-rc1/production-replay-summary.tsv
+?? docs/validation/v8.0.8-p3-rc1/proposal-package.txt
+?? docs/validation/v8.0.8-p3-rc1/proposed-real-vps-readonly-check.sh
+?? docs/validation/v8.0.8-p3-rc1/rc1-code-and-tests.patch
+?? docs/validation/v8.0.8-p3-rc1/real-systemd-pid1.log
+?? docs/validation/v8.0.8-p3-rc1/targeted-regression.log
+?? docs/validation/v8.0.8-p3-rc1/test-inputs.sha256
+?? docs/validation/v8.0.8-p3-rc1/v807-reads-rc1.log
+?? docs/validation/v8.0.8-p3-rc1/validation-summary.tsv
+?? docs/validation/v8.0.8/README.md
+?? docs/validation/v8.0.8/docker-debian12.log
+?? docs/validation/v8.0.8/docker-debian13.log
+?? docs/validation/v8.0.8/docker-ubuntu2204.log
+?? docs/validation/v8.0.8/docker-ubuntu2404.log
+?? docs/validation/v8.0.8/early-budget-plan.tsv
+?? docs/validation/v8.0.8/early-budget-summary.tsv
+?? docs/validation/v8.0.8/git-state.txt
+?? docs/validation/v8.0.8/local-release.log
+?? docs/validation/v8.0.8/local-validate.log
+?? docs/validation/v8.0.8/production-replay-events.tsv
+?? docs/validation/v8.0.8/production-replay-failure.tsv
+?? docs/validation/v8.0.8/production-replay-history.txt
+?? docs/validation/v8.0.8/production-replay-peers.txt
+?? docs/validation/v8.0.8/production-replay-samples.tsv
+?? docs/validation/v8.0.8/production-replay-summary.tsv
+?? docs/validation/v8.0.8/replay-metadata.tsv
+?? docs/validation/v8.0.8/startup-probe-before-fix.txt
+?? docs/validation/v8.0.8/validation-summary.tsv
+?? tests/fixtures/v808-high-bandwidth/README.md
+?? tests/fixtures/v808-high-bandwidth/context.tsv
+?? tests/fixtures/v808-high-bandwidth/samples.tsv
+?? tests/fixtures/v808-p3-budget-semantics/README.md
+?? tests/fixtures/v808-p3-budget-semantics/context.tsv
+?? tests/fixtures/v808-p3-budget-semantics/legacy-failure.tsv
+?? tests/fixtures/v808-p3-budget-semantics/legacy-summary.tsv
+?? tests/fixtures/v808-p3-budget-semantics/samples.tsv
+?? tests/helpers/iperf-server.sh
+?? tests/helpers/v808-fixture.sh
+?? tests/test_v808_budget_failure_semantics.sh
+?? tests/test_v808_budget_feasibility.sh
+?? tests/test_v808_decision_confidence.sh
+?? tests/test_v808_history_tsv_integrity.sh
+?? tests/test_v808_incomplete_knee.sh
+?? tests/test_v808_peer_health_semantics.sh
+?? tests/test_v808_reference_representativeness.sh

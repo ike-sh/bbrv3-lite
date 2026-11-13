@@ -1,0 +1,31 @@
+ID                 20261112T224346Z-sweep
+Time               2026-11-12T22:43:46Z
+Operation          sweep
+Peer               fixture.example
+Result             FAILURE
+Decision           budget-exceeded
+Last clean         none
+Suspected break    none
+Confirmed break    none
+Knee               none/unconfirmed
+Sample confidence  high
+Decision confidence low
+Recommendation     none
+Verify             none
+Traffic TX         2.39 GiB
+Failure reason     budget-exceeded
+Failure explanation  当前 profile 的剩余测量计划预计无法在指定 TX 或时间预算内完成
+
+Budget at rejection (snapshot)
+Budget subtype       feasibility-rejected
+TX hard limit        6.00 GiB (6442450944 bytes)
+TX used              2.39 GiB (2562106393 bytes)
+TX remaining         3.61 GiB (3880344551 bytes)
+Required TX          13.63 GiB (14640332764 bytes)
+Time hard limit      900s
+Time used            49s
+Time remaining       851s
+Required time        135s
+Budget cause         expected-remaining-tx-not-safe
+Required TX means    expected-remaining-plan
+Selected profile     standard
