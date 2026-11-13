@@ -1,5 +1,14 @@
 # Changelog
 
+## v8.0.9 — XanMod Dependency Bootstrap Hotfix（2026-11-13）
+
+- 在安全预检及基础 APT 检查后安装缺失依赖，再验证 curl/gpg；精简系统不再因缺少 gpg 提前拒绝 bootstrap。
+- 依赖与内核安装均执行关键网络组件移除模拟保护和 --no-remove，保留真实 APT/GPG 错误，拒绝部分索引更新失败。
+- 官方 HTTPS 公钥格式/转换校验、原子创建专用仓库文件；保留不同的现有配置，失败清理本次新建文件及临时数据，不保存旧安装备份。
+- 保留 CPU/LTS/Main、容器与 Secure Boot guard；不自动重启，不删除运行内核，不更改 TCP/qdisc、持久化策略或测量历史。
+
+本次仅修复 XanMod 安装链路。真实 Debian 13 隔离容器已验证依赖补齐和 LTS 包安装；bootloader 准备、新内核启动与新内核中的 BBRv3 运行均未实机验证，不宣称吞吐改善。详见 [Release Notes](docs/release-notes-v8.0.9.md)。
+
 ## v8.0.8 — High-Bandwidth Measurement Reliability（2026-11-13）
 
 - 根据实测接收容量评估剩余扫描、必要确认和最终复验成本，分别显示 expected、conservative upper bound 与 hard budget；预算不足时安全退出，默认仍为 6 GiB。

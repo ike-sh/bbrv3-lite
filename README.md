@@ -2,7 +2,7 @@
 
 BBRv3 Lite 是面向 Debian/Ubuntu VPS 的可测量 TCP 调优工具。它把原项目中可靠的 XanMod 安装、BBR/FQ、DNS/IPv6 管理、严格配置、持久化与回滚重新实现，并吸收 tcpfit 的机器画像、iperf3 测量、policer 拐点扫描、并发锁和最早基线保护。
 
-当前正式版本：[v8.0.8](https://github.com/ike-sh/bbrv3-lite/releases/tag/v8.0.8)
+当前正式版本：[v8.0.9](https://github.com/ike-sh/bbrv3-lite/releases/tag/v8.0.9) — XanMod Dependency Bootstrap Hotfix。详见 [Release Notes](docs/release-notes-v8.0.9.md)。
 
 项目不追求“sysctl 越多越好”。默认配置保持克制。命令行 `measure` 只给出结果；交互式 `auto` 会在一次总确认后完成测量、决策、应用和复验，未发现可信拐点时保持纯 FQ。
 
@@ -149,6 +149,8 @@ sudo reboot
 ```
 
 重启后再次执行 `sudo bbr kernel status`。XanMod 官方 APT 当前只面向 amd64 Debian 系发行版；ARM64 社区内核不再由本项目自动下载和安装，避免把未经项目控制的第三方内核带入默认信任链。CPU 包等级按 x86-64 psABI 完整特性集保守判断（包含 SSE3、F16C、LZCNT 等容易漏判的位）；Main 只选择 Main 的 x64v2/v3 包，绝不为兼容老 CPU 静默改装 LTS，x64v1 机器应明确使用 `--track lts`。
+
+v8.0.9 先完成 OS/架构、容器和既有 Secure Boot 安全检查，再用基础 APT 安装缺失的 ca-certificates/curl/gnupg；不再要求 gpg/curl 在 bootstrap 前存在。依赖与内核安装均先模拟并拒绝删除关键网络组件，实际安装使用 --no-remove；索引、下载、GPG 或安装失败会明确停止。官方 HTTPS 公钥经格式和转换校验后，以 signed-by 限定 APT 签名信任；不同的既有 keyring/source 不被覆盖，失败只清理本次新增且未被更改的文件及临时目录。包安装成功、当前运行内核和重启后验证分别报告；不会自动重启或重配 TCP/qdisc。
 
 BBRv3 自身不会和 FQ 或本项目的 HTB → FQ 层级冲突：BBR 使用标准 TCP pacing，HTB 仅作为本机出口的聚合速率边界，FQ 仍负责叶子流调度。本项目也不改写 BBRv3 可选的 ECN/`ecn_low` 路由策略。需要注意，Linux 运行时只报告拥塞控制名 `bbr`，官方 BBRv3 源码并不提供可通用读取的代际接口，因此普通内核上无法仅凭 `sysctl` 或供应商 `modinfo version` 严格证明 v3；XanMod 状态只显示“按发行版默认预期为 v3”，不会再误报为已验证。
 
